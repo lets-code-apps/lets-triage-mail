@@ -273,6 +273,29 @@ Tasks 4.1–4.3 depend on phase 3. 4.2 and 4.3 can run in parallel after 4.1.
 - `digest [--account X] [--dry]`: build and print, or append immediately (the scheduled digest
   runs inside `run`).
 
+### 5.3 Spam-folder watch, read-only (`imap/junk.rs`)
+Found on 2026-10-25: wp.pl filed a DKIM-valid message from the user's own Gmail account into
+`Spam` (`X-WP-SPAM: YES (CB)`). The inbox worker never saw it, because it only watches INBOX.
+- Watch the folder with the `\Junk` special-use attribute (`Spam` on wp.pl), or the configured
+  `junk_folder`, read-only: `SELECT`, `FETCH` with `PEEK` only, no `STORE`, nothing moved. Track
+  its own `(UIDVALIDITY, last_uid)` like the inbox; first run starts from now.
+- Fetch headers only (`BODY.PEEK[HEADER]`). The model is **never** called for this folder: spam
+  folders hold hundreds of messages, and the question is simply "do I know this sender?".
+- A message is **possibly misfiled** when the sender is trusted (`screen_sender` gives
+  `Trusted`, from a known sender or an allow rule) and DKIM passes (standard header or
+  `provider_headers`). Everything else in the folder is ignored.
+- Record possibly-misfiled messages with metadata only, and add a digest section **"Possibly
+  misfiled in Spam"** listing sender, subject and date.
+- No new IMAP connection per account if avoidable: run it on the inbox worker's wake-ups, or on a
+  slow timer (for example every 15 min) in the account unit. Explain the choice.
+- `check` reports the detected Junk folder.
+- Config: `junk_folder = ""` (auto-detect) and `watch_junk = true` per account.
+- *Later (after v1, when moving mail is allowed):* move such messages back to INBOX, as part of
+  the spam and security filtering in `SPEC.md` §5.
+- *Tests:* pure "possibly misfiled" decision; Dovecot test with a Junk folder: a known sender's
+  message is reported and stays unseen, a stranger's is ignored.
+- *Depends on:* 3.5, 3.6, 5.1, 5.2.
+
 ## Phase 6: Ship v1
 
 | # | Task |
@@ -295,7 +318,7 @@ Tasks 4.1–4.3 depend on phase 3. 4.2 and 4.3 can run in parallel after 4.1.
 2.1 + 3.2 ── 3.4
 1.2 + 1.3 + 2.1 + 3.2 ── 3.5 ── 3.6 (B) ── 4.1 ─┬─ 4.2 ── (C)
                                                  └─ 4.3
-3.6 ── 5.1 ── 5.2
+3.6 ── 5.1 ── 5.2 ── 5.3
 everything ── 6.x
 ```
 
