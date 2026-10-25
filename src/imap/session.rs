@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::{Capabilities, Capability, Flag, Mailbox, NameAttribute};
 use async_imap::{Client, Session};
 use futures::TryStreamExt;
@@ -23,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_util::sync::CancellationToken;
 
 use super::folders::{ListedFolder, ResolvedFolders, resolve_folders};
 use super::{ImapError, ImapSettings, TlsMode};
@@ -303,6 +305,17 @@ pub struct MessageMeta {
     pub flags: Vec<String>,
 }
 
+/// Why an [`ImapSession::idle`] wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEnd {
+    /// The server pushed something (usually `EXISTS`: new mail). Look at the mailbox.
+    NewData,
+    /// The timeout passed with nothing happening. The caller re-issues IDLE.
+    Timeout,
+    /// The cancellation token fired.
+    Cancelled,
+}
+
 /// The recipients of one message, as lowercase `local@domain` addresses.
 ///
 /// Built from the `ENVELOPE` of a message in the Sent folder. Addresses that cannot be decoded
@@ -441,6 +454,37 @@ impl ImapSession {
             .collect()
     }
 
+    /// Same as [`fetch_meta`](Self::fetch_meta), for every UID in `first..=last`.
+    ///
+    /// A range keeps the command short. The result is sorted by UID and only holds UIDs inside
+    /// the range: for a range such as `5:*`, a server answers with the *last* message even when
+    /// nothing is above 5 (RFC 3501 §6.4.8), and callers must not mistake that for new mail.
+    pub async fn fetch_meta_range(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<Vec<MessageMeta>, ImapError> {
+        let fetches: Vec<_> = self
+            .inner
+            .uid_fetch(format!("{first}:{last}"), META_QUERY)
+            .await?
+            .try_collect()
+            .await?;
+        let mut metas = fetches
+            .iter()
+            .map(|fetch| {
+                Ok(MessageMeta {
+                    uid: fetch.uid.ok_or(ImapError::MissingData("UID"))?,
+                    size: fetch.size,
+                    flags: fetch.flags().map(|f| flag_name(&f)).collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, ImapError>>()?;
+        metas.retain(|meta| (first..=last).contains(&meta.uid));
+        metas.sort_by_key(|meta| meta.uid);
+        Ok(metas)
+    }
+
     /// To, Cc and Bcc addresses of every message with a UID in `first..=last` in the selected
     /// mailbox, fetched with `ENVELOPE` only (no body, nothing marked as read).
     ///
@@ -533,6 +577,48 @@ impl ImapSession {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Wait for the server to announce changes in the selected mailbox (IMAP `IDLE`, RFC 2177),
+    /// for at most `timeout`, or until `cancel` fires.
+    ///
+    /// Takes `self` and gives the session back with the result. That mirrors `async-imap`:
+    /// `Session::idle` consumes the session and returns a `Handle`, and only `Handle::done`
+    /// returns it. While IDLE runs, the connection cannot be used for anything else, so the
+    /// type system stops us from issuing a command in the middle. If anything fails, the
+    /// session is gone with the error and the caller reconnects.
+    pub async fn idle(
+        self,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<(ImapSession, IdleEnd), ImapError> {
+        // Destructure to move both fields out of `self` (a type with no `Drop` impl allows it).
+        let ImapSession { inner, selected } = self;
+        let mut handle = inner.idle();
+        handle.init().await?;
+
+        let response = {
+            // `stop` is a guard: dropping it interrupts the wait. It must stay alive while we
+            // wait, so it lives until the end of this block.
+            let (wait, stop) = handle.wait_with_timeout(timeout);
+            tokio::pin!(wait);
+            tokio::select! {
+                response = &mut wait => response?,
+                _ = cancel.cancelled() => {
+                    drop(stop);
+                    wait.await?
+                }
+            }
+        };
+
+        // Always send DONE, so the server leaves IDLE cleanly and we get the session back.
+        let inner = handle.done().await?;
+        let end = match response {
+            IdleResponse::NewData(_) => IdleEnd::NewData,
+            IdleResponse::Timeout => IdleEnd::Timeout,
+            IdleResponse::ManualInterrupt => IdleEnd::Cancelled,
+        };
+        Ok((ImapSession { inner, selected }, end))
     }
 
     /// End the session politely.
