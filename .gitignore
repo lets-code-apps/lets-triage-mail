@@ -16,3 +16,8 @@ CLAUDE.local.md
 # Claude Code: agent worktrees and personal settings
 .claude/worktrees/
 .claude/settings.local.json
+
+# Local test data (real exported mail). Never commit it.
+/tmp/
+*.eml
+!tests/fixtures/*.eml
