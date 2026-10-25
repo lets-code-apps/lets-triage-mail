@@ -691,15 +691,25 @@ impl<D: Decider> Ctx<'_, D> {
         // PHASE 4: `dry_run` is always true here (see `run_account_with_timing`). This is the
         // one place where flagging plugs in: when `dry_run` is false, send the STORE for
         // `flag` first and write the record below only if it succeeded.
-        tracing::info!(
-            account = %self.account.name,
-            uid = key.uid,
-            category = verdict.category.as_str(),
-            source,
-            flag = ?flag.map(|flag| self.config.flag_name(flag)),
-            colour = ?flag.map(|flag| self.policy.colour_for(flag)),
-            "dry-run: would set flag (nothing was changed on the server)"
-        );
+        if self.account.flagging {
+            tracing::info!(
+                account = %self.account.name,
+                uid = key.uid,
+                category = verdict.category.as_str(),
+                source,
+                flag = ?flag.map(|flag| self.config.flag_name(flag)),
+                colour = ?flag.map(|flag| self.policy.colour_for(flag)),
+                "dry-run: would set flag (nothing was changed on the server)"
+            );
+        } else {
+            tracing::info!(
+                account = %self.account.name,
+                uid = key.uid,
+                category = verdict.category.as_str(),
+                source,
+                "classified for the digest (flagging is off for this account)"
+            );
+        }
 
         let record = ProcessedRecord {
             verdict: Some(verdict.clone()),
