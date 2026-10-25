@@ -68,14 +68,24 @@ Keep `engine.rs` and `flags.rs` free of IO. Most logic gets unit-tested there.
 
 - Port the Python prototype's 34 tests as the behavioural spec (the prototype is kept outside
   this repo; see `CLAUDE.local.md` for its path).
-- Integration tests need a real IMAP server. Options: **pymap** (Python, in-memory; used by the
-  prototype). It has an asyncio bug where the GC destroys live sessions, so run it with
-  `gc.disable()` (see the prototype's `conftest.py`). Alternatively **Dovecot or GreenMail in
-  Docker** (more realistic: keywords, special-use, IDLE). Check that keyword support works for
-  the flag tests.
+- Integration tests need a real IMAP server. **Decision (task 3.1): Dovecot 2.3 in Docker**
+  (`dovecot/dovecot:2.3.21.1`, config in `tests/dovecot/dovecot.conf`). Why Dovecot: Maildir
+  accepts new keywords and reports `PERMANENTFLAGS (... \*)`, which the `$MailFlagBit*` colours
+  need; special-use folders (`\Sent`) are a config line; IDLE and UIDPLUS are on by default; and
+  it is what many self-hosted users actually run. GreenMail (Java) was rejected: it is a test double rather
+  than a full server, and its documentation does not promise `\*` in `PERMANENTFLAGS` or
+  special-use folders, which are exactly what these tests exist to check. pymap
+  (used by the prototype) was rejected because of its asyncio GC bug and because the Rust tests
+  should not need Python.
+- The tests that need the server are `#[ignore]`d, so plain `cargo test` stays fast and works
+  without Docker (this Mac has none). The `imap-integration` CI job on Linux starts the container
+  and runs `cargo test --test imap_integration -- --ignored`. To run them by hand, see the
+  header of `tests/common/mod.rs`. Every test logs in as a fresh user (the static userdb accepts
+  any name), so tests never share mail.
 - Stub LLM: a tiny local HTTP server returning canned verdicts keyed on the subject (the prototype
   has one).
-- CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on macOS and Linux.
+- CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on macOS and Linux, plus the
+  Linux-only Dovecot job above.
 
 ## Security checklist
 

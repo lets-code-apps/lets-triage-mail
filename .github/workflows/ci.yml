@@ -25,3 +25,30 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # Integration tests against a real Dovecot server. Linux only, because the runner has Docker.
+  # The tests are #[ignore]d for plain `cargo test`; this job runs exactly those.
+  imap-integration:
+    name: IMAP integration (Dovecot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Started with `docker run` instead of a `services:` container, because the config file
+      # comes from this repository and service containers start before the checkout.
+      - name: Start Dovecot
+        run: |
+          docker run -d --name dovecot -p 1143:143 \
+            -v "$PWD/tests/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro" \
+            dovecot/dovecot:2.3.21.1
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/1143) 2>/dev/null; then exit 0; fi
+            sleep 1
+          done
+          docker logs dovecot
+          exit 1
+      - run: cargo test --test imap_integration -- --ignored
+      - name: Dovecot log
+        if: failure()
+        run: docker logs dovecot
