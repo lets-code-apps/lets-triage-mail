@@ -14,6 +14,7 @@
 | 2026-10-25 | Digest delivered via **IMAP APPEND**, not SMTP | No deliverability issues; it appears in every client. |
 | 2026-10-25 | Laya decision model: **v2 candidate**, not v1 (pending confirmation) | Zero-shot accuracy near chance; needs our own labelled data plus calibration; can't do summaries/dates anyway. v1 logs labels to make that possible. See CLASSIFIER.md. |
 | 2026-10-25 | Name: **Let's Triage Mail** (`lets-triage-mail`), repo `lets-code-apps/lets-triage-mail` | MailGuard was crowded (~290 GitHub repos). Follows Piotr's "Let's ..." brand (from his company, Let's Code): `lets-<verb>-<object>` for services, `lets-<verb>` for tools. "Triage" covers flagging, digests and later spam filtering and unsubscribing, not just flags. Free on crates.io, Homebrew and GitHub on 2026-10-25. |
+| 2026-10-25 | **Post-v1 roadmap**: spam/security filtering to Junk/Trash, unsubscribing, drafted replies, home-assistant integration | The service should handle the whole inbox, and it is one microservice in Piotr's local assistant setup. v1 scope is unchanged. Drafts go to the Drafts folder via APPEND; the service never sends mail. See SPEC.md §5. |
 
 ## Rejected or parked options
 

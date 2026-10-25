@@ -9,6 +9,9 @@ account, classifies new mail with a **local model** (nothing leaves the user's m
 **Apple-Mail-compatible flag colours** on the server, and writes a **daily digest email** into
 the mailbox.
 
+- Beyond v1 the goal is the whole inbox: spam/security filtering, unsubscribing, drafted replies,
+  and serving triage results (bills, deadlines, reminders) to Piotr's home assistant as one of
+  several local `lets-*` microservices. See `docs/SPEC.md` §5.
 - Name: **Let's Triage Mail**; repo, crate and binary `lets-triage-mail`; GitHub
   `lets-code-apps/lets-triage-mail`. It follows Piotr's "Let's ..." brand pattern:
   `lets-<verb>-<object>` for services, `lets-<verb>` for tools people use directly.

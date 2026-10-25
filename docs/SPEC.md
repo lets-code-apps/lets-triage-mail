@@ -74,8 +74,28 @@ Packaging: a single static binary, `cargo install`, a Homebrew tap, and a launch
 
 ## 5. Later (not v1)
 
-From the prototype: moving to folders (Promotions/Newsletters/Cold/Junk), training folders
-(`NotSpam`/`BlackHole`), the RFC 8058 one-click unsubscribe queue with a localhost review UI, and
-restore. New ideas: "Summarize selected message" for Apple Mail via AppleScript + Shortcuts
-calling `lets-triage-mail summarize`; an optional Swift MailKit extension for background colours;
-OAuth2 for Outlook.com/M365 and Gmail.
+The product goal is wider than v1: the service should handle the whole inbox, not only flag it.
+Planned after v1, roughly in this order:
+
+1. **Spam and security filtering.** Move spam and phishing to Junk/Trash. This ends the v1 "never
+   move or hide mail" rule, so it needs: special-use folder resolution, MOVE (or COPY + `\Deleted`
+   + `UID EXPUNGE` with UIDPLUS), a high confidence threshold, a log of every move, a `restore`
+   command, and training folders (`NotSpam`/`BlackHole`) as in the prototype. Never delete
+   permanently.
+2. **Unsubscribing.** The prototype's RFC 8058 one-click unsubscribe queue: the model proposes,
+   the user approves in a localhost review UI, then the service sends the one-click POST.
+   Unsubscribe URLs come from email, so they are hostile: resolve to a public IP and pin it (SSRF).
+3. **Drafted replies.** For mail flagged "Reply needed", draft a suggested reply with the local
+   model and APPEND it to the Drafts folder with `\Draft` (threaded via `In-Reply-To` and
+   `References`). The user reviews and sends it from their own client. **The service never sends
+   mail.** Drafts are model output built from hostile input: plain text only, no links or
+   addresses the user did not write.
+4. **Home-assistant integration.** Expose triage results (bills and payment due dates, deadlines,
+   reminders such as a car lease payment) to Piotr's home assistant and RAG "brain" over a local
+   API, so the assistant can surface them. It is one microservice in a family of local `lets-*`
+   services. The API shape is not decided yet.
+5. **Folder moves** for non-spam categories (Promotions/Newsletters/Cold), as in the prototype.
+
+Other ideas: "Summarize selected message" for Apple Mail via AppleScript + Shortcuts calling
+`lets-triage-mail summarize`; an optional Swift MailKit extension for background colours; OAuth2
+for Outlook.com/M365 and Gmail.
