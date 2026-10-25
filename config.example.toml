@@ -119,3 +119,7 @@ password_command = "security find-generic-password -s lets-triage-mail -a person
 inbox = "INBOX"
 # Leave empty to detect the Sent folder automatically.
 sent_folder = ""
+# Set to false if `check` says the mailbox does not allow custom keywords (some providers,
+# such as wp.pl). Mail is then classified for the digest only and never flagged: without
+# keywords, a flag would show as red in Apple Mail, and red is yours.
+# flagging = true

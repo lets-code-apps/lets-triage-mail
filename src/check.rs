@@ -525,6 +525,7 @@ pub async fn probe_account(account: &AccountConfig) -> Vec<CheckItem> {
             &account.imap_settings(&password),
             &account.inbox,
             &account.sent_folder,
+            account.flagging,
         )
         .await,
     );
@@ -534,12 +535,14 @@ pub async fn probe_account(account: &AccountConfig) -> Vec<CheckItem> {
 /// The IMAP part of the account checks, separate so a test can run it against a test server
 /// without a config file.
 ///
-/// `configured_sent` is the `sent_folder` setting; empty means "detect it".
+/// `configured_sent` is the `sent_folder` setting; empty means "detect it". `flagging` is the
+/// account's `flagging` setting.
 pub async fn probe_imap(
     area: &str,
     settings: &ImapSettings,
     inbox: &str,
     configured_sent: &str,
+    flagging: bool,
 ) -> Vec<CheckItem> {
     let mut items = Vec::new();
 
@@ -571,7 +574,7 @@ pub async fn probe_imap(
     }
 
     match step(&format!("selecting {inbox}"), session.select(inbox)).await {
-        Ok(info) => items.extend(mailbox_items(area, inbox, &info)),
+        Ok(info) => items.extend(mailbox_items(area, inbox, &info, flagging)),
         Err(message) => items.push(CheckItem::fail(
             area,
             message,
@@ -672,7 +675,15 @@ pub fn capability_item(area: &str, caps: &ServerCapabilities) -> CheckItem {
 }
 
 /// The items for a selected inbox: size and `UIDVALIDITY`, and whether keywords are allowed.
-pub fn mailbox_items(area: &str, folder: &str, info: &crate::imap::MailboxInfo) -> Vec<CheckItem> {
+///
+/// `flagging` is the account's setting: a server without custom keywords is a failure only
+/// when the service is supposed to set flags there.
+pub fn mailbox_items(
+    area: &str,
+    folder: &str,
+    info: &crate::imap::MailboxInfo,
+    flagging: bool,
+) -> Vec<CheckItem> {
     let selected = CheckItem::ok(
         area,
         format!(
@@ -680,18 +691,29 @@ pub fn mailbox_items(area: &str, folder: &str, info: &crate::imap::MailboxInfo) 
             info.exists, info.uid_validity
         ),
     );
-    let keywords = if info.keywords_allowed {
-        CheckItem::ok(
+    let keywords = match (info.keywords_allowed, flagging) {
+        (true, true) => CheckItem::ok(
             area,
             "custom keywords allowed (PERMANENTFLAGS has \\*), so flag colours can be stored",
-        )
-    } else {
-        CheckItem::fail(
+        ),
+        (true, false) => CheckItem::ok(
+            area,
+            "flagging is off for this account (`flagging = false`): mail is classified for the \
+             digest only, although this server could store flag colours",
+        ),
+        (false, false) => CheckItem::warn(
+            area,
+            "this mailbox does not allow custom keywords (PERMANENTFLAGS lacks \\*); flagging is \
+             off for this account, so mail is classified for the digest only",
+            "nothing to do; colours set in Apple Mail stay on this Mac only for this server",
+        ),
+        (false, true) => CheckItem::fail(
             area,
             "this mailbox does not allow custom keywords (PERMANENTFLAGS lacks \\*)",
-            "flag colours are stored as keywords such as $MailFlagBit0, so they cannot work on this server or folder; \
-             use another provider or server setting, or leave this account out of the config",
-        )
+            "flag colours are stored as keywords such as $MailFlagBit0, so they cannot work on this \
+             server or folder; set `flagging = false` for this account to use it for the digest \
+             only, or use another provider",
+        ),
     };
     vec![selected, keywords]
 }
@@ -947,16 +969,36 @@ mod tests {
             permanent_flags: vec![String::from("\\Seen")],
             keywords_allowed: false,
         };
-        let items = mailbox_items("Account a", "INBOX", &info);
+        let items = mailbox_items("Account a", "INBOX", &info, true);
         assert_eq!(statuses(&items), [Status::Ok, Status::Fail]);
         assert!(
             items[0].message.contains("9 messages") && items[0].message.contains("UIDVALIDITY 7")
         );
-        assert!(items[1].hint.as_deref().unwrap().contains("flag colours"));
+        let hint = items[1].hint.as_deref().unwrap();
+        assert!(hint.contains("flag colours") && hint.contains("flagging = false"));
 
         info.keywords_allowed = true;
-        let items = mailbox_items("Account a", "INBOX", &info);
+        let items = mailbox_items("Account a", "INBOX", &info, true);
         assert_eq!(statuses(&items), [Status::Ok, Status::Ok]);
+    }
+
+    #[test]
+    fn missing_keywords_only_warn_when_flagging_is_off() {
+        let mut info = MailboxInfo {
+            uid_validity: 7,
+            uid_next: 10,
+            exists: 9,
+            permanent_flags: vec![String::from("\\Seen")],
+            keywords_allowed: false,
+        };
+        let items = mailbox_items("Account a", "INBOX", &info, false);
+        assert_eq!(statuses(&items), [Status::Ok, Status::Warn]);
+        assert!(items[1].message.contains("digest only"));
+
+        info.keywords_allowed = true;
+        let items = mailbox_items("Account a", "INBOX", &info, false);
+        assert_eq!(statuses(&items), [Status::Ok, Status::Ok]);
+        assert!(items[1].message.contains("flagging is off"));
     }
 
     #[test]

@@ -680,7 +680,13 @@ impl<D: Decider> Ctx<'_, D> {
             }
         };
 
-        let flag = choose_flag(trust, &verdict, &self.policy);
+        // An account with `flagging = false` is classified for the digest only, so there is
+        // no flag to choose, not even a would-be one.
+        let flag = if self.account.flagging {
+            choose_flag(trust, &verdict, &self.policy)
+        } else {
+            None
+        };
 
         // PHASE 4: `dry_run` is always true here (see `run_account_with_timing`). This is the
         // one place where flagging plugs in: when `dry_run` is false, send the STORE for
@@ -1058,6 +1064,37 @@ mod tests {
         assert_eq!(counts[0].label, "reply_needed");
         // Nothing was queued for a retry.
         assert!(store.due_retries("test", i64::MAX, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_account_with_flagging_off_is_classified_without_a_flag() {
+        let decider = FakeDecider::answering(reply_needed());
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        // Struct-update syntax (`..account(...)`) is not allowed here: `AccountConfig` has a
+        // private field (`port`), so we change the one field on a mutable copy instead.
+        let mut account = account("me@example.org");
+        account.flagging = false;
+        let config = Config::default();
+        let (shutdown, timing) = (CancellationToken::new(), WorkerTiming::default());
+        let ctx = Ctx {
+            account: &account,
+            config: &config,
+            policy: config.flag_policy(),
+            decider: &decider,
+            store: &store,
+            shutdown: &shutdown,
+            timing: &timing,
+            own: own_address(&account),
+        };
+        let outcome = ctx
+            .triage(&key(5), &parsed("anna@friend.example"), 0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Processed);
+        let store = store.lock().unwrap();
+        // Classified and recorded for the digest, but no flag, not even a would-be one.
+        assert!(store.is_processed(&key(5)).unwrap());
+        assert!(store.flag_counts(0).unwrap().is_empty());
     }
 
     #[tokio::test]

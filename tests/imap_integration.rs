@@ -296,7 +296,7 @@ async fn check_probe_passes_against_dovecot() {
     let settings = fresh_account();
     seed_inbox(&settings, &["one", "two"]).await;
 
-    let items = probe_imap("Account test", &settings, "INBOX", "").await;
+    let items = probe_imap("Account test", &settings, "INBOX", "", true).await;
     assert!(items.iter().all(|i| i.status != Status::Fail), "{items:#?}");
     let text = lets_triage_mail::check::format_items(&items);
     assert!(text.contains("2 messages"), "{text}");
@@ -310,7 +310,7 @@ async fn check_probe_reports_a_wrong_password_with_a_hint() {
 
     let mut settings = fresh_account();
     settings.password = "not-the-password".into();
-    let items = probe_imap("Account test", &settings, "INBOX", "").await;
+    let items = probe_imap("Account test", &settings, "INBOX", "", true).await;
     assert_eq!(items.len(), 1, "{items:#?}");
     assert_eq!(items[0].status, Status::Fail);
     assert!(items[0].hint.as_deref().unwrap().contains("password"));

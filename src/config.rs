@@ -346,6 +346,16 @@ pub struct AccountConfig {
     /// Leave empty to auto-detect the Sent folder from its special-use attribute.
     #[serde(default)]
     pub sent_folder: String,
+    /// Whether the service may set flags on this account. `false` means "classify for the
+    /// digest only", for servers that cannot store flag colours (no custom keywords, as on
+    /// wp.pl). A bare `\Flagged` without colour bits shows as red in Apple Mail, and red is
+    /// the user's, so such an account must not be flagged at all.
+    #[serde(default = "default_flagging")]
+    pub flagging: bool,
+}
+
+fn default_flagging() -> bool {
+    true
 }
 
 fn default_tls() -> Tls {
