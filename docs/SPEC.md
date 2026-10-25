@@ -64,7 +64,7 @@ lets-triage-mail run                       # daemon: watch accounts, flag, send 
 lets-triage-mail check                     # test model + each account; show caps (IDLE, MOVE, UIDPLUS, keywords allowed), folders
 lets-triage-mail classify FILE.eml         # dry classification of one message, prints verdict + chosen flag
 lets-triage-mail backfill [--days 7] [--account X]
-lets-triage-mail digest --now [--account X] [--dry]   # build/print or append a digest immediately
+lets-triage-mail digest [--account X] [--dry]         # build/print or append a digest immediately
 lets-triage-mail stats [--days 7]
 lets-triage-mail rules list|allow|block|remove PATTERN
 ```

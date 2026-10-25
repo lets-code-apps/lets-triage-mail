@@ -244,7 +244,8 @@ Tasks 4.1–4.3 depend on phase 3. 4.2 and 4.3 can run in parallel after 4.1.
 - APPEND without `\Seen` to the configured folder, once a day at the configured local time.
   Catch-up after sleep; `last_digest_date` guarantees one digest per day per account.
 - The worker skips our own digest when classifying.
-- `digest --now [--account X] [--dry]`: build and print, or append immediately.
+- `digest [--account X] [--dry]`: build and print, or append immediately (the scheduled digest
+  runs inside `run`).
 
 ## Phase 6: Ship v1
 

@@ -20,10 +20,9 @@ use clap::{ArgAction, Parser, Subcommand};
 const DEFAULT_CONFIG_PATH: &str = "~/.config/lets-triage-mail/config.toml";
 
 // `#[derive(Parser)]` is a macro from `clap`: it writes the argument parsing code for us
-// from this struct, and the doc comments become the `--help` text. (This is a plain comment
-// on purpose: a doc comment here would end up in `--help`.)
-
-/// Local-first email triage: classify new mail with a local model and set flag colours.
+// from this struct. The doc comments on the fields become the `--help` text; the program
+// description comes from `Cargo.toml` through `about`. (Plain comments here on purpose: a
+// doc comment on the struct would replace that description.)
 #[derive(Debug, Parser)]
 #[command(name = "lets-triage-mail", version, about)]
 pub struct Cli {
@@ -73,9 +72,6 @@ pub enum Command {
     },
     /// Build and print or append a digest immediately
     Digest {
-        /// Required: for now a digest is only built on request from the command line
-        #[arg(long, required = true)]
-        now: bool,
         /// Only this account (by name)
         #[arg(long)]
         account: Option<String>,
@@ -105,8 +101,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Backfill { days, account } => {
             backfill::run(&config_path, days, account.as_deref()).await
         }
-        Command::Digest { now, account, dry } => {
-            digest::run(&config_path, now, account.as_deref(), dry).await
+        Command::Digest { account, dry } => {
+            digest::run(&config_path, account.as_deref(), dry).await
         }
         Command::Stats { days } => stats::run(&config_path, days).await,
         Command::Rules(command) => rules::run(&config_path, command).await,
@@ -187,13 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn digest_requires_now() {
-        assert!(parse(&["digest"]).is_err());
-        let cli = parse(&["digest", "--now", "--dry"]).unwrap();
+    fn parses_digest_dry_run() {
+        let cli = parse(&["digest", "--dry"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Digest {
-                now: true,
                 account: None,
                 dry: true
             }
