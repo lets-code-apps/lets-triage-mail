@@ -56,7 +56,14 @@ pub enum Command {
     /// Watch the accounts, flag new mail and send the daily digest
     Run,
     /// Test the model and each account; show server capabilities and folders
-    Check,
+    Check {
+        /// Only this account (by name)
+        #[arg(long)]
+        account: Option<String>,
+        /// Print machine-readable JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Classify one message without touching any mailbox
     Classify {
         /// One or more .eml files (for example exported from Apple Mail)
@@ -104,7 +111,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     tracing::debug!(config = %config_path.display(), "using config file");
     match cli.command {
         Command::Run => run::run(&config_path).await,
-        Command::Check => check::run(&config_path).await,
+        Command::Check { account, json } => {
+            check::run(&config_path, account.as_deref(), json).await
+        }
         Command::Classify { files, json } => classify::run(&config_path, &files, json).await,
         Command::Backfill { days, account } => {
             backfill::run(&config_path, days, account.as_deref()).await
@@ -283,6 +292,25 @@ mod tests {
                 dry: true
             }
         ));
+    }
+
+    #[test]
+    fn parses_check_options() {
+        assert!(matches!(
+            parse(&["check"]).unwrap().command,
+            Command::Check {
+                account: None,
+                json: false
+            }
+        ));
+        let cli = parse(&["check", "--account", "work", "--json"]).unwrap();
+        match cli.command {
+            Command::Check { account, json } => {
+                assert_eq!(account.as_deref(), Some("work"));
+                assert!(json);
+            }
+            other => panic!("expected check, got {other:?}"),
+        }
     }
 
     #[test]

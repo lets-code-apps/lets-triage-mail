@@ -109,7 +109,7 @@ impl std::fmt::Debug for LlmSettings {
 /// How we ask the server for JSON, from strictest to loosest. Servers differ in what they
 /// support, so we try the strictest and step down when the server rejects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
+pub enum OutputMode {
     /// `response_format: json_schema`: the server enforces our schema.
     JsonSchema = 0,
     /// `response_format: json_object`: valid JSON, but any shape.
@@ -124,6 +124,17 @@ impl OutputMode {
         OutputMode::JsonObject,
         OutputMode::Plain,
     ];
+
+    /// A short description for the `check` command.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutputMode::JsonSchema => "json_schema (the server enforces our schema)",
+            OutputMode::JsonObject => "json_object (valid JSON, shape checked by us)",
+            OutputMode::Plain => {
+                "plain text (no structured output; the prompt alone asks for JSON)"
+            }
+        }
+    }
 
     fn next(self) -> Option<OutputMode> {
         Self::ORDER.get(self as usize + 1).copied()
@@ -179,6 +190,12 @@ impl LlmDecider {
             permits,
             mode: AtomicU8::new(OutputMode::JsonSchema as u8),
         })
+    }
+
+    /// The structured-output mode in use now. It starts at the strictest and only moves down
+    /// when the server rejects a mode, so after one successful call it is the mode that works.
+    pub fn output_mode(&self) -> OutputMode {
+        self.current_mode()
     }
 
     fn current_mode(&self) -> OutputMode {

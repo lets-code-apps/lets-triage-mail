@@ -36,6 +36,26 @@ Each file prints its category, confidence, reason and the flag it would get. Add
 one JSON object per line. Nothing is sent anywhere except to your own model server, message
 bodies are never printed or stored, and no mailbox is touched.
 
+## Check your setup
+
+Before pointing the service at a real mailbox, let it test everything it depends on:
+
+```sh
+cargo run --release -- check
+```
+
+`check` reports `OK`, `WARN` or `FAIL` for each area, with a hint for every problem:
+
+- **Config:** the file is valid, whether dry-run is on, and the state database can be opened.
+- **Model:** the server answers, your model exists, and one made-up message is classified (with
+  the time it took and the structured-output mode that works).
+- **Each account:** password lookup, login over TLS, IDLE/UIDPLUS/MOVE support, inbox size, and
+  the Sent folder. A mailbox that does not allow custom keywords fails, because flag colours are
+  stored as keywords.
+
+Use `--account NAME` to check one account and `--json` for machine-readable output. The exit code
+is non-zero if anything failed. `check` never changes anything on the mail server.
+
 ## Background
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,

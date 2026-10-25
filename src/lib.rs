@@ -3,6 +3,7 @@
 //! The library holds the logic; `main.rs` is a thin command-line front end over it.
 //! See `docs/ARCHITECTURE.md` for the planned modules.
 
+pub mod check;
 pub mod config;
 pub mod decider;
 pub mod engine;

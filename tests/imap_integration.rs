@@ -281,3 +281,33 @@ async fn harvests_known_senders_incrementally_from_sent() {
     assert_eq!(off.skipped, Some(Skipped::Disabled));
     session.logout().await.unwrap();
 }
+
+/// The `check` probes against a real server: no failures, and the numbers come from the
+/// mailbox. (A fresh Dovecot user may have no Sent folder, so a warning is allowed.)
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn check_probe_passes_against_dovecot() {
+    use lets_triage_mail::check::{Status, probe_imap};
+
+    let settings = fresh_account();
+    seed_inbox(&settings, &["one", "two"]).await;
+
+    let items = probe_imap("Account test", &settings, "INBOX", "").await;
+    assert!(items.iter().all(|i| i.status != Status::Fail), "{items:#?}");
+    let text = lets_triage_mail::check::format_items(&items);
+    assert!(text.contains("2 messages"), "{text}");
+    assert!(text.contains("custom keywords allowed"), "{text}");
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn check_probe_reports_a_wrong_password_with_a_hint() {
+    use lets_triage_mail::check::{Status, probe_imap};
+
+    let mut settings = fresh_account();
+    settings.password = "not-the-password".into();
+    let items = probe_imap("Account test", &settings, "INBOX", "").await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    assert_eq!(items[0].status, Status::Fail);
+    assert!(items[0].hint.as_deref().unwrap().contains("password"));
+}
