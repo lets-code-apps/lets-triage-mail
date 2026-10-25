@@ -24,11 +24,24 @@ pub enum Category {
 }
 
 impl Category {
+    /// The lowercase name used in the prompt, in `classify --json` and in logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::Personal => "personal",
+            Category::Transactional => "transactional",
+            Category::Newsletter => "newsletter",
+            Category::Marketing => "marketing",
+            Category::ColdOutreach => "cold_outreach",
+            Category::Spam => "spam",
+            Category::Phishing => "phishing",
+        }
+    }
+
     /// Whether a message from an unknown sender in this category may get an action flag.
     ///
     /// Spam and phishing must never be flagged: a phishing "invoice" flagged "To pay" would
     /// help the attacker. Newsletters, marketing and cold outreach are noise, not actions.
-    fn can_be_flagged(self) -> bool {
+    pub fn can_be_flagged(self) -> bool {
         matches!(self, Category::Personal | Category::Transactional)
     }
 }
@@ -41,6 +54,17 @@ pub enum Payment {
     /// A receipt or paid invoice.
     Paid,
     NotApplicable,
+}
+
+impl Payment {
+    /// The lowercase name used in the prompt, in `classify --json` and in logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Payment::Unpaid => "unpaid",
+            Payment::Paid => "paid",
+            Payment::NotApplicable => "not_applicable",
+        }
+    }
 }
 
 /// The model's judgement of one message.

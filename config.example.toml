@@ -14,6 +14,14 @@ model = "qwen3:14b"
 timeout_seconds = 120
 # How much of the body (after HTML is flattened) the model sees.
 max_body_chars = 4000
+# The most tokens the model may write per answer. The answer itself is short, but reasoning
+# models (Qwen3 and similar) write a long "thinking" block first and may need 4096 or more.
+max_tokens = 1024
+# PRIVACY: the model server must be on this machine or your own network (127.0.0.1, 10.x,
+# 172.16-31.x, 192.168.x, or a .local / .lan / .home.arpa name), because the text of your
+# mail is sent to it. Any other address is refused. Setting this to true switches that check
+# off, and your mail text is then sent to that server. Leave it false unless you know why.
+allow_remote = false
 # How many model requests may run at once, across all accounts. Keep 1 if the same
 # machine also serves other models, e.g. a voice assistant.
 max_concurrent = 1

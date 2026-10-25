@@ -16,6 +16,26 @@ mailbox.
 
 See [docs/SPEC.md](docs/SPEC.md) for the full spec and [docs/](docs/) for the design notes.
 
+## Try it: classify your own mail
+
+You can judge the model on real messages before anything touches a mailbox.
+
+1. Start a local model server (for example `ollama serve` with `ollama pull qwen3:14b`).
+2. Export some messages from Apple Mail: select them and drag them to a folder in Finder, for
+   example `~/Desktop/mail`. Each one becomes an `.eml` file.
+3. Copy the example config and adjust `[llm]` to your model:
+   `mkdir -p ~/.config/lets-triage-mail && cp config.example.toml ~/.config/lets-triage-mail/config.toml`
+   (or pass `--config PATH`). The `[[accounts]]` block is not used by `classify`.
+4. Run it:
+
+   ```sh
+   cargo run --release -- classify ~/Desktop/mail/*.eml
+   ```
+
+Each file prints its category, confidence, reason and the flag it would get. Add `--json` for
+one JSON object per line. Nothing is sent anywhere except to your own model server, message
+bodies are never printed or stored, and no mailbox is touched.
+
 ## Background
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,

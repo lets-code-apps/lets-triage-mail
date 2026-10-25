@@ -14,11 +14,14 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::decider::LlmSettings;
 use crate::engine::{FlagColours, FlagPolicy, TriageFlag};
 use crate::flags::FlagColour;
+use crate::imap::{ImapSettings, TlsMode, is_loopback_host};
 
 /// Everything that can go wrong while loading the config or looking up a password.
 ///
@@ -121,6 +124,12 @@ pub struct LlmConfig {
     pub max_body_chars: usize,
     /// How many model requests may run at once, across all accounts.
     pub max_concurrent: usize,
+    /// Upper limit on the length of the model's answer, in tokens. Reasoning models that
+    /// write a long think block before the JSON may need more than the default.
+    pub max_tokens: u32,
+    /// Allow a `base_url` that is not on this machine or a private network. Off by default,
+    /// because the privacy promise is "mail content never leaves your own network".
+    pub allow_remote: bool,
     /// Only for local servers that insist on a key.
     pub api_key: Option<Secret>,
 }
@@ -133,7 +142,23 @@ impl Default for LlmConfig {
             timeout_seconds: 120,
             max_body_chars: 4000,
             max_concurrent: 1,
+            max_tokens: 1024,
+            allow_remote: false,
             api_key: None,
+        }
+    }
+}
+
+impl From<&LlmConfig> for LlmSettings {
+    fn from(llm: &LlmConfig) -> LlmSettings {
+        LlmSettings {
+            base_url: llm.base_url.clone(),
+            model: llm.model.clone(),
+            timeout: Duration::from_secs(llm.timeout_seconds),
+            max_body_chars: llm.max_body_chars,
+            max_concurrent: llm.max_concurrent,
+            max_tokens: llm.max_tokens,
+            api_key: llm.api_key.as_ref().map(|key| key.expose().to_string()),
         }
     }
 }
@@ -319,12 +344,41 @@ fn default_inbox() -> String {
     String::from("INBOX")
 }
 
-/// Whether a host name or address points back at this machine.
-fn is_loopback_host(host: &str) -> bool {
-    // `[::1]` is how an IPv6 literal may be written in a URL-like form.
+/// Whether a host name or address is on this machine or a private network, so that mail
+/// content sent there stays inside the user's own network.
+///
+/// Accepts loopback, RFC 1918 private IPv4, link-local, IPv6 unique-local (`fc00::/7`),
+/// `localhost`, and the names that are reserved for local networks: `.local` (mDNS), `.lan`
+/// and `.home.arpa` (RFC 8375). It never looks anything up in DNS: a name that merely
+/// *looks* local could still resolve to a public address, and the answer could change, so
+/// the check is on the text only. A user who really means a remote server says so with
+/// `llm.allow_remote`.
+fn is_local_or_private_host(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost")
-        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    // `fc00::/7` and `fe80::/10` have no stable std helper yet, so we test
+                    // the leading bits by hand.
+                    || v6.segments()[0] & 0xfe00 == 0xfc00
+                    || v6.segments()[0] & 0xffc0 == 0xfe80
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    })
+            }
+        };
+    }
+    let name = bare.trim_end_matches('.').to_ascii_lowercase();
+    // A single-label name such as `studio` can only come from the local network: public DNS
+    // names always have a dot.
+    (!name.is_empty() && !name.contains('.'))
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || name.ends_with(".local")
+        || name.ends_with(".lan")
+        || name.ends_with(".home.arpa")
 }
 
 /// The environment variable that holds an account's password:
@@ -351,6 +405,27 @@ impl AccountConfig {
             Tls::Tls => 993,
             Tls::Starttls | Tls::None => 143,
         })
+    }
+
+    /// The connection settings for the IMAP session, with the already-resolved password.
+    ///
+    /// The password is passed in rather than looked up here, so this conversion stays pure
+    /// (no shell commands) and a caller decides when the lookup happens. The "plain text
+    /// only on loopback" rule is enforced in one place, [`ImapSettings::validate`], which
+    /// the session runs before connecting; config validation uses the same
+    /// `is_loopback_host` check.
+    pub fn imap_settings(&self, password: &Secret) -> ImapSettings {
+        ImapSettings {
+            host: self.host.clone(),
+            port: self.port(),
+            tls: match self.tls {
+                Tls::Tls => TlsMode::Implicit,
+                Tls::Starttls => TlsMode::StartTls,
+                Tls::None => TlsMode::PlainLoopbackOnly,
+            },
+            username: self.username.clone(),
+            password: password.expose().to_string(),
+        }
     }
 
     /// Looks up the password: `password_command` if set, otherwise the environment variable.
@@ -458,6 +533,7 @@ impl Config {
                 "must start with http:// or https:// (for example http://127.0.0.1:11434/v1)",
             ));
         }
+        self.validate_llm_host()?;
         if llm.model.trim().is_empty() {
             return Err(ConfigError::invalid("llm.model", "must not be empty"));
         }
@@ -473,10 +549,41 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        if llm.max_tokens == 0 {
+            return Err(ConfigError::invalid("llm.max_tokens", "must be at least 1"));
+        }
         if llm.max_concurrent == 0 {
             return Err(ConfigError::invalid(
                 "llm.max_concurrent",
                 "must be at least 1 (use 1 to share the machine with other models)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enforces the privacy rule: the model server must be local or on a private network.
+    fn validate_llm_host(&self) -> Result<(), ConfigError> {
+        let llm = &self.llm;
+        if llm.allow_remote {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(&llm.base_url).map_err(|e| {
+            ConfigError::invalid("llm.base_url", format!("is not a valid URL: {e}"))
+        })?;
+        // `host_str` is `None` only for URLs without a host, which `http(s)://` never is,
+        // but treating it as "not local" is the safe answer.
+        let host = url.host_str().unwrap_or_default();
+        if !is_local_or_private_host(host) {
+            return Err(ConfigError::invalid(
+                "llm.base_url",
+                format!(
+                    "`{host}` is not a local or private-network address. Let's Triage Mail \
+                     sends your mail text to this server, and the privacy rule is that it \
+                     never leaves your own network. Use a loopback address (127.0.0.1), a \
+                     private address (10.x, 172.16-31.x, 192.168.x), or a .local, .lan or \
+                     .home.arpa name. If you really want a remote server, set \
+                     `allow_remote = true` in [llm]; your mail text is then sent there."
+                ),
             ));
         }
         Ok(())
@@ -509,6 +616,37 @@ impl Config {
                 return Err(ConfigError::invalid(
                     format!("flags.{key}.name"),
                     "must not be empty",
+                ));
+            }
+        }
+
+        // Two flags with one colour could not be told apart in Mail, and clearing one
+        // would clear the other. Only flags that are switched on count.
+        let policy = self.flag_policy();
+        let in_use = [
+            (
+                "reply_needed",
+                policy.reply_needed,
+                policy.colours.reply_needed,
+            ),
+            ("deadline", policy.deadline, policy.colours.deadline),
+            ("to_pay", policy.to_pay, policy.colours.to_pay),
+            (
+                "bookkeeping",
+                policy.bookkeeping,
+                policy.colours.bookkeeping,
+            ),
+            ("unsure", policy.unsure, policy.colours.unsure),
+        ];
+        let enabled: Vec<_> = in_use.iter().filter(|(_, on, _)| *on).collect();
+        for (index, (key, _, colour)) in enabled.iter().enumerate() {
+            if let Some((other, _, _)) = enabled[..index].iter().find(|(_, _, c)| c == colour) {
+                return Err(ConfigError::invalid(
+                    format!("flags.{key}.colour"),
+                    format!(
+                        "flags `{other}` and `{key}` are both enabled with the same colour \
+                         ({colour:?}); give each enabled flag its own colour"
+                    ),
                 ));
             }
         }
@@ -926,5 +1064,125 @@ mod tests {
     fn load_reports_a_missing_file() {
         let error = Config::load(Path::new("/nonexistent/config.toml")).unwrap_err();
         assert!(error.to_string().contains("/nonexistent/config.toml"));
+    }
+    fn llm_url(url: &str) -> String {
+        format!("[llm]\nbase_url = \"{url}\"\n")
+    }
+
+    #[test]
+    fn local_and_private_model_hosts_are_accepted() {
+        for url in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:1234/v1",
+            "http://[::1]:8080/v1",
+            "http://10.0.0.5/v1",
+            "http://172.16.3.4/v1",
+            "http://172.31.255.1/v1",
+            "http://192.168.1.20:1234/v1",
+            "http://169.254.10.10/v1",
+            "http://[fd12:3456::1]/v1",
+            "http://[fe80::1]/v1",
+            "http://mac-studio.local:1234/v1",
+            "http://studio.lan/v1",
+            "http://studio:1234/v1",
+            "http://studio.home.arpa/v1",
+            "http://STUDIO.Local/v1",
+        ] {
+            assert!(
+                Config::parse(&llm_url(url)).is_ok(),
+                "{url} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_model_hosts_are_rejected_with_the_privacy_rule() {
+        for url in [
+            "https://api.openai.com/v1",
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://192.169.0.1/v1",
+            "http://[2001:db8::1]/v1",
+            "http://evil.local.example.com/v1",
+        ] {
+            let message = error_of(&llm_url(url));
+            assert!(message.contains("llm.base_url"), "{url}: {message}");
+            assert!(message.contains("allow_remote"), "{url}: {message}");
+        }
+    }
+
+    #[test]
+    fn allow_remote_opts_out_of_the_host_check() {
+        let text = "[llm]\nbase_url = \"https://llm.example.com/v1\"\nallow_remote = true\n";
+        assert!(Config::parse(text).is_ok());
+    }
+
+    #[test]
+    fn max_tokens_defaults_to_1024_and_reaches_the_settings() {
+        assert_eq!(Config::parse("").unwrap().llm.max_tokens, 1024);
+        let config = Config::parse("[llm]\nmax_tokens = 4096\napi_key = \"k\"\n").unwrap();
+        let settings = LlmSettings::from(&config.llm);
+        assert_eq!(settings.max_tokens, 4096);
+        assert_eq!(settings.api_key.as_deref(), Some("k"));
+        assert_eq!(settings.timeout, Duration::from_secs(120));
+        assert!(error_of("[llm]\nmax_tokens = 0\n").contains("llm.max_tokens"));
+    }
+
+    #[test]
+    fn two_enabled_flags_may_not_share_a_colour() {
+        let message = error_of("[flags.deadline]\nenabled = true\ncolour = \"orange\"\n");
+        assert!(message.contains("flags.deadline.colour"), "{message}");
+        assert!(message.contains("reply_needed"), "{message}");
+    }
+
+    #[test]
+    fn a_disabled_flag_may_share_a_colour() {
+        // `deadline` is off by default, so it does not clash with `reply_needed`.
+        assert!(Config::parse("[flags.deadline]\ncolour = \"orange\"\n").is_ok());
+    }
+
+    #[test]
+    fn account_converts_to_imap_settings() {
+        let config = Config::parse(
+            r#"
+            [[accounts]]
+            name = "a"
+            host = "imap.example.com"
+            username = "me"
+            tls = "starttls"
+            "#,
+        )
+        .unwrap();
+        let settings = config.accounts[0].imap_settings(&Secret::new("pw"));
+        assert_eq!(settings.host, "imap.example.com");
+        assert_eq!(settings.port, 143);
+        assert_eq!(settings.tls, TlsMode::StartTls);
+        assert_eq!(settings.username, "me");
+        assert_eq!(settings.password, "pw");
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_modes_map_and_plain_stays_loopback_only() {
+        let account = |tls: &str, host: &str| {
+            let text = format!(
+                "[[accounts]]\nname = \"a\"\nhost = \"{host}\"\nusername = \"u\"\ntls = \"{tls}\"\n"
+            );
+            Config::parse(&text).unwrap().accounts.remove(0)
+        };
+        let secret = Secret::new("pw");
+        assert_eq!(
+            account("tls", "imap.example.com")
+                .imap_settings(&secret)
+                .tls,
+            TlsMode::Implicit
+        );
+        let plain = account("none", "127.0.0.1").imap_settings(&secret);
+        assert_eq!(plain.tls, TlsMode::PlainLoopbackOnly);
+        assert_eq!(plain.port, 143);
+        // The session-side check agrees with the config-side one (same function).
+        let mut remote = plain;
+        remote.host = "imap.example.com".into();
+        assert!(remote.validate().is_err());
     }
 }

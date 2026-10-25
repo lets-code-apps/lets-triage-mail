@@ -99,11 +99,13 @@ impl ImapSettings {
 }
 
 /// True for `localhost` and loopback IP addresses (`127.0.0.0/8`, `::1`).
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+///
+/// The one definition of "loopback" in the crate: the config validation uses it too.
+pub fn is_loopback_host(host: &str) -> bool {
+    // `[::1]` is how an IPv6 literal may be written in a URL-like form.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Everything that can go wrong while talking to an IMAP server.

@@ -59,8 +59,12 @@ pub enum Command {
     Check,
     /// Classify one message without touching any mailbox
     Classify {
-        /// Path to an .eml file
-        file: PathBuf,
+        /// One or more .eml files (for example exported from Apple Mail)
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+        /// Print one JSON object per file instead of readable text
+        #[arg(long)]
+        json: bool,
     },
     /// Classify and flag existing inbox mail from the last few days
     Backfill {
@@ -101,7 +105,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Run => run::run(&config_path).await,
         Command::Check => check::run(&config_path).await,
-        Command::Classify { file } => classify::run(&config_path, &file).await,
+        Command::Classify { files, json } => classify::run(&config_path, &files, json).await,
         Command::Backfill { days, account } => {
             backfill::run(&config_path, days, account.as_deref()).await
         }
@@ -196,6 +200,27 @@ mod tests {
                 json: true
             }
         ));
+    }
+
+    #[test]
+    fn parses_classify_with_several_files_and_json() {
+        let cli = parse(&["classify", "a.eml", "b.eml", "--json"]).unwrap();
+        match cli.command {
+            Command::Classify { files, json } => {
+                assert_eq!(files, [PathBuf::from("a.eml"), PathBuf::from("b.eml")]);
+                assert!(json);
+            }
+            other => panic!("expected classify, got {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["classify", "a.eml"]).unwrap().command,
+            Command::Classify { json: false, .. }
+        ));
+    }
+
+    #[test]
+    fn classify_needs_at_least_one_file() {
+        assert!(parse(&["classify"]).is_err());
     }
 
     #[test]

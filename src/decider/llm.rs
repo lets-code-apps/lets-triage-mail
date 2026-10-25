@@ -85,6 +85,9 @@ pub struct LlmSettings {
     /// How many requests may be in flight at once. The default is 1, so we do not starve the
     /// voice assistant that shares the machine's model.
     pub max_concurrent: usize,
+    /// Upper limit on the length of the model's answer. Reasoning models spend tokens on a
+    /// long think block before the JSON, so they may need more than the default.
+    pub max_tokens: u32,
     pub api_key: Option<String>,
 }
 
@@ -97,6 +100,7 @@ impl std::fmt::Debug for LlmSettings {
             .field("timeout", &self.timeout)
             .field("max_body_chars", &self.max_body_chars)
             .field("max_concurrent", &self.max_concurrent)
+            .field("max_tokens", &self.max_tokens)
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .finish()
     }
@@ -184,7 +188,7 @@ impl LlmDecider {
         );
         let mut mode = self.current_mode();
         loop {
-            let body = request_body(&self.settings.model, system, user, mode);
+            let body = request_body(&self.settings, system, user, mode);
             let mut request = self.client.post(&url).json(&body);
             if let Some(key) = &self.settings.api_key {
                 request = request.bearer_auth(key);
@@ -236,15 +240,15 @@ impl Decider for LlmDecider {
 
 // --- Request and response shapes ---
 
-fn request_body(model: &str, system: &str, user: &str, mode: OutputMode) -> Value {
+fn request_body(settings: &LlmSettings, system: &str, user: &str, mode: OutputMode) -> Value {
     let mut body = json!({
-        "model": model,
+        "model": settings.model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "temperature": 0,
-        "max_tokens": 1024,
+        "max_tokens": settings.max_tokens,
     });
     match mode {
         OutputMode::JsonSchema => {
@@ -617,6 +621,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_body_chars: 4000,
             max_concurrent: 1,
+            max_tokens: 1024,
             api_key: None,
         }
     }
@@ -877,6 +882,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             max_body_chars: 100,
             max_concurrent: 1,
+            max_tokens: 1024,
             api_key: None,
         })
         .unwrap();
@@ -937,6 +943,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_body_chars: 1,
             max_concurrent: 1,
+            max_tokens: 1024,
             api_key: Some("hunter2".into()),
         };
         assert!(!format!("{s:?}").contains("hunter2"));
