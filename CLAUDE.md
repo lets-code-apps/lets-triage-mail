@@ -60,6 +60,7 @@ Out of scope for v1: folder moves, unsubscribe queue, web review UI, MailKit (Sw
 - `docs/DECISIONS.md`: decision log with reasons, and options we rejected
 - `docs/RESEARCH.md`: what we learned about Inbox Zero, Mac mail clients and the Apple Mail extension APIs
 - `docs/OPEN_SOURCE.md`: repo, licence and launch checklist
+- `docs/PLAN.md`: v1 implementation plan: phases, tasks, milestones and the brief for agents
 - Python prototype (working name MailGuard, 34 passing tests): kept **outside** this repo so it
   never enters the public history; its local path is in `CLAUDE.local.md`. Treat it as the
   behavioural reference and port its tests as the spec.
