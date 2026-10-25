@@ -10,4 +10,5 @@ pub mod evidence;
 pub mod flags;
 pub mod imap;
 pub mod message;
+pub mod senders;
 pub mod store;

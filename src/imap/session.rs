@@ -37,6 +37,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const META_QUERY: &str = "(UID RFC822.SIZE FLAGS)";
 const BODY_PEEK_QUERY: &str = "(UID BODY.PEEK[])";
 const HEADERS_PEEK_QUERY: &str = "(UID BODY.PEEK[HEADER])";
+// ENVELOPE is the server's own parsed summary of the header (RFC 3501 §7.4.2). It never
+// includes the body, and fetching it does not set `\Seen`.
+const ENVELOPE_QUERY: &str = "(UID ENVELOPE)";
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers
@@ -300,6 +303,36 @@ pub struct MessageMeta {
     pub flags: Vec<String>,
 }
 
+/// The recipients of one message, as lowercase `local@domain` addresses.
+///
+/// Built from the `ENVELOPE` of a message in the Sent folder. Addresses that cannot be decoded
+/// are left out rather than failing the whole fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvelopeAddresses {
+    /// The message's UID in the selected mailbox.
+    pub uid: u32,
+    /// Everyone in To, Cc and Bcc, in that order, lowercase. Duplicates are not removed.
+    pub recipients: Vec<String>,
+}
+
+/// Join the two halves of an envelope address into `local@domain`, lowercase.
+///
+/// IMAP sends an address as `(name adl mailbox host)`. A group such as `Team: a@x.org, b@x.org;`
+/// is sent as a start marker (`mailbox` = group name, `host` = NIL), the members, and an end
+/// marker (both NIL). Requiring *both* parts makes the markers fall out naturally, while the
+/// members are ordinary addresses. Bytes that are not valid UTF-8 are skipped: an old message
+/// with a Latin-1 address is not worth an error.
+pub(crate) fn envelope_address(mailbox: Option<&[u8]>, host: Option<&[u8]>) -> Option<String> {
+    let local = std::str::from_utf8(mailbox?).ok()?.trim();
+    let domain = std::str::from_utf8(host?).ok()?.trim();
+    let bad =
+        |text: &str| text.is_empty() || text.chars().any(|c| c.is_whitespace() || c.is_control());
+    if bad(local) || bad(domain) || domain.contains('@') {
+        return None;
+    }
+    Some(format!("{local}@{domain}").to_lowercase())
+}
+
 /// An authenticated connection to one IMAP account.
 pub struct ImapSession {
     inner: Session<MaybeTls>,
@@ -408,6 +441,46 @@ impl ImapSession {
             .collect()
     }
 
+    /// To, Cc and Bcc addresses of every message with a UID in `first..=last` in the selected
+    /// mailbox, fetched with `ENVELOPE` only (no body, nothing marked as read).
+    ///
+    /// A range is used instead of a list of UIDs because a long list makes a long command line;
+    /// UIDs in the range that do not exist are simply absent from the answer.
+    pub async fn fetch_envelopes(
+        &mut self,
+        first: u32,
+        last: u32,
+    ) -> Result<Vec<EnvelopeAddresses>, ImapError> {
+        if self.selected.is_none() {
+            return Err(ImapError::NoMailboxSelected);
+        }
+        let fetches: Vec<_> = self
+            .inner
+            .uid_fetch(format!("{first}:{last}"), ENVELOPE_QUERY)
+            .await?
+            .try_collect()
+            .await?;
+
+        let mut result = Vec::new();
+        for fetch in &fetches {
+            // A response without UID or ENVELOPE (such as an unsolicited flag update) is not
+            // an error; there is just nothing to harvest from it.
+            let (Some(uid), Some(envelope)) = (fetch.uid, fetch.envelope()) else {
+                continue;
+            };
+            let recipients = [&envelope.to, &envelope.cc, &envelope.bcc]
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|address| {
+                    envelope_address(address.mailbox.as_deref(), address.host.as_deref())
+                })
+                .collect();
+            result.push(EnvelopeAddresses { uid, recipients });
+        }
+        Ok(result)
+    }
+
     /// The whole raw message, fetched with `BODY.PEEK[]` so it is **not** marked as read.
     ///
     /// `None` if the message is gone (for example deleted by the user in the meantime).
@@ -509,6 +582,28 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn envelope_addresses_are_joined_and_lowercased() {
+        let joined = envelope_address(Some(b"Ann.Lee"), Some(b"Example.ORG"));
+        assert_eq!(joined.as_deref(), Some("ann.lee@example.org"));
+    }
+
+    #[test]
+    fn envelope_addresses_skip_group_markers_and_junk() {
+        // Group start: host is NIL. Group end: both are NIL.
+        assert_eq!(envelope_address(Some(b"Team"), None), None);
+        assert_eq!(envelope_address(None, None), None);
+        assert_eq!(envelope_address(None, Some(b"example.org")), None);
+        // Latin-1 bytes, empty parts, spaces and a second `@` are rejected, not a panic.
+        assert_eq!(
+            envelope_address(Some(b"caf\xe9"), Some(b"example.org")),
+            None
+        );
+        assert_eq!(envelope_address(Some(b""), Some(b"example.org")), None);
+        assert_eq!(envelope_address(Some(b"a b"), Some(b"example.org")), None);
+        assert_eq!(envelope_address(Some(b"a"), Some(b"x@y")), None);
+    }
 
     #[test]
     fn capabilities_are_parsed_case_insensitively() {

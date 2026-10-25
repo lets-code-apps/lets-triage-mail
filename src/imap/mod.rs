@@ -41,7 +41,7 @@ use std::fmt;
 use std::net::IpAddr;
 
 pub use folders::{ListedFolder, ResolvedFolders, resolve_folders};
-pub use session::{ImapSession, MailboxInfo, MessageMeta, ServerCapabilities};
+pub use session::{EnvelopeAddresses, ImapSession, MailboxInfo, MessageMeta, ServerCapabilities};
 
 /// How to protect the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
