@@ -125,6 +125,32 @@ Tasks 1.1–1.3 can run in parallel after 0.3.
   `.eml` files), runs `classify` on each against his local model, and judges the verdicts. Tune the
   prompt here, before any IMAP work.
 
+### 1.5 Tuning after the first real data (2026-10-25)
+Milestone A ran on 16 real messages. Most verdicts were right. Three gaps showed up:
+- **Rotating-address spam.** Casino spam arrives 5–10 times a day, each from a new random
+  address, so a block rule cannot catch it. It was labelled "marketing". It has signals our
+  code can check without the model:
+  - **Invalid sender address:** the domain has two dots in a row (`a@x.cz..sn.live.com`).
+  - **The recipient's own name inside a stranger's From:** the local part starts with the
+    recipient's own local part plus random characters
+    (`me.name.2lkxp6bb.fnvrb@other.example`), or the display name equals the recipient's local
+    part or address.
+- **Provider headers.** Some providers (wp.pl) do not write `Authentication-Results`; they write
+  their own headers instead (`X-WP-DKIM-Status`, `X-WP-SPAM`). Without them, SPF/DKIM is
+  "unknown" for every message on that account.
+- **Prompt.** A delivery date was read as a deadline. A marketing agency sending for a brand
+  (brand ≠ sending domain, valid DKIM) was called phishing.
+
+Work:
+- A deterministic **pre-check** before the model: certain spam gets a verdict from code (source
+  `rule`), so the model is not called. This saves about 12 s per message on a thinking model.
+  Shared by `classify` and the worker.
+- Opt-in support for provider authentication and spam headers, set in the config. It is opt-in
+  because a sender can forge headers; only trust them when the user's provider stamps them.
+- Prompt: a deadline is an action the user must take by a date. Phishing needs a credential or
+  payment lure, not only a brand–domain mismatch.
+- *Depends on:* 1.2, 1.3, 1.4, 3.5.
+
 ## Phase 2: Storage
 
 ### 2.1 SQLite store (`store.rs`)
