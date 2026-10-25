@@ -130,6 +130,24 @@ impl OutputMode {
     }
 }
 
+/// Makes `ring` the process-wide TLS crypto provider, once.
+///
+/// `reqwest` is built with `rustls-no-provider` so that the whole program uses a single TLS
+/// crypto library (`ring`, like the IMAP code) instead of also compiling `aws-lc-rs`. The
+/// price is that reqwest panics when it builds a client and no provider is installed, so
+/// every place that builds a `reqwest::Client` calls this first. Our endpoints are usually
+/// plain `http://` on the local network, but a user may point at an `https://` server.
+///
+/// `std::sync::Once` runs the closure exactly once however many times, and from however many
+/// threads, this is called. `install_default` fails if someone installed a provider already;
+/// that is fine, there is then one to use, so the error is ignored.
+pub fn install_tls_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// A [`Decider`] backed by a local OpenAI-compatible chat model.
 pub struct LlmDecider {
     settings: LlmSettings,
@@ -149,6 +167,7 @@ pub struct LlmDecider {
 impl LlmDecider {
     /// Builds the HTTP client. Fails only if the TLS backend cannot be initialised.
     pub fn new(settings: LlmSettings) -> Result<Self, DecideError> {
+        install_tls_provider();
         let client = reqwest::Client::builder()
             .timeout(settings.timeout)
             .build()?;

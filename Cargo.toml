@@ -17,7 +17,7 @@ clap = { version = "4.6.7", default-features = false, features = ["std", "derive
 ego-tree = "0.11.1"
 futures = "0.3.34"
 mail-parser = "1.0.0"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"

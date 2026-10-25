@@ -16,7 +16,7 @@ use std::future::Future;
 
 use crate::engine::Verdict;
 
-pub use llm::{LlmDecider, LlmSettings};
+pub use llm::{LlmDecider, LlmSettings, install_tls_provider};
 
 /// The outcome of one SPF, DKIM or DMARC check, as reported by our own mail server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
