@@ -1,0 +1,13 @@
+[package]
+name = "lets-triage-mail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local-first email triage for any IMAP account, powered by a local LLM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lets-code-apps/lets-triage-mail"
+readme = "README.md"
+keywords = ["email", "imap", "triage", "llm", "apple-mail"]
+categories = ["email", "command-line-utilities"]
+
+[dependencies]

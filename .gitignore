@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# Local config and data (may contain account details)
+config.toml
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# Claude Code local notes
+CLAUDE.local.md
