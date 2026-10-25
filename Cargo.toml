@@ -11,3 +11,8 @@ keywords = ["email", "imap", "triage", "llm", "apple-mail"]
 categories = ["email", "command-line-utilities"]
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "ansi"] }
