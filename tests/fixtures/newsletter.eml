@@ -1,0 +1,18 @@
+Authentication-Results: mx.test; spf=pass smtp.mailfrom=shop.example; dkim=pass header.d=shop.example; dmarc=pass header.from=shop.example
+From: Shop <news@shop.example>
+To: demouser@example.com
+Cc: Friend <Friend@Example.org>
+Subject: Weekly digest
+Message-ID: <weekly-1@shop.example>
+In-Reply-To: <prev-1@shop.example>
+References: <root-1@shop.example> <prev-1@shop.example>
+Date: Sat, 24 Oct 2026 12:00:00 +0200
+MIME-Version: 1.0
+List-Id: <weekly.shop.example>
+List-Unsubscribe: <mailto:unsub@shop.example>, <https://shop.example/u/abc>
+Precedence: bulk
+Content-Type: text/html; charset=utf-8
+
+<html><head><style>p{color:red}</style><title>Hidden title</title></head>
+<body><p>Hello <b>Piotr</b></p><script>evil()</script>
+<a href='https://a.example'>x</a><a href='https://b.example'>y</a></body></html>

@@ -8,4 +8,5 @@ pub mod decider;
 pub mod engine;
 pub mod flags;
 pub mod imap;
+pub mod message;
 pub mod store;

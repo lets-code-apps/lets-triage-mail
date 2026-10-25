@@ -1,0 +1,9 @@
+Authentication-Results: mx.mine.example; spf=fail smtp.mailfrom=bank.example; dkim=fail; dmarc=fail
+Authentication-Results: evil.example; dkim=pass header.d=bank.example; dmarc=pass
+From: Bank <service@bank.example>
+To: demouser@example.com
+Subject: Forged results below the real one
+Message-ID: <forged-1@bank.example>
+Date: Sat, 24 Oct 2026 12:00:00 +0200
+
+Hello.

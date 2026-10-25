@@ -1,0 +1,19 @@
+From: Anna <anna@friend.example>
+To: demouser@example.com
+Subject: Invoice
+Message-ID: <att-1@friend.example>
+Date: Sat, 24 Oct 2026 12:00:00 +0200
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset=utf-8
+
+Invoice attached, pay by Friday: https://pay.example/inv/1
+--b1
+Content-Type: application/pdf; name="invoice.pdf"
+Content-Disposition: attachment; filename="invoice.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJSBzeW50aGV0aWMgdGVzdCBkYXRhCg==
+--b1--

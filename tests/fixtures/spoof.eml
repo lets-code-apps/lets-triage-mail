@@ -1,0 +1,9 @@
+Authentication-Results: mx.test; spf=fail smtp.mailfrom=evil.example; dkim=none; dmarc=fail header.from=evil.example
+From: "support@paypal.com" <x@evil.example>
+Reply-To: collect@other.example
+To: demouser@example.com
+Subject: Account notice
+Message-ID: <spoof-1@evil.example>
+Date: Sat, 24 Oct 2026 12:00:00 +0200
+
+Please verify your account.
