@@ -239,6 +239,32 @@ pub struct LabelRecord {
     pub flag: Option<TriageFlag>,
 }
 
+/// A count for one label (a category or a flag) within one account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountCount {
+    pub account: String,
+    /// The stable stored text, for example `"newsletter"` or `"to_pay"`.
+    pub label: String,
+    pub count: u64,
+}
+
+/// A count for one label, with no account attached (for example one sender).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counted {
+    pub label: String,
+    pub count: u64,
+}
+
+/// The state of one account's retry queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrySummary {
+    pub account: String,
+    /// Messages waiting for another model attempt.
+    pub queued: u64,
+    /// Of those, how many are due now.
+    pub due: u64,
+}
+
 /// The SQLite-backed store. See the module docs for how to use it from async code.
 #[derive(Debug)]
 pub struct Store {
@@ -663,6 +689,101 @@ impl Store {
             .conn
             .execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
         Ok(removed > 0)
+    }
+
+    // ---- statistics (read-only) -----------------------------------------------------
+
+    /// Messages per account and category, for rows logged at or after `since` (Unix
+    /// seconds). Messages the model never judged (blocked sender, model failure) count
+    /// under `"unclassified"`. Biggest counts first.
+    pub fn category_counts(&self, since: i64) -> Result<Vec<AccountCount>> {
+        self.account_counts(
+            "SELECT account, COALESCE(category, 'unclassified'), COUNT(*) FROM processed
+             WHERE created_at >= ?1
+             GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2",
+            since,
+        )
+    }
+
+    /// Messages per account and chosen flag since `since`. This counts the flag the engine
+    /// chose, so in dry-run mode it shows the flags that *would* have been set.
+    pub fn flag_counts(&self, since: i64) -> Result<Vec<AccountCount>> {
+        self.account_counts(
+            "SELECT account, flag, COUNT(*) FROM processed
+             WHERE created_at >= ?1 AND flag IS NOT NULL
+             GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2",
+            since,
+        )
+    }
+
+    /// Shared by the two queries above: they differ only in SQL, not in row shape.
+    fn account_counts(&self, sql: &str, since: i64) -> Result<Vec<AccountCount>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![since], |row| {
+                Ok(AccountCount {
+                    account: row.get(0)?,
+                    label: row.get(1)?,
+                    count: row.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The `limit` senders with the most messages since `since`, in one account or (with
+    /// `None`) across all of them. Ties are broken by address so the output is stable.
+    pub fn top_senders(
+        &self,
+        since: i64,
+        limit: u32,
+        account: Option<&str>,
+    ) -> Result<Vec<Counted>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender, COUNT(*) AS n FROM processed
+             WHERE created_at >= ?1 AND sender IS NOT NULL AND (?2 IS NULL OR account = ?2)
+             GROUP BY sender ORDER BY n DESC, sender LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![since, account, limit], |row| {
+                Ok(Counted {
+                    label: row.get(0)?,
+                    // SQLite integers are signed 64-bit; a COUNT is never negative.
+                    count: row.get::<_, i64>(1)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The oldest and newest `processed` row since `since` (Unix seconds), or `None` when
+    /// there are none.
+    pub fn processed_range(&self, since: i64) -> Result<Option<(i64, i64)>> {
+        // MIN and MAX over zero rows give one row of NULLs, hence the `Option`s.
+        let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(created_at), MAX(created_at) FROM processed WHERE created_at >= ?1",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(first.zip(last))
+    }
+
+    /// Per account: how many messages wait in the retry queue and how many are due at `now`.
+    pub fn retry_queue_summary(&self, now: i64) -> Result<Vec<RetrySummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account, COUNT(*), COALESCE(SUM(next_attempt_at <= ?1), 0)
+             FROM retry_queue GROUP BY account ORDER BY account",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |row| {
+                Ok(RetrySummary {
+                    account: row.get(0)?,
+                    queued: row.get::<_, i64>(1)? as u64,
+                    due: row.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // ---- digest state -------------------------------------------------------------
@@ -1305,5 +1426,132 @@ mod tests {
         if wal.exists() {
             assert_eq!(mode(&wal), 0o600);
         }
+    }
+
+    // ---- statistics ---
+
+    /// Inserts a `processed` row directly, so a test can choose the timestamp.
+    fn log(
+        s: &Store,
+        uid: u32,
+        account: &str,
+        sender: &str,
+        labels: (Option<&str>, Option<&str>),
+        at: i64,
+    ) {
+        let (category, flag) = labels;
+        s.conn
+            .execute(
+                "INSERT INTO processed
+                   (account, mailbox, uidvalidity, uid, sender, category, flag, source, created_at)
+                 VALUES (?1, 'INBOX', 1, ?2, ?3, ?4, ?5, 'model', ?6)",
+                params![account, uid, sender, category, flag, at],
+            )
+            .unwrap();
+    }
+
+    fn ac(account: &str, label: &str, count: u64) -> AccountCount {
+        AccountCount {
+            account: account.into(),
+            label: label.into(),
+            count,
+        }
+    }
+
+    fn counted(label: &str, count: u64) -> Counted {
+        Counted {
+            label: label.into(),
+            count,
+        }
+    }
+
+    #[test]
+    fn category_and_flag_counts_group_by_account_and_respect_since() {
+        let s = store();
+        log(&s, 1, "a", "x@x.com", (Some("newsletter"), None), 100);
+        log(&s, 2, "a", "x@x.com", (Some("newsletter"), None), 200);
+        log(
+            &s,
+            3,
+            "a",
+            "y@y.com",
+            (Some("personal"), Some("reply_needed")),
+            300,
+        );
+        log(&s, 4, "a", "z@z.com", (None, None), 400);
+        log(
+            &s,
+            5,
+            "b",
+            "x@x.com",
+            (Some("personal"), Some("reply_needed")),
+            500,
+        );
+        log(&s, 6, "b", "old@x.com", (Some("spam"), None), 10);
+
+        assert_eq!(
+            s.category_counts(0).unwrap(),
+            vec![
+                ac("a", "newsletter", 2),
+                ac("a", "personal", 1),
+                ac("a", "unclassified", 1),
+                ac("b", "personal", 1),
+                ac("b", "spam", 1),
+            ]
+        );
+        // The cut-off hides the old spam row.
+        let recent = s.category_counts(50).unwrap();
+        assert!(!recent.iter().any(|c| c.label == "spam"));
+        assert_eq!(
+            s.flag_counts(0).unwrap(),
+            vec![ac("a", "reply_needed", 1), ac("b", "reply_needed", 1)]
+        );
+    }
+
+    #[test]
+    fn top_senders_can_be_limited_to_an_account() {
+        let s = store();
+        log(&s, 1, "a", "x@x.com", (None, None), 100);
+        log(&s, 2, "a", "x@x.com", (None, None), 100);
+        log(&s, 3, "a", "y@y.com", (None, None), 100);
+        log(&s, 4, "b", "y@y.com", (None, None), 100);
+        log(&s, 5, "b", "y@y.com", (None, None), 100);
+        log(&s, 6, "b", "y@y.com", (None, None), 100);
+
+        assert_eq!(
+            s.top_senders(0, 10, None).unwrap(),
+            vec![counted("y@y.com", 4), counted("x@x.com", 2)]
+        );
+        assert_eq!(
+            s.top_senders(0, 10, Some("a")).unwrap(),
+            vec![counted("x@x.com", 2), counted("y@y.com", 1)]
+        );
+        assert_eq!(s.top_senders(0, 1, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn processed_range_is_none_when_empty() {
+        let s = store();
+        assert_eq!(s.processed_range(0).unwrap(), None);
+        log(&s, 1, "a", "x@x.com", (None, None), 100);
+        log(&s, 2, "a", "x@x.com", (None, None), 300);
+        assert_eq!(s.processed_range(0).unwrap(), Some((100, 300)));
+        assert_eq!(s.processed_range(200).unwrap(), Some((300, 300)));
+    }
+
+    #[test]
+    fn retry_queue_summary_counts_queued_and_due() {
+        let s = store();
+        assert!(s.retry_queue_summary(500).unwrap().is_empty());
+        s.enqueue_retry(&key(1), "down", 100).unwrap();
+        s.enqueue_retry(&key(2), "down", 900).unwrap();
+        assert_eq!(
+            s.retry_queue_summary(500).unwrap(),
+            vec![RetrySummary {
+                account: "a".into(),
+                queued: 2,
+                due: 1
+            }]
+        );
     }
 }

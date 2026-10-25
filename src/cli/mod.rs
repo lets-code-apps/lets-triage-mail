@@ -12,9 +12,10 @@ mod run;
 mod stats;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand};
+use lets_triage_mail::config::Config;
 
 /// Where the config lives when `--config` is not given (see `docs/SPEC.md` section 3).
 const DEFAULT_CONFIG_PATH: &str = "~/.config/lets-triage-mail/config.toml";
@@ -84,6 +85,9 @@ pub enum Command {
         /// How many days back to cover
         #[arg(long, default_value_t = 7)]
         days: u32,
+        /// Print machine-readable JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the sender allow and block rules
     #[command(subcommand)]
@@ -104,9 +108,21 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Digest { account, dry } => {
             digest::run(&config_path, account.as_deref(), dry).await
         }
-        Command::Stats { days } => stats::run(&config_path, days).await,
+        Command::Stats { days, json } => stats::run(&config_path, days, json).await,
         Command::Rules(command) => rules::run(&config_path, command).await,
     }
+}
+
+/// Loads the config for a command, with a pointer to the example file when it is missing.
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    if !path.exists() {
+        anyhow::bail!(
+            "config file {} not found; copy config.example.toml there and adjust it, \
+             or pass --config PATH",
+            path.display()
+        );
+    }
+    Ok(Config::load(path)?)
 }
 
 /// Replaces a leading `~` with the home directory.
@@ -161,18 +177,62 @@ mod tests {
             }
         ));
         let cli = parse(&["stats"]).unwrap();
-        assert!(matches!(cli.command, Command::Stats { days: 7 }));
+        assert!(matches!(
+            cli.command,
+            Command::Stats {
+                days: 7,
+                json: false
+            }
+        ));
     }
 
     #[test]
-    fn parses_rules_allow() {
+    fn parses_stats_options() {
+        let cli = parse(&["stats", "--days", "30", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Stats {
+                days: 30,
+                json: true
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_rules_allow_with_and_without_account() {
         let cli = parse(&["rules", "allow", "@example.com"]).unwrap();
         match cli.command {
-            Command::Rules(rules::RulesCommand::Allow { pattern }) => {
+            Command::Rules(rules::RulesCommand::Allow { pattern, account }) => {
                 assert_eq!(pattern, "@example.com");
+                assert_eq!(account, None);
             }
             other => panic!("expected rules allow, got {other:?}"),
         }
+        let cli = parse(&["rules", "block", "a@b.com", "--account", "work"]).unwrap();
+        match cli.command {
+            Command::Rules(rules::RulesCommand::Block { pattern, account }) => {
+                assert_eq!(pattern, "a@b.com");
+                assert_eq!(account.as_deref(), Some("work"));
+            }
+            other => panic!("expected rules block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rules_remove_and_list_account() {
+        let cli = parse(&["rules", "remove", "@b.com", "--account", "home"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Rules(rules::RulesCommand::Remove {
+                account: Some(_),
+                ..
+            })
+        ));
+        let cli = parse(&["rules", "list", "--account", "home"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Rules(rules::RulesCommand::List { account: Some(_) })
+        ));
     }
 
     #[test]
@@ -180,6 +240,12 @@ mod tests {
         assert!(parse(&["rules", "list"]).is_ok());
         assert!(parse(&["rules", "list", "x"]).is_err());
         assert!(parse(&["rules", "block"]).is_err());
+    }
+
+    #[test]
+    fn missing_config_error_points_at_the_example() {
+        let err = load_config(Path::new("/nonexistent/config.toml")).unwrap_err();
+        assert!(err.to_string().contains("config.example.toml"), "{err}");
     }
 
     #[test]
