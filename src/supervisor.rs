@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{AccountConfig, Config};
@@ -143,10 +143,16 @@ where
 {
     let mut failures = 0u32;
     loop {
+        let started = Instant::now();
         let error = match make_worker().await {
             Ok(()) => return AccountEnd::Stopped,
             Err(error) => error,
         };
+        // A worker that ran fine for longer than the longest wait was healthy: start the
+        // backoff from the beginning, so one bad login after days of work waits 5 min, not 1 h.
+        if started.elapsed() >= timing.restart_max {
+            failures = 0;
+        }
         failures += 1;
         match restart_decision(&error, failures, timing) {
             RestartDecision::GiveUp => {
@@ -461,6 +467,46 @@ mod tests {
         .await;
         assert_eq!(end, AccountEnd::Stopped);
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_healthy_run_resets_the_restart_backoff() {
+        let shutdown = CancellationToken::new();
+        let timing = timing();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        supervise("a", &shutdown, &timing, || {
+            let (starts, shutdown) = (Arc::clone(&starts), shutdown.clone());
+            let healthy_for = timing.restart_max;
+            async move {
+                let attempt = {
+                    let mut starts = starts.lock().unwrap();
+                    starts.push(Instant::now());
+                    starts.len()
+                };
+                match attempt {
+                    1 | 2 => Err(login_error()),
+                    3 => {
+                        // Runs fine for a long time, then the login fails once more.
+                        sleep(healthy_for).await;
+                        Err(login_error())
+                    }
+                    _ => {
+                        shutdown.cancel();
+                        Ok(())
+                    }
+                }
+            }
+        })
+        .await;
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 4);
+        // Second failure in a row: the doubled wait.
+        assert_eq!(starts[2] - starts[1], timing.restart_initial * 2);
+        // After the healthy run the wait starts from the beginning again.
+        assert_eq!(
+            starts[3] - starts[2],
+            timing.restart_max + timing.restart_initial
+        );
     }
 
     #[tokio::test(start_paused = true)]
