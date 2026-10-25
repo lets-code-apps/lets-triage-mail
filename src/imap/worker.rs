@@ -49,6 +49,7 @@ use crate::config::{AccountConfig, Config, ConfigError};
 use crate::decider::{Decider, Evidence};
 use crate::engine::{FlagPolicy, Trust, choose_flag, screen_sender};
 use crate::message::{HEADERS_ONLY_THRESHOLD, ParsedMessage, parse_headers_only, parse_message};
+use crate::precheck::{SOURCE_MODEL, SOURCE_RULE, precheck};
 use crate::senders::plan_batches;
 use crate::store::{LabelRecord, MailboxState, MessageKey, ProcessedRecord, Store, StoreError};
 
@@ -573,9 +574,10 @@ impl<D: Decider> Ctx<'_, D> {
         };
 
         let authserv = Some(self.config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
+        let provider = self.config.policy.provider_headers;
         let parsed = match plan {
-            FetchPlan::Full => parse_message(&raw, authserv),
-            FetchPlan::HeadersOnly => parse_headers_only(&raw, authserv),
+            FetchPlan::Full => parse_message(&raw, authserv, provider),
+            FetchPlan::HeadersOnly => parse_headers_only(&raw, authserv, provider),
         };
         let Ok(parsed) = parsed else {
             tracing::warn!(account = %self.account.name, uid = meta.uid, "cannot parse the message; skipping");
@@ -621,7 +623,7 @@ impl<D: Decider> Ctx<'_, D> {
             subject: Some(parsed.subject.clone()),
             verdict: None,
             flag: None,
-            source: String::from("rule"),
+            source: String::from(SOURCE_RULE),
         };
 
         // A blocked sender is never shown to the model.
@@ -633,32 +635,48 @@ impl<D: Decider> Ctx<'_, D> {
         }
 
         let evidence = Evidence::from_message(parsed, domain_count > 0);
-        let Some(decision) = self
-            .shutdown
-            .run_until_cancelled(self.decider.decide(&evidence))
-            .await
-        else {
-            return Ok(Outcome::Cancelled);
-        };
 
-        let verdict = match decision {
-            Ok(verdict) => verdict,
-            Err(error) => {
-                // No guess, no action: queue it for later.
-                let attempts = failed_attempts + 1;
-                let delay =
-                    backoff_delay(attempts, self.timing.retry_initial, self.timing.retry_max);
-                let due =
-                    now_unix().saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
-                let (retry_key, text) = (key.clone(), error.to_string());
-                self.with_store(move |store| store.enqueue_retry(&retry_key, &text, due))
-                    .await?;
-                tracing::warn!(
-                    account = %self.account.name, uid = key.uid, attempts,
-                    retry_in_secs = delay.as_secs(), %error,
-                    "the model failed; message queued for a retry"
-                );
-                return Ok(Outcome::Deferred);
+        // Certain spam is decided by code and the model is never asked. A sender the user
+        // allowed or has written to (`Trusted`) is exempt: the heuristics must not override
+        // the user's own knowledge.
+        let rule_verdict = if trust == Trust::Unknown {
+            precheck(&evidence)
+        } else {
+            None
+        };
+        let (verdict, source) = match rule_verdict {
+            Some(verdict) => (verdict, SOURCE_RULE),
+            None => {
+                let Some(decision) = self
+                    .shutdown
+                    .run_until_cancelled(self.decider.decide(&evidence))
+                    .await
+                else {
+                    return Ok(Outcome::Cancelled);
+                };
+                match decision {
+                    Ok(verdict) => (verdict, SOURCE_MODEL),
+                    Err(error) => {
+                        // No guess, no action: queue it for later.
+                        let attempts = failed_attempts + 1;
+                        let delay = backoff_delay(
+                            attempts,
+                            self.timing.retry_initial,
+                            self.timing.retry_max,
+                        );
+                        let due = now_unix()
+                            .saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
+                        let (retry_key, text) = (key.clone(), error.to_string());
+                        self.with_store(move |store| store.enqueue_retry(&retry_key, &text, due))
+                            .await?;
+                        tracing::warn!(
+                            account = %self.account.name, uid = key.uid, attempts,
+                            retry_in_secs = delay.as_secs(), %error,
+                            "the model failed; message queued for a retry"
+                        );
+                        return Ok(Outcome::Deferred);
+                    }
+                }
             }
         };
 
@@ -671,6 +689,7 @@ impl<D: Decider> Ctx<'_, D> {
             account = %self.account.name,
             uid = key.uid,
             category = verdict.category.as_str(),
+            source,
             flag = ?flag.map(|flag| self.config.flag_name(flag)),
             colour = ?flag.map(|flag| self.policy.colour_for(flag)),
             "dry-run: would set flag (nothing was changed on the server)"
@@ -679,7 +698,7 @@ impl<D: Decider> Ctx<'_, D> {
         let record = ProcessedRecord {
             verdict: Some(verdict.clone()),
             flag,
-            source: String::from("model"),
+            source: String::from(source),
             ..base
         };
         let label = LabelRecord {
@@ -752,6 +771,9 @@ fn features_json(evidence: &Evidence, trust: Trust, sender_domain: &str) -> Stri
         "auto_submitted": evidence.auto_submitted,
         "reply_to_mismatch": evidence.reply_to_mismatch,
         "display_name_spoof": evidence.display_name_spoof,
+        "malformed_sender": evidence.malformed_sender,
+        "impersonates_recipient": evidence.impersonates_recipient,
+        "provider_spam": evidence.provider_spam,
         "spf": format!("{:?}", evidence.spf).to_lowercase(),
         "dkim": format!("{:?}", evidence.dkim).to_lowercase(),
         "dmarc": format!("{:?}", evidence.dmarc).to_lowercase(),
@@ -985,7 +1007,7 @@ mod tests {
             "From: Alice <{from}>\r\nTo: me@example.org\r\nSubject: Lunch?\r\n\
              Message-ID: <1@example.org>\r\n\r\nAre you free on Friday?\r\n"
         );
-        parse_message(raw.as_bytes(), None).unwrap()
+        parse_message(raw.as_bytes(), None, None).unwrap()
     }
 
     fn key(uid: u32) -> MessageKey {
@@ -1053,6 +1075,67 @@ mod tests {
         assert_eq!(queued[0].attempts, 1);
         // First failure waits the initial minute.
         assert!(queued[0].next_attempt_at >= before + 60);
+    }
+
+    #[tokio::test]
+    async fn a_model_verdict_is_recorded_with_source_model() {
+        let decider = FakeDecider::answering(reply_needed());
+        let (_, store) =
+            run_triage(&decider, |_| {}, "me@example.org", "anna@friend.example").await;
+        let source = store.lock().unwrap().processed_source(&key(5)).unwrap();
+        assert_eq!(source.as_deref(), Some("model"));
+    }
+
+    #[tokio::test]
+    async fn certain_spam_is_decided_by_the_rule_without_calling_the_model() {
+        let decider = FakeDecider::answering(reply_needed());
+        // `..` in the domain: an invalid sender address.
+        let (outcome, store) = run_triage(
+            &decider,
+            |_| {},
+            "me@example.org",
+            "me.x7k2.qwrty@volny.example..sn.live.example",
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Processed);
+        assert_eq!(
+            decider.calls.load(Ordering::SeqCst),
+            0,
+            "the model was asked"
+        );
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store.processed_source(&key(5)).unwrap().as_deref(),
+            Some("rule")
+        );
+        // The record carries the spam verdict, and spam is never flagged.
+        assert!(store.flag_counts(0).unwrap().is_empty());
+        let categories = store.category_counts(0).unwrap();
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0].label, "spam");
+    }
+
+    #[tokio::test]
+    async fn a_trusted_sender_is_exempt_from_the_rules() {
+        let decider = FakeDecider::answering(reply_needed());
+        let (_, store) = run_triage(
+            &decider,
+            |store| {
+                store
+                    .add_rule(
+                        "test",
+                        "me.x7k2.qwrty@volny.example..sn.live.example",
+                        Rule::Allow,
+                    )
+                    .unwrap();
+            },
+            "me@example.org",
+            "me.x7k2.qwrty@volny.example..sn.live.example",
+        )
+        .await;
+        assert_eq!(decider.calls.load(Ordering::SeqCst), 1);
+        let source = store.lock().unwrap().processed_source(&key(5)).unwrap();
+        assert_eq!(source.as_deref(), Some("model"));
     }
 
     #[tokio::test]

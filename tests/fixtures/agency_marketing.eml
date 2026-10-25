@@ -1,0 +1,15 @@
+X-WP-DKIM-Status: good (id: sl25.example)
+X-WP-SPAM: YES (PS-CB) 0U00019 [8HYk]
+From: "UNIQA" <kampanie@sl25.example>
+Reply-To: replyto@salelifter.example
+To: me.name@provider.example
+Subject: Your autumn offer is ready
+Message-ID: <agency-1@sl25.example>
+Date: Sat, 24 Oct 2026 10:00:00 +0200
+List-Unsubscribe: <mailto:unsub@sl25.example>, <https://sl25.example/unsubscribe>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Check our autumn offer: https://sl25.example/offer
+
+To stop receiving these messages, unsubscribe at https://sl25.example/unsubscribe

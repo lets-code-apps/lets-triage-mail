@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod flags;
 pub mod imap;
 pub mod message;
+pub mod precheck;
 pub mod senders;
 pub mod store;
 pub mod supervisor;

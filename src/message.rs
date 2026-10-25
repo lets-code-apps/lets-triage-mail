@@ -14,6 +14,7 @@ use std::fmt;
 
 use mail_parser::{HeaderName, Headers, MessageParser};
 use scraper::{Html, Node};
+use serde::Deserialize;
 use thiserror::Error;
 
 /// Messages larger than this should be parsed with [`parse_headers_only`]: decoding and
@@ -116,6 +117,23 @@ impl AuthResults {
     }
 }
 
+/// A mail provider whose own spam and DKIM headers we know how to read.
+///
+/// This is opt-in (`[policy] provider_headers` in the config) because a *sender* can write
+/// any header they like, including a fake `X-WP-DKIM-Status: good`. Only a provider that
+/// strips or overwrites these headers on arrival makes them trustworthy, and only the user
+/// knows whether theirs does. To support another provider, add a variant here and a match arm
+/// in [`apply_provider_headers`]; there is deliberately no plugin system.
+///
+/// `Deserialize` lets `serde` parse the config value. `rename_all` makes the TOML spelling
+/// lowercase (`"wp"`), and a typo gets an error that lists the known values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderHeaders {
+    /// wp.pl: `X-WP-DKIM-Status` and `X-WP-SPAM`.
+    Wp,
+}
+
 /// Everything the classifier needs to know about one message.
 ///
 /// **Privacy:** `body_text` holds the flattened message body because the decider needs it for
@@ -154,6 +172,10 @@ pub struct ParsedMessage {
     pub has_attachments: bool,
     /// Authentication results from the trusted `Authentication-Results` header.
     pub auth: AuthResults,
+    /// The provider's own spam verdict (`Some(true)` = "spam"), read only when the user opted
+    /// in to [`ProviderHeaders`]. Evidence for the model, never a verdict by itself: providers
+    /// also mark legitimate bulk mail as spam.
+    pub provider_spam: Option<bool>,
     /// A `List-Unsubscribe` header is present. We never act on it; it is a bulk-mail signal.
     pub has_list_unsubscribe: bool,
     /// `List-Id` header, trimmed.
@@ -191,6 +213,7 @@ impl fmt::Debug for ParsedMessage {
             .field("attachment_names", &self.attachment_names)
             .field("has_attachments", &self.has_attachments)
             .field("auth", &self.auth)
+            .field("provider_spam", &self.provider_spam)
             .field("has_list_unsubscribe", &self.has_list_unsubscribe)
             .field("list_id", &self.list_id)
             .field("precedence", &self.precedence)
@@ -224,6 +247,23 @@ impl ParsedMessage {
             .any(|found| *found != self.from_address)
     }
 
+    /// The `From` address is not a valid address (see [`is_malformed_address`]).
+    ///
+    /// `mail-parser` hands such an address back unchanged, so we can judge it. A message with
+    /// no `From` address at all (`from_address` empty) is *not* reported here: that is
+    /// "unknown", not "invalid", and calling it spam would be too harsh for a broken but
+    /// real message.
+    pub fn malformed_sender(&self) -> bool {
+        !self.from_address.is_empty() && is_malformed_address(&self.from_address)
+    }
+
+    /// A stranger writes "as" the recipient; [`impersonates_recipient`] holds the rules and
+    /// their trade-offs. The recipients are this message's `To` and `Cc` addresses.
+    pub fn impersonates_recipient(&self) -> bool {
+        let recipients: Vec<&str> = self.to.iter().chain(&self.cc).map(String::as_str).collect();
+        impersonates_recipient(&self.from_name, &self.from_address, &recipients)
+    }
+
     /// `Reply-To` points at a different domain than `From`: replies would go somewhere else.
     pub fn reply_to_mismatch(&self) -> bool {
         match &self.reply_to {
@@ -235,12 +275,20 @@ impl ParsedMessage {
 
 /// Parse a full message: headers, body, attachments.
 ///
+/// `provider_headers` opts in to reading one provider's own DKIM and spam headers (see
+/// [`ProviderHeaders`]); `None` ignores them. A standard `Authentication-Results` header,
+/// when present, still wins for the methods it reports.
+///
 /// `authserv_id` is the hostname our own mail server stamps on `Authentication-Results`. When
 /// `Some`, only headers from that server are trusted, so a sender cannot inject a forged
 /// `dkim=pass` header. When `None`, the topmost header is used (the one added last, by the
 /// receiving server).
-pub fn parse_message(raw: &[u8], authserv_id: Option<&str>) -> Result<ParsedMessage, ParseError> {
-    parse(raw, authserv_id, false)
+pub fn parse_message(
+    raw: &[u8],
+    authserv_id: Option<&str>,
+    provider_headers: Option<ProviderHeaders>,
+) -> Result<ParsedMessage, ParseError> {
+    parse(raw, authserv_id, provider_headers, false)
 }
 
 /// Parse headers only; body, links and attachments stay empty. Use this for messages over
@@ -248,13 +296,15 @@ pub fn parse_message(raw: &[u8], authserv_id: Option<&str>) -> Result<ParsedMess
 pub fn parse_headers_only(
     raw: &[u8],
     authserv_id: Option<&str>,
+    provider_headers: Option<ProviderHeaders>,
 ) -> Result<ParsedMessage, ParseError> {
-    parse(raw, authserv_id, true)
+    parse(raw, authserv_id, provider_headers, true)
 }
 
 fn parse(
     raw: &[u8],
     authserv_id: Option<&str>,
+    provider_headers: Option<ProviderHeaders>,
     headers_only: bool,
 ) -> Result<ParsedMessage, ParseError> {
     let parser = MessageParser::default();
@@ -316,6 +366,9 @@ fn parse(
         ..ParsedMessage::default()
     };
 
+    if let Some(provider) = provider_headers {
+        apply_provider_headers(provider, &headers, &mut parsed);
+    }
     if !headers_only {
         fill_body(&message, &mut parsed);
     }
@@ -479,6 +532,163 @@ fn dkim_domain(clause: &str) -> Option<String> {
         let domain = domain.rsplit('@').next().unwrap_or(domain);
         (!domain.is_empty()).then(|| domain.to_lowercase())
     })
+}
+
+/// Fills in what a provider's own headers say, for the methods `Authentication-Results` did
+/// not cover. The standard header wins: if it already gave a DKIM result, the provider's is
+/// ignored.
+fn apply_provider_headers(
+    provider: ProviderHeaders,
+    headers: &Headers<'_>,
+    out: &mut ParsedMessage,
+) {
+    match provider {
+        ProviderHeaders::Wp => {
+            if out.auth.dkim == AuthVerdict::None {
+                if let Some(value) = header_text(headers, "X-WP-DKIM-Status") {
+                    out.auth.dkim = parse_wp_dkim(&value);
+                }
+            }
+            out.provider_spam = header_text(headers, "X-WP-SPAM").and_then(|v| parse_wp_spam(&v));
+        }
+    }
+}
+
+/// `X-WP-DKIM-Status` value to a DKIM result: `good (id: example.com)` is a pass, `bad` or
+/// `invalid` a fail, `no signature` (and anything else) means "no result".
+fn parse_wp_dkim(value: &str) -> AuthVerdict {
+    let first = value.split_whitespace().next().unwrap_or_default();
+    match first.to_ascii_lowercase().as_str() {
+        "good" => AuthVerdict::Pass,
+        "bad" | "invalid" => AuthVerdict::Fail,
+        _ => AuthVerdict::None,
+    }
+}
+
+/// `X-WP-SPAM: YES (U9) 0000019 [IAYE]` or `NO ...` to the provider's verdict.
+fn parse_wp_spam(value: &str) -> Option<bool> {
+    let first = value.split_whitespace().next()?;
+    match first.to_ascii_uppercase().as_str() {
+        "YES" => Some(true),
+        "NO" => Some(false),
+        _ => None,
+    }
+}
+
+/// True when `address` (`local@domain`) cannot be a real mailbox.
+///
+/// Checked: an empty local part or domain, an empty domain label (this covers `..` anywhere
+/// and a leading or trailing dot), a domain that starts or ends with `-`, a domain without a
+/// dot, and characters a domain may not contain. Non-ASCII letters are allowed, because
+/// internationalised domains exist. It is deliberately not a full RFC 5322 validator: it
+/// catches the generated junk seen in rotating-address spam, and a real mailbox passes.
+///
+/// A domain without a dot (`user@localhost`) is flagged although it is technically valid:
+/// nobody legitimate mails us from a single-label domain over the internet.
+pub fn is_malformed_address(address: &str) -> bool {
+    let Some((local, domain)) = address.rsplit_once('@') else {
+        return true;
+    };
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return true;
+    }
+    if domain.starts_with('-') || domain.ends_with('-') {
+        return true;
+    }
+    // `split('.')` yields an empty label for `..`, a leading dot and a trailing dot.
+    domain.split('.').any(str::is_empty)
+        || !domain
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '.')
+}
+
+/// Shortest recipient local part for which a look-alike is meaningful. `anna` or `piotr` is
+/// shared by thousands of real people, so mail that merely starts with it proves nothing.
+const MIN_IMPERSONATED_LOCAL_LEN: usize = 6;
+
+/// A stranger's `From` uses the recipient's own identity.
+///
+/// Spam generators put the victim's name into the sender to look personal. `recipients` are
+/// the message's `To` and `Cc` addresses (lowercase). It never fires when the `From` address
+/// is one of the recipients (mail to yourself, a mailing list that sends to its own address).
+/// Otherwise it fires when, for some recipient:
+///
+/// 1. the display name is exactly that recipient's address; or
+/// 2. the display name is exactly the recipient's local part; or
+/// 3. the `From` local part is the recipient's local part, then one of `.` `_` `-` `+`, then
+///    a random-looking tail (see [`looks_random`]), and the `From` domain differs from the
+///    recipient's domain.
+///
+/// # Trade-offs (false positives versus misses)
+///
+/// Rules 2 and 3 only apply to a *distinctive* recipient local part: at least
+/// [`MIN_IMPERSONATED_LOCAL_LEN`] characters and containing a separator or a digit
+/// (`me.name`, `piotr77`; not `piotr`). That keeps `piotr.kowalski@firm.example` writing to
+/// `piotr@home.example` from firing. The price: someone whose address is a plain first name
+/// is not protected by rules 2 and 3 (rule 1 still works). Rule 3 can still hit a real sender
+/// who appends digits to your address, such as `me.name.2024@other.example`; the caller
+/// therefore acts on the result only together with a missing DKIM pass.
+pub fn impersonates_recipient(from_name: &str, from_address: &str, recipients: &[&str]) -> bool {
+    if from_address.is_empty() || recipients.contains(&from_address) {
+        return false;
+    }
+    let name = from_name.trim().to_lowercase();
+    let from_local = local_of(from_address);
+    let from_domain = domain_of(from_address);
+
+    recipients.iter().any(|&recipient| {
+        // Rule 1: the display name is the victim's own address. Specific enough on its own.
+        if !name.is_empty() && name == recipient {
+            return true;
+        }
+        let local = local_of(recipient);
+        if !is_distinctive_local(local) {
+            return false;
+        }
+        // Rule 2.
+        if name == local {
+            return true;
+        }
+        // Rule 3: `<local><separator><tail>` from another domain.
+        let tail = from_local
+            .strip_prefix(local)
+            .and_then(|rest| rest.strip_prefix(['.', '_', '-', '+']));
+        tail.is_some_and(looks_random) && from_domain != domain_of(recipient)
+    })
+}
+
+/// Long enough, and not a bare first name: it has a separator or a digit.
+fn is_distinctive_local(local: &str) -> bool {
+    local.chars().count() >= MIN_IMPERSONATED_LOCAL_LEN
+        && local
+            .chars()
+            .any(|c| c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Does this address tail look machine-generated, like `2lkxp6bb.fnvrb`?
+///
+/// Ignoring the separators it must be ASCII letters and digits only, at least five
+/// characters, and either contain a digit or contain a run of four or more letters without a
+/// vowel (`fskpfqvf`). Words such as `kowalski`, `work` or `newsletter` have vowels and no
+/// digits, so they pass as human-chosen. `y` counts as a vowel, which is right for Polish
+/// and English words and rarely matters for random strings.
+fn looks_random(tail: &str) -> bool {
+    let is_separator = |c: char| matches!(c, '.' | '_' | '-' | '+');
+    let compact: String = tail.chars().filter(|&c| !is_separator(c)).collect();
+    if compact.len() < 5 || !compact.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    compact.chars().any(|c| c.is_ascii_digit())
+        || tail.split(is_separator).any(|segment| {
+            segment.len() >= 4
+                && !segment
+                    .chars()
+                    .any(|c| "aeiouy".contains(c.to_ascii_lowercase()))
+        })
+}
+
+fn local_of(address: &str) -> &str {
+    address.rsplit_once('@').map_or(address, |(local, _)| local)
 }
 
 fn domain_of(address: &str) -> &str {
@@ -667,4 +877,198 @@ fn normalize_text(text: &str) -> String {
         out.push_str(&line);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_addresses_pass() {
+        for ok in [
+            "anna@friend.example",
+            "a.b+tag@mail.example.co.uk",
+            "x@sub-domain.example",
+            "jan@zażółć.example",
+        ] {
+            assert!(!is_malformed_address(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn malformed_addresses_are_caught() {
+        for bad in [
+            "me.name.2lkxp6bb.fnvrb@volny.example..sn.live.example", // `..` in the domain
+            "@example.com",                                          // empty local part
+            "anna@",                                                 // empty domain
+            "anna@.example.com",                                     // leading dot
+            "anna@example.com.",                                     // trailing dot
+            "anna@-example.com",                                     // leading hyphen
+            "anna@example.com-",                                     // trailing hyphen
+            "anna@localhost",                                        // no dot
+            "anna@exa mple.com",                                     // space
+            "anna@exam_ple.com",                                     // underscore
+            "anna@exam!ple.com",                                     // punctuation
+            "not-an-address",                                        // no @
+        ] {
+            assert!(is_malformed_address(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_missing_sender_is_not_called_malformed() {
+        assert!(!ParsedMessage::default().malformed_sender());
+    }
+
+    const ME: &str = "me.name@provider.example";
+
+    #[test]
+    fn rotating_address_spam_impersonates_the_recipient() {
+        // Local part starts with ours, then a random tail, on another domain.
+        assert!(impersonates_recipient(
+            "Casino",
+            "me.name.2lkxp6bb.fnvrb@other.example",
+            &[ME]
+        ));
+        // `_` as the separator, no digit, but a vowel-less run.
+        assert!(impersonates_recipient(
+            "x",
+            "me.name_fskpfqvf@other.example",
+            &[ME]
+        ));
+        // The display name is our local part, or our whole address.
+        assert!(impersonates_recipient(
+            "me.name",
+            "zzz@other.example",
+            &[ME]
+        ));
+        assert!(impersonates_recipient(
+            "Me.Name",
+            "zzz@other.example",
+            &[ME]
+        ));
+        assert!(impersonates_recipient(ME, "zzz@other.example", &[ME]));
+        // A Cc recipient counts too.
+        assert!(impersonates_recipient(
+            "me.name",
+            "zzz@other.example",
+            &["someone@else.example", ME]
+        ));
+    }
+
+    #[test]
+    fn real_people_and_lists_do_not_impersonate() {
+        // A colleague with the same first name: our local part is too short and plain.
+        assert!(!impersonates_recipient(
+            "Piotr Kowalski",
+            "piotr.kowalski@firm.example",
+            &["piotr@home.example"]
+        ));
+        // Even a distinctive local part is safe against a human-looking tail.
+        assert!(!impersonates_recipient(
+            "x",
+            "me.name.work@other.example",
+            &[ME]
+        ));
+        assert!(!impersonates_recipient(
+            "x",
+            "me.name.kowalski@other.example",
+            &[ME]
+        ));
+        // Mail to ourselves, and a list that writes to its own address.
+        assert!(!impersonates_recipient("me.name", ME, &[ME]));
+        assert!(!impersonates_recipient(
+            "List",
+            "list@lists.example",
+            &["list@lists.example"]
+        ));
+        // Same domain: an alias on our own provider is not a stranger's look-alike.
+        assert!(!impersonates_recipient(
+            "x",
+            "me.name.2lkxp6bb@provider.example",
+            &[ME]
+        ));
+        // An unrelated sender, and no recipients at all.
+        assert!(!impersonates_recipient(
+            "Anna",
+            "anna@friend.example",
+            &[ME]
+        ));
+        assert!(!impersonates_recipient("me.name", "zzz@other.example", &[]));
+        // The tail must follow a separator: this is a different local part.
+        assert!(!impersonates_recipient(
+            "x",
+            "me.name2lkxp6bb@other.example",
+            &[ME]
+        ));
+    }
+
+    #[test]
+    fn a_bare_first_name_recipient_only_matches_on_the_full_address() {
+        let recipients = ["piotr@home.example"];
+        assert!(!impersonates_recipient(
+            "piotr",
+            "piotr.2lkxp6bb@other.example",
+            &recipients
+        ));
+        assert!(impersonates_recipient(
+            "piotr@home.example",
+            "zzz@other.example",
+            &recipients
+        ));
+    }
+
+    #[test]
+    fn random_tails() {
+        for random in ["2lkxp6bb.fnvrb", "fskpfqvf.eyvxl", "k2oypgxx", "12345"] {
+            assert!(looks_random(random), "{random}");
+        }
+        for human in ["work", "kowalski", "newsletter", "ab1", "sales.team", "a-b"] {
+            assert!(!looks_random(human), "{human}");
+        }
+    }
+
+    #[test]
+    fn wp_dkim_status_maps_to_a_result() {
+        assert_eq!(parse_wp_dkim("good (id: sl25.example)"), AuthVerdict::Pass);
+        assert_eq!(parse_wp_dkim("GOOD (id: x)"), AuthVerdict::Pass);
+        assert_eq!(parse_wp_dkim("no signature (id: n/a)"), AuthVerdict::None);
+        assert_eq!(parse_wp_dkim("bad (id: x)"), AuthVerdict::Fail);
+        assert_eq!(parse_wp_dkim("invalid (id: x)"), AuthVerdict::Fail);
+        assert_eq!(parse_wp_dkim(""), AuthVerdict::None);
+    }
+
+    #[test]
+    fn wp_spam_header_maps_to_a_verdict() {
+        assert_eq!(parse_wp_spam("YES (U9) 0000019 [IAYE]"), Some(true));
+        assert_eq!(parse_wp_spam("NO"), Some(false));
+        assert_eq!(parse_wp_spam("no (x)"), Some(false));
+        assert_eq!(parse_wp_spam("MAYBE"), None);
+        assert_eq!(parse_wp_spam(""), None);
+    }
+
+    fn with_headers(extra: &str, provider: Option<ProviderHeaders>) -> ParsedMessage {
+        let raw =
+            format!("{extra}From: a@b.example\r\nTo: me@x.example\r\nSubject: s\r\n\r\nbody\r\n");
+        parse_message(raw.as_bytes(), None, provider).unwrap()
+    }
+
+    #[test]
+    fn provider_headers_are_ignored_unless_enabled() {
+        let headers = "X-WP-DKIM-Status: good (id: b.example)\r\nX-WP-SPAM: YES (U9)\r\n";
+        let off = with_headers(headers, None);
+        assert_eq!(off.auth.dkim, AuthVerdict::None);
+        assert_eq!(off.provider_spam, None);
+        let on = with_headers(headers, Some(ProviderHeaders::Wp));
+        assert_eq!(on.auth.dkim, AuthVerdict::Pass);
+        assert_eq!(on.provider_spam, Some(true));
+    }
+
+    #[test]
+    fn authentication_results_wins_over_provider_headers() {
+        let headers = "Authentication-Results: mx.test; dkim=fail\r\n\
+                       X-WP-DKIM-Status: good (id: b.example)\r\n";
+        let message = with_headers(headers, Some(ProviderHeaders::Wp));
+        assert_eq!(message.auth.dkim, AuthVerdict::Fail);
+    }
 }

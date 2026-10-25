@@ -416,6 +416,20 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Who decided a processed message (`"model"` or `"rule"`), or `None` if it was not
+    /// processed.
+    pub fn processed_source(&self, key: &MessageKey) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT source FROM processed
+                 WHERE account = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+                params![key.account, key.mailbox, key.uidvalidity, key.uid],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     // ---- rules --------------------------------------------------------------------
 
     /// Adds a rule, or changes the kind of an existing one. `pattern` is an address or

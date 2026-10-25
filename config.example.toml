@@ -40,6 +40,14 @@ known_senders_from_sent = true
 # Optional: only trust Authentication-Results headers stamped by this server
 # (for example "mx.example.com"). Empty means the topmost header is used.
 authserv_id = ""
+# Optional: read your provider's own DKIM and spam headers when it does not write
+# Authentication-Results. Known values: "wp" (wp.pl: X-WP-DKIM-Status, X-WP-SPAM).
+# OFF by default, because a sender can write these headers too: a spammer can add
+# "X-WP-DKIM-Status: good" to a message. Turn it on only if your provider overwrites or
+# strips such headers on arrival. The provider's spam verdict is only a hint for the model
+# (providers also mark real newsletters as spam). A standard Authentication-Results header,
+# when present, still wins.
+# provider_headers = "wp"
 
 # Flags: one table per flag the service can set. Each key is optional.
 #   enabled: whether the flag is used at all

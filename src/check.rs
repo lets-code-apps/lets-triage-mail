@@ -399,11 +399,14 @@ fn synthetic_evidence() -> Evidence {
         spf: AuthResult::Pass,
         dkim: AuthResult::Pass,
         dmarc: AuthResult::Pass,
+        provider_spam: None,
         bulk_headers: true,
         auto_submitted: false,
         known_domain: false,
         reply_to_mismatch: false,
         display_name_spoof: false,
+        malformed_sender: false,
+        impersonates_recipient: false,
         link_count: 1,
     }
 }

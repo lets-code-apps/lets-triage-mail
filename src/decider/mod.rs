@@ -62,6 +62,9 @@ pub struct Evidence {
     pub spf: AuthResult,
     pub dkim: AuthResult,
     pub dmarc: AuthResult,
+    /// The mail provider's own spam verdict, when the user opted in to reading it. Only a
+    /// hint: providers also mark legitimate bulk mail as spam.
+    pub provider_spam: Option<bool>,
     /// `List-Unsubscribe`, `List-Id` or `Precedence: bulk` present.
     pub bulk_headers: bool,
     /// `Auto-Submitted` says a machine sent it.
@@ -72,6 +75,10 @@ pub struct Evidence {
     pub reply_to_mismatch: bool,
     /// The display name contains an email address other than the real one.
     pub display_name_spoof: bool,
+    /// The sender address is not a valid address (for example `a@x.example..y.example`).
+    pub malformed_sender: bool,
+    /// A stranger's From address or name reuses the recipient's own identity.
+    pub impersonates_recipient: bool,
     pub link_count: usize,
 }
 

@@ -44,6 +44,9 @@ impl Evidence {
             spf: message.auth.spf.into(),
             dkim: message.auth.dkim.into(),
             dmarc: message.auth.dmarc.into(),
+            provider_spam: message.provider_spam,
+            malformed_sender: message.malformed_sender(),
+            impersonates_recipient: message.impersonates_recipient(),
             bulk_headers: message.is_bulk(),
             auto_submitted: message.is_auto_submitted,
             known_domain,
@@ -77,7 +80,7 @@ mod tests {
     #[test]
     fn evidence_carries_the_message_fields() {
         let raw = include_bytes!("../tests/fixtures/friend.eml");
-        let message = parse_message(raw, None).unwrap();
+        let message = parse_message(raw, None, None).unwrap();
         let evidence = Evidence::from_message(&message, true);
         assert_eq!(evidence.from_address, "anna@friend.example");
         assert_eq!(evidence.subject, "Lunch?");
@@ -91,7 +94,7 @@ mod tests {
     #[test]
     fn evidence_maps_newsletter_signals_and_auth() {
         let raw = include_bytes!("../tests/fixtures/newsletter.eml");
-        let message = parse_message(raw, None).unwrap();
+        let message = parse_message(raw, None, None).unwrap();
         let evidence = Evidence::from_message(&message, false);
         assert!(evidence.bulk_headers);
         assert!(!evidence.known_domain);
@@ -101,7 +104,7 @@ mod tests {
     #[test]
     fn failed_auth_and_spoofing_are_mapped() {
         let raw = include_bytes!("../tests/fixtures/spoof.eml");
-        let message = parse_message(raw, None).unwrap();
+        let message = parse_message(raw, None, None).unwrap();
         let evidence = Evidence::from_message(&message, false);
         assert_eq!(evidence.display_name_spoof, message.display_name_spoof());
         assert_eq!(evidence.reply_to_mismatch, message.reply_to_mismatch());

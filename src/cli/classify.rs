@@ -16,6 +16,7 @@ use lets_triage_mail::engine::{FlagPolicy, Trust, Verdict, choose_flag, screen_s
 use lets_triage_mail::message::{
     HEADERS_ONLY_THRESHOLD, ParsedMessage, parse_headers_only, parse_message,
 };
+use lets_triage_mail::precheck::{SOURCE_MODEL, SOURCE_RULE, precheck};
 use serde_json::{Value, json};
 
 /// Classifies each file and prints the result. One bad file does not stop the others, but
@@ -59,6 +60,8 @@ struct Outcome {
     from: String,
     subject: String,
     verdict: Verdict,
+    /// Who decided: `"rule"` (the pre-check) or `"model"`.
+    source: &'static str,
     /// The chosen flag with its display name and colour, if any.
     flag: Option<ChosenFlag>,
     /// Why there is no flag; `Some` exactly when `flag` is `None`.
@@ -78,17 +81,23 @@ async fn classify_file<D: Decider>(
 ) -> anyhow::Result<Outcome> {
     let raw = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let authserv_id = Some(config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
+    let provider = config.policy.provider_headers;
     let message = if raw.len() > HEADERS_ONLY_THRESHOLD {
         // Big messages are mostly attachments; the headers are enough to judge them.
-        parse_headers_only(&raw, authserv_id)
+        parse_headers_only(&raw, authserv_id, provider)
     } else {
-        parse_message(&raw, authserv_id)
+        parse_message(&raw, authserv_id, provider)
     }
     .with_context(|| format!("parsing {}", file.display()))?;
 
     // No database here, so we know nothing about the sender: not a known domain, no rule.
     let evidence = Evidence::from_message(&message, false);
-    let verdict = decider.decide(&evidence).await?;
+    // Same order as the worker: certain spam is decided by code, and only the rest is
+    // shown to the model.
+    let (verdict, source) = match precheck(&evidence) {
+        Some(verdict) => (verdict, SOURCE_RULE),
+        None => (decider.decide(&evidence).await?, SOURCE_MODEL),
+    };
 
     let policy = config.flag_policy();
     let trust = screen_sender(None, false, message.auth.any_fail());
@@ -110,6 +119,7 @@ async fn classify_file<D: Decider>(
         from: sender_text(&message),
         subject: message.subject.clone(),
         verdict,
+        source,
         flag,
         no_flag_reason,
     })
@@ -155,6 +165,12 @@ impl Outcome {
             (None, None) => String::from("no flag"),
         };
         let yes_no = |b: bool| if b { "yes" } else { "no" };
+        // For a rule, say which one fired; the model's reason is printed on its own line.
+        let decided_by = if self.source == SOURCE_RULE {
+            format!("{} ({})", self.source, v.reason)
+        } else {
+            self.source.to_string()
+        };
         [
             format!("== {}", self.file.display()),
             format!("From:        {}", self.from),
@@ -165,6 +181,7 @@ impl Outcome {
             format!("Deadline:    {}", v.deadline.as_deref().unwrap_or("none")),
             format!("Payment:     {}", v.payment.as_str()),
             format!("Reason:      {}", v.reason),
+            format!("Decided by:  {decided_by}"),
             format!("Flag:        {flag}"),
             String::new(),
         ]
@@ -184,6 +201,7 @@ impl Outcome {
             "deadline": v.deadline,
             "payment": v.payment.as_str(),
             "reason": v.reason,
+            "source": self.source,
             "flag": self.flag.as_ref().map(|f| json!({"name": f.name, "colour": f.colour})),
             "no_flag_reason": self.no_flag_reason,
         })
@@ -273,6 +291,59 @@ mod tests {
         assert_eq!(value["flag"]["colour"], "orange");
         assert_eq!(value["no_flag_reason"], Value::Null);
         assert!(!line.contains("free on Friday"));
+    }
+
+    #[tokio::test]
+    async fn the_model_is_named_as_the_source_of_its_verdict() {
+        let server = fake_model(REPLY).await;
+        let config = config_for(&server);
+        let outcome = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+            .await
+            .unwrap();
+        assert!(outcome.render().contains("Decided by:  model"));
+        assert_eq!(outcome.to_json()["source"], "model");
+    }
+
+    #[tokio::test]
+    async fn a_rule_decides_certain_spam_and_the_model_is_not_called() {
+        // The fake model would answer "personal, reply needed"; any request would show.
+        let server = fake_model(REPLY).await;
+        let config = config_for(&server);
+        let outcome = classify_file(&decider(&config), &config, &fixture("casino_rotating.eml"))
+            .await
+            .unwrap();
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(outcome.verdict.category, Category::Spam);
+        assert!(outcome.flag.is_none());
+        let text = outcome.render();
+        assert!(
+            text.contains("Decided by:  rule (invalid sender address)"),
+            "{text}"
+        );
+        let json = outcome.to_json();
+        assert_eq!(json["source"], "rule");
+        assert_eq!(json["category"], "spam");
+    }
+
+    #[tokio::test]
+    async fn provider_headers_reach_the_parser_only_when_configured() {
+        // Agency mail is not decided by a rule either way: the model is asked.
+        let server = fake_model(REPLY).await;
+        let mut config = config_for(&server);
+        config.policy.provider_headers = Some(lets_triage_mail::message::ProviderHeaders::Wp);
+        let outcome = classify_file(&decider(&config), &config, &fixture("agency_marketing.eml"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.source, "model");
+        // The prompt carries the provider facts, so the model saw them.
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body).to_string();
+        assert!(
+            body.contains("authentication: spf=unknown dkim=pass"),
+            "{body}"
+        );
+        assert!(body.contains("(a hint only): spam"), "{body}");
     }
 
     #[tokio::test]
