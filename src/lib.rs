@@ -13,3 +13,4 @@ pub mod imap;
 pub mod message;
 pub mod senders;
 pub mod store;
+pub mod supervisor;

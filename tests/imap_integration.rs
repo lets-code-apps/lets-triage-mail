@@ -559,3 +559,59 @@ async fn worker_queues_a_retry_when_the_model_fails() {
     assert!(server_flags(&settings, 1).await.is_empty());
     worker.stop().await;
 }
+
+/// The supervisor, driven directly (the CLI builds a real `LlmDecider`, which cannot be faked
+/// from outside the binary). Two accounts: one good, one with a wrong password. The bad one
+/// fails its login and waits to be restarted; the good one must keep working, and shutdown must
+/// stop both well inside the grace period.
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn supervisor_keeps_a_good_account_running_next_to_a_rejected_login() {
+    use lets_triage_mail::supervisor::{SupervisorTiming, run_service};
+
+    let (good, bad) = (fresh_account(), fresh_account());
+    let mut wrong_password = worker_account(&bad);
+    wrong_password.name = "bad".into();
+    wrong_password.password_command = "echo wrong-password".into();
+    let config = Config {
+        accounts: vec![worker_account(&good), wrong_password],
+        ..Config::default()
+    };
+    assert!(config.policy.dry_run);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let shutdown = CancellationToken::new();
+    let service = tokio::spawn(run_service(
+        Arc::new(config),
+        Arc::new(FakeDecider { fail: false }),
+        Arc::clone(&store),
+        shutdown.clone(),
+        SupervisorTiming::default(),
+    ));
+
+    wait_until(
+        Duration::from_secs(10),
+        "the good account's position",
+        || {
+            store
+                .lock()
+                .unwrap()
+                .mailbox_state("test", "INBOX")
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+
+    shutdown.cancel();
+    let report = tokio::time::timeout(Duration::from_secs(10), service)
+        .await
+        .expect("the service stops within 10 seconds")
+        .expect("the service task did not panic");
+    assert_eq!(report.accounts, 2);
+    assert_eq!(
+        report.aborted, 0,
+        "everything stopped inside the grace period"
+    );
+    assert!(!report.every_account_failed());
+}

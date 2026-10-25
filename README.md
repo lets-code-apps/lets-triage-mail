@@ -56,6 +56,20 @@ cargo run --release -- check
 Use `--account NAME` to check one account and `--json` for machine-readable output. The exit code
 is non-zero if anything failed. `check` never changes anything on the mail server.
 
+## Run it in dry-run
+
+Once `check` passes, watch your inboxes without changing anything:
+
+```sh
+cargo run --release -- run
+```
+
+`run` keeps one connection per account, classifies new mail as it arrives and logs the flag it
+would set. It also reads each Sent folder every few hours to learn who you write to. Nothing is
+changed on the server: `policy.dry_run = false` is refused until flagging exists. Press Ctrl-C
+(or send SIGTERM) to stop; a second Ctrl-C exits at once. If one account cannot log in, the
+others keep running and the failed one is retried after 5 minutes, then 10, up to an hour.
+
 ## Background
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,
