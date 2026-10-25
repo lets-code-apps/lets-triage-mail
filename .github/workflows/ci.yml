@@ -48,7 +48,12 @@ jobs:
           done
           docker logs dovecot
           exit 1
-      - run: cargo test --test imap_integration -- --ignored
+      # Fail if no test ran, so a test that silently skips itself can't turn this job green.
+      - name: Run IMAP integration tests
+        run: |
+          set -o pipefail
+          cargo test --test imap_integration -- --ignored 2>&1 | tee test-output.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' test-output.txt
       - name: Dovecot log
         if: failure()
         run: docker logs dovecot
