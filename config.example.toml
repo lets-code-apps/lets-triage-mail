@@ -1,0 +1,105 @@
+# Let's Triage Mail configuration.
+#
+# Copy this file to ~/.config/lets-triage-mail/config.toml and adjust it.
+# Every section and key is optional except [[accounts]]; the values below are the defaults
+# unless a comment says otherwise. Unknown keys are an error, so typos are caught early.
+
+[llm]
+# Any OpenAI-compatible endpoint. Nothing leaves your machine as long as it is local.
+#   Ollama:    http://127.0.0.1:11434/v1
+#   LM Studio: http://127.0.0.1:1234/v1
+#   llama.cpp: http://127.0.0.1:8080/v1
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3:14b"
+timeout_seconds = 120
+# How much of the body (after HTML is flattened) the model sees.
+max_body_chars = 4000
+# How many model requests may run at once, across all accounts. Keep 1 if the same
+# machine also serves other models, e.g. a voice assistant.
+max_concurrent = 1
+# Only if your local server insists on a key.
+# api_key = ""
+
+[policy]
+# Start with dry_run = true: everything is classified and logged, but nothing on the
+# server is changed. Look at the results for a few days, then set this to false.
+dry_run = true
+# Below this confidence (0 to 1) a message gets the "Unsure" flag instead of an action flag.
+min_confidence = 0.75
+# Treat everyone you have written to (read from the Sent folder) as a known sender.
+# Known senders are trusted, unless their mail fails SPF/DKIM/DMARC.
+known_senders_from_sent = true
+# Optional: only trust Authentication-Results headers stamped by this server
+# (for example "mx.example.com"). Empty means the topmost header is used.
+authserv_id = ""
+
+# Flags: one table per flag the service can set. Each key is optional.
+#   enabled: whether the flag is used at all
+#   colour:  orange, yellow, green, blue, purple or gray. Never red: red is reserved for
+#            your own flags and the service refuses to use it.
+#   name:    the name shown in the digest. Rename the colour in Mail's sidebar to match.
+# Keep few flags on; too many flags is just noise. Priority when several apply:
+# reply_needed > deadline > to_pay > bookkeeping > unsure.
+[flags.reply_needed]
+enabled = true
+colour = "orange"
+name = "Reply needed"
+
+[flags.deadline]
+enabled = false
+colour = "yellow"
+name = "Deadline"
+
+[flags.to_pay]
+enabled = false
+colour = "green"
+name = "To pay"
+
+[flags.bookkeeping]
+enabled = false
+colour = "purple"
+name = "Bookkeeping"
+
+[flags.unsure]
+enabled = true
+colour = "gray"
+name = "Unsure"
+
+[digest]
+# Local time of day (24 hours, HH:MM) when the daily digest email is written.
+time = "07:00"
+# The mailbox the digest is added to. INBOX makes sure you notice it.
+folder = "INBOX"
+# The From header of the digest. Optional.
+# from = "Let's Triage Mail <triage@example.com>"
+language = "en"
+
+[storage]
+# Where the SQLite database lives (metadata only, never message bodies).
+# db_path = "~/.local/share/lets-triage-mail/state.db"
+
+# One [[accounts]] block per mailbox.
+#
+# Passwords never go in this file. Either set password_command, or leave it out and set the
+# environment variable LETS_TRIAGE_MAIL_PASSWORD_<NAME>, where <NAME> is the account name in
+# capitals with every character that is not a letter or digit replaced by "_"
+# (account "personal" -> LETS_TRIAGE_MAIL_PASSWORD_PERSONAL).
+#
+# On macOS, store the password in the Keychain once (you are asked to type it):
+#   security add-generic-password -s lets-triage-mail -a personal -w
+# and read it back with the password_command below.
+#
+# Most providers other than a plain IMAP server need an app-specific password
+# (iCloud always does).
+[[accounts]]
+name = "personal"
+host = "imap.example.com"
+username = "me@example.com"
+# "tls" (encrypted from the start, port 993), "starttls" (port 143) or "none".
+# "none" is only accepted for localhost, for testing.
+tls = "tls"
+# port = 993          # defaults to 993 for "tls" and 143 for "starttls"
+password_command = "security find-generic-password -s lets-triage-mail -a personal -w"
+inbox = "INBOX"
+# Leave empty to detect the Sent folder automatically.
+sent_folder = ""

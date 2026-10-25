@@ -1,0 +1,930 @@
+//! Configuration: the TOML file in, validated typed settings out.
+//!
+//! Loading is two steps. `serde` turns the TOML text into plain structs (and rejects unknown
+//! keys, so a typo like `min_confidnce` is an error instead of being silently ignored). Then
+//! [`Config::validate`] checks the rules `serde` cannot express: ranges, uniqueness, "TLS unless
+//! loopback", "no red flag". Every error names the key (and account) that is wrong.
+//!
+//! Passwords never live in the config file. An account names a `password_command` (for example
+//! a macOS Keychain lookup) or the password comes from an environment variable. Either way it
+//! is returned as a [`Secret`], whose `Debug` output is `***`.
+//!
+//! See `docs/SPEC.md` section 3 and `config.example.toml`.
+
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::Deserialize;
+
+use crate::engine::{FlagColours, FlagPolicy, TriageFlag};
+use crate::flags::FlagColour;
+
+/// Everything that can go wrong while loading the config or looking up a password.
+///
+/// This is a library error type, so it is an enum callers can match on. `thiserror` writes
+/// the `Display` and `Error` impls from the `#[error(...)]` attributes. None of the messages
+/// ever contain a password.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The file could not be read (missing, no permission, ...).
+    #[error("cannot read config file {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// The file is not valid TOML, or has an unknown key or a value of the wrong type.
+    #[error("invalid config file {origin}:\n{source}")]
+    Parse {
+        origin: String,
+        source: toml::de::Error,
+    },
+
+    /// The file parsed, but a value is not acceptable.
+    #[error("config key `{key}`: {message}")]
+    Invalid { key: String, message: String },
+
+    /// `password_command` could not be run, failed, or printed nothing.
+    #[error("account `{account}`: password_command failed: {message}")]
+    PasswordCommand { account: String, message: String },
+
+    /// No `password_command` and the environment variable is not set.
+    #[error(
+        "account `{account}`: no password found; set `password_command` in the config \
+         or the environment variable {env_var}"
+    )]
+    PasswordMissing { account: String, env_var: String },
+}
+
+impl ConfigError {
+    fn invalid(key: impl Into<String>, message: impl Into<String>) -> ConfigError {
+        ConfigError::Invalid {
+            key: key.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A password or API key.
+///
+/// A newtype around `String` whose `Debug` is written by hand to print `***`. Without that, a
+/// stray `tracing::debug!("{config:?}")` or `{:?}` in an error would leak the secret into a
+/// log file. There is deliberately no `Display` impl; reading the value takes an explicit
+/// call to [`Secret::expose`].
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a value.
+    pub fn new(value: impl Into<String>) -> Secret {
+        Secret(value.into())
+    }
+
+    /// The secret itself. Call this only at the point of use (the IMAP login, an HTTP header).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// The whole configuration file.
+///
+/// `#[serde(default)]` on a struct means: any key missing from the TOML takes its value from
+/// the type's `Default` impl. That is how every section is optional. `deny_unknown_fields`
+/// turns typos into errors.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub llm: LlmConfig,
+    pub policy: PolicyConfig,
+    pub flags: FlagsConfig,
+    pub digest: DigestConfig,
+    pub storage: StorageConfig,
+    pub accounts: Vec<AccountConfig>,
+}
+
+/// `[llm]`: the local model endpoint (any OpenAI-compatible server).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmConfig {
+    pub base_url: String,
+    pub model: String,
+    pub timeout_seconds: u64,
+    /// How much of the body (after HTML is flattened) the model sees.
+    pub max_body_chars: usize,
+    /// How many model requests may run at once, across all accounts.
+    pub max_concurrent: usize,
+    /// Only for local servers that insist on a key.
+    pub api_key: Option<Secret>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        LlmConfig {
+            base_url: String::from("http://127.0.0.1:11434/v1"),
+            model: String::from("qwen3:14b"),
+            timeout_seconds: 120,
+            max_body_chars: 4000,
+            max_concurrent: 1,
+            api_key: None,
+        }
+    }
+}
+
+/// `[policy]`: when the service may act.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Classify and log, but change nothing on the server. On by default: a new install
+    /// must never touch a mailbox until the user has looked at the results.
+    pub dry_run: bool,
+    /// Below this confidence a message gets "Unsure" instead of an action flag.
+    pub min_confidence: f32,
+    /// Treat everyone the user has written to (from the Sent folder) as a known sender.
+    pub known_senders_from_sent: bool,
+    /// Only trust `Authentication-Results` headers stamped by this server. Empty means
+    /// the topmost header is used.
+    pub authserv_id: String,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        PolicyConfig {
+            dry_run: true,
+            min_confidence: FlagPolicy::default().min_confidence,
+            known_senders_from_sent: true,
+            authserv_id: String::new(),
+        }
+    }
+}
+
+/// The colour names a user may write in `[flags.*] colour`.
+///
+/// This mirrors [`FlagColour`] so that `serde` can do the parsing and report the list of valid
+/// names on a typo. `red` is parsed too, so that we can reject it with an explanation instead
+/// of a generic "unknown variant" error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ColourName {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+    Gray,
+}
+
+impl ColourName {
+    fn to_colour(self) -> FlagColour {
+        match self {
+            ColourName::Red => FlagColour::Red,
+            ColourName::Orange => FlagColour::Orange,
+            ColourName::Yellow => FlagColour::Yellow,
+            ColourName::Green => FlagColour::Green,
+            ColourName::Blue => FlagColour::Blue,
+            ColourName::Purple => FlagColour::Purple,
+            ColourName::Gray => FlagColour::Gray,
+        }
+    }
+}
+
+/// One `[flags.<name>]` table. Every field is optional: what is missing keeps the default
+/// for that flag (see `docs/FLAGS.md`), so `[flags.to_pay] enabled = true` is enough.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlagSetting {
+    pub enabled: Option<bool>,
+    colour: Option<ColourName>,
+    /// The name shown in the digest. Rename the flag in Mail's sidebar to match.
+    pub name: Option<String>,
+}
+
+/// `[flags.*]`: one table per flag the service can set.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlagsConfig {
+    pub reply_needed: FlagSetting,
+    pub deadline: FlagSetting,
+    pub to_pay: FlagSetting,
+    pub bookkeeping: FlagSetting,
+    pub unsure: FlagSetting,
+}
+
+impl FlagsConfig {
+    /// The `(config key, setting, flag)` triples, so loops need no copy-paste.
+    fn entries(&self) -> [(&'static str, &FlagSetting, TriageFlag); 5] {
+        [
+            ("reply_needed", &self.reply_needed, TriageFlag::ReplyNeeded),
+            ("deadline", &self.deadline, TriageFlag::Deadline),
+            ("to_pay", &self.to_pay, TriageFlag::ToPay),
+            ("bookkeeping", &self.bookkeeping, TriageFlag::Bookkeeping),
+            ("unsure", &self.unsure, TriageFlag::Unsure),
+        ]
+    }
+}
+
+/// `[digest]`: the daily summary email.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DigestConfig {
+    /// Local time of day, `HH:MM` (24 hours).
+    pub time: String,
+    /// The mailbox the digest is appended to.
+    pub folder: String,
+    /// The `From` header of the digest. `None` lets the digest code pick a default.
+    pub from: Option<String>,
+    /// Language of the digest text, as a short code such as `en`.
+    pub language: String,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        DigestConfig {
+            time: String::from("07:00"),
+            folder: String::from("INBOX"),
+            from: None,
+            language: String::from("en"),
+        }
+    }
+}
+
+impl DigestConfig {
+    /// The configured time as `(hour, minute)`. Always `Some` after [`Config::validate`].
+    pub fn time_of_day(&self) -> Option<(u8, u8)> {
+        let (hours, minutes) = self.time.split_once(':')?;
+        // Exactly two digits each, so "7:5" and "+7:+5" are rejected.
+        let two_digits = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+        if !two_digits(hours) || !two_digits(minutes) {
+            return None;
+        }
+        let (hours, minutes) = (hours.parse::<u8>().ok()?, minutes.parse::<u8>().ok()?);
+        (hours < 24 && minutes < 60).then_some((hours, minutes))
+    }
+}
+
+/// `[storage]`: where the SQLite database lives.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Defaults to `~/.local/share/lets-triage-mail/state.db`.
+    pub db_path: Option<PathBuf>,
+}
+
+/// How an account's connection is secured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tls {
+    /// Encrypted from the first byte (IMAPS, usually port 993).
+    Tls,
+    /// Starts in plain text, then upgrades (usually port 143).
+    Starttls,
+    /// No encryption. Accepted only for a loopback host (tests, a local bridge).
+    None,
+}
+
+/// One `[[accounts]]` entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
+    pub name: String,
+    pub host: String,
+    pub username: String,
+    /// Defaults to 993 for `tls` and 143 for `starttls`/`none`; see [`AccountConfig::port`].
+    port: Option<u16>,
+    #[serde(default = "default_tls")]
+    pub tls: Tls,
+    /// A shell command that prints the password. Run through `sh -c`.
+    #[serde(default)]
+    pub password_command: String,
+    #[serde(default = "default_inbox")]
+    pub inbox: String,
+    /// Leave empty to auto-detect the Sent folder from its special-use attribute.
+    #[serde(default)]
+    pub sent_folder: String,
+}
+
+fn default_tls() -> Tls {
+    Tls::Tls
+}
+
+fn default_inbox() -> String {
+    String::from("INBOX")
+}
+
+/// Whether a host name or address points back at this machine.
+fn is_loopback_host(host: &str) -> bool {
+    // `[::1]` is how an IPv6 literal may be written in a URL-like form.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The environment variable that holds an account's password:
+/// `LETS_TRIAGE_MAIL_PASSWORD_<ACCOUNT>`, with the name uppercased and every character that is
+/// not a letter or digit replaced by `_`.
+pub fn password_env_var(account_name: &str) -> String {
+    let suffix: String = account_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("LETS_TRIAGE_MAIL_PASSWORD_{suffix}")
+}
+
+impl AccountConfig {
+    /// The IMAP port: the configured one, or the standard port for the TLS mode.
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(match self.tls {
+            Tls::Tls => 993,
+            Tls::Starttls | Tls::None => 143,
+        })
+    }
+
+    /// Looks up the password: `password_command` if set, otherwise the environment variable.
+    pub fn password(&self) -> Result<Secret, ConfigError> {
+        self.password_with_env(|name| std::env::var(name).ok())
+    }
+
+    /// Same as [`password`](Self::password), with the environment lookup passed in.
+    ///
+    /// Tests use this to supply fake variables. Changing the real environment from a test
+    /// is unsafe in Rust 2024 (other threads may read it) and tests run in parallel.
+    fn password_with_env(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Secret, ConfigError> {
+        if !self.password_command.trim().is_empty() {
+            return self.run_password_command();
+        }
+        let env_var = password_env_var(&self.name);
+        match env(&env_var) {
+            Some(value) if !value.is_empty() => Ok(Secret::new(value)),
+            _ => Err(ConfigError::PasswordMissing {
+                account: self.name.clone(),
+                env_var,
+            }),
+        }
+    }
+
+    fn run_password_command(&self) -> Result<Secret, ConfigError> {
+        let fail = |message: String| ConfigError::PasswordCommand {
+            account: self.name.clone(),
+            message,
+        };
+
+        // `sh -c` lets the command use quotes and pipes, like a line typed in a terminal.
+        // The command's own stderr goes straight to ours so the user sees messages such as
+        // "keychain item not found"; stdout is captured and never put in an error.
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&self.password_command)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|e| fail(format!("could not start the shell: {e}")))?;
+
+        if !output.status.success() {
+            return Err(fail(format!(
+                "the command exited with {}; its output is not shown",
+                output.status
+            )));
+        }
+
+        let stdout = String::from_utf8(output.stdout).map_err(|_| {
+            fail(String::from(
+                "the command printed something that is not UTF-8",
+            ))
+        })?;
+        let password = stdout.trim();
+        if password.is_empty() {
+            return Err(fail(String::from("the command printed nothing")));
+        }
+        Ok(Secret::new(password))
+    }
+}
+
+impl Config {
+    /// Reads, parses and validates the config file at `path`.
+    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Config::parse_named(&text, &path.display().to_string())
+    }
+
+    /// Parses and validates config text.
+    pub fn parse(text: &str) -> Result<Config, ConfigError> {
+        Config::parse_named(text, "<text>")
+    }
+
+    fn parse_named(text: &str, origin: &str) -> Result<Config, ConfigError> {
+        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
+            origin: origin.to_string(),
+            source,
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Checks every rule `serde` cannot. Called by [`load`](Self::load) and
+    /// [`parse`](Self::parse); only needed directly for a `Config` built in code.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_llm()?;
+        self.validate_policy()?;
+        self.validate_flags()?;
+        self.validate_digest()?;
+        self.validate_accounts()
+    }
+
+    fn validate_llm(&self) -> Result<(), ConfigError> {
+        let llm = &self.llm;
+        if !(llm.base_url.starts_with("http://") || llm.base_url.starts_with("https://")) {
+            return Err(ConfigError::invalid(
+                "llm.base_url",
+                "must start with http:// or https:// (for example http://127.0.0.1:11434/v1)",
+            ));
+        }
+        if llm.model.trim().is_empty() {
+            return Err(ConfigError::invalid("llm.model", "must not be empty"));
+        }
+        if llm.timeout_seconds == 0 {
+            return Err(ConfigError::invalid(
+                "llm.timeout_seconds",
+                "must be at least 1",
+            ));
+        }
+        if llm.max_body_chars == 0 {
+            return Err(ConfigError::invalid(
+                "llm.max_body_chars",
+                "must be at least 1",
+            ));
+        }
+        if llm.max_concurrent == 0 {
+            return Err(ConfigError::invalid(
+                "llm.max_concurrent",
+                "must be at least 1 (use 1 to share the machine with other models)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_policy(&self) -> Result<(), ConfigError> {
+        // `contains` is false for NaN, so NaN is rejected too.
+        if !(0.0..=1.0).contains(&self.policy.min_confidence) {
+            return Err(ConfigError::invalid(
+                "policy.min_confidence",
+                format!(
+                    "must be between 0 and 1, got {}",
+                    self.policy.min_confidence
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_flags(&self) -> Result<(), ConfigError> {
+        for (key, setting, _) in self.flags.entries() {
+            if setting.colour == Some(ColourName::Red) {
+                return Err(ConfigError::invalid(
+                    format!("flags.{key}.colour"),
+                    "red is reserved for your own flags and is never set by the service; \
+                     choose orange, yellow, green, blue, purple or gray",
+                ));
+            }
+            if setting.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+                return Err(ConfigError::invalid(
+                    format!("flags.{key}.name"),
+                    "must not be empty",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_digest(&self) -> Result<(), ConfigError> {
+        let digest = &self.digest;
+        if digest.time_of_day().is_none() {
+            return Err(ConfigError::invalid(
+                "digest.time",
+                format!(
+                    "must be a 24-hour time like \"07:30\", got \"{}\"",
+                    digest.time
+                ),
+            ));
+        }
+        if digest.folder.trim().is_empty() {
+            return Err(ConfigError::invalid("digest.folder", "must not be empty"));
+        }
+        if digest.from.as_deref().is_some_and(|f| f.trim().is_empty()) {
+            return Err(ConfigError::invalid("digest.from", "must not be empty"));
+        }
+        if digest.language.trim().is_empty() {
+            return Err(ConfigError::invalid("digest.language", "must not be empty"));
+        }
+        Ok(())
+    }
+
+    fn validate_accounts(&self) -> Result<(), ConfigError> {
+        // Names are compared by their environment-variable form, because two accounts that
+        // map to the same variable ("my-mail" and "my_mail") would share one password.
+        let mut seen: Vec<(String, &str)> = Vec::new();
+
+        for (index, account) in self.accounts.iter().enumerate() {
+            let name = account.name.as_str();
+            if name.trim().is_empty() {
+                return Err(ConfigError::invalid(
+                    format!("accounts[{index}].name"),
+                    "must not be empty",
+                ));
+            }
+            let key = |field: &str| format!("accounts[{name}].{field}");
+
+            let env_var = password_env_var(name);
+            if let Some((_, other)) = seen.iter().find(|(var, _)| *var == env_var) {
+                return Err(ConfigError::invalid(
+                    key("name"),
+                    format!(
+                        "account names must be unique; `{name}` clashes with `{other}` \
+                         (both map to {env_var})"
+                    ),
+                ));
+            }
+            seen.push((env_var, name));
+
+            if account.host.trim().is_empty() {
+                return Err(ConfigError::invalid(key("host"), "must not be empty"));
+            }
+            if account.username.trim().is_empty() {
+                return Err(ConfigError::invalid(key("username"), "must not be empty"));
+            }
+            if account.inbox.trim().is_empty() {
+                return Err(ConfigError::invalid(key("inbox"), "must not be empty"));
+            }
+            if account.port == Some(0) {
+                return Err(ConfigError::invalid(key("port"), "must not be 0"));
+            }
+            if account.tls == Tls::None && !is_loopback_host(&account.host) {
+                return Err(ConfigError::invalid(
+                    key("tls"),
+                    format!(
+                        "\"none\" is only allowed for a loopback host, and `{}` is not one; \
+                         use \"tls\" or \"starttls\"",
+                        account.host
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The account with this name.
+    pub fn account(&self, name: &str) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| a.name == name)
+    }
+
+    /// The settings the decision engine needs: which flags are on, their colours and the
+    /// confidence threshold. Missing settings keep the defaults from `docs/FLAGS.md`.
+    pub fn flag_policy(&self) -> FlagPolicy {
+        let defaults = FlagPolicy::default();
+        let enabled = |setting: &FlagSetting, default: bool| setting.enabled.unwrap_or(default);
+        let colour = |setting: &FlagSetting, flag: TriageFlag| {
+            setting.colour.map_or(flag.colour(), ColourName::to_colour)
+        };
+        let flags = &self.flags;
+
+        FlagPolicy {
+            reply_needed: enabled(&flags.reply_needed, defaults.reply_needed),
+            deadline: enabled(&flags.deadline, defaults.deadline),
+            to_pay: enabled(&flags.to_pay, defaults.to_pay),
+            bookkeeping: enabled(&flags.bookkeeping, defaults.bookkeeping),
+            unsure: enabled(&flags.unsure, defaults.unsure),
+            colours: FlagColours {
+                reply_needed: colour(&flags.reply_needed, TriageFlag::ReplyNeeded),
+                deadline: colour(&flags.deadline, TriageFlag::Deadline),
+                to_pay: colour(&flags.to_pay, TriageFlag::ToPay),
+                bookkeeping: colour(&flags.bookkeeping, TriageFlag::Bookkeeping),
+                unsure: colour(&flags.unsure, TriageFlag::Unsure),
+            },
+            min_confidence: self.policy.min_confidence,
+        }
+    }
+
+    /// The display name of a flag (the configured one, or the default such as "Reply needed").
+    pub fn flag_name(&self, flag: TriageFlag) -> &str {
+        let configured = self
+            .flags
+            .entries()
+            .into_iter()
+            .find(|&(_, _, f)| f == flag)
+            .and_then(|(_, setting, _)| setting.name.as_deref());
+        configured.unwrap_or(match flag {
+            TriageFlag::ReplyNeeded => "Reply needed",
+            TriageFlag::Deadline => "Deadline",
+            TriageFlag::ToPay => "To pay",
+            TriageFlag::Bookkeeping => "Bookkeeping",
+            TriageFlag::Unsure => "Unsure",
+        })
+    }
+
+    /// Where the SQLite database lives: the configured path, or the default under
+    /// `~/.local/share`. A leading `~` is expanded.
+    pub fn db_path(&self) -> PathBuf {
+        let path = self
+            .storage
+            .db_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("~/.local/share/lets-triage-mail/state.db"));
+        expand_home(&path)
+    }
+}
+
+/// Replaces a leading `~` with the home directory (`$HOME`). The shell does this for
+/// command-line arguments, but not for paths read from a file.
+fn expand_home(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid account, as TOML.
+    const ACCOUNT: &str = r#"
+        [[accounts]]
+        name = "work"
+        host = "imap.example.com"
+        username = "me@example.com"
+    "#;
+
+    /// Parses `text` and returns the error message, failing the test if it is accepted.
+    fn error_of(text: &str) -> String {
+        Config::parse(text)
+            .expect_err("config should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn example_config_parses() {
+        let text = include_str!("../config.example.toml");
+        let config = Config::parse(text).expect("config.example.toml must stay valid");
+        assert!(config.policy.dry_run);
+        assert_eq!(config.accounts.len(), 1);
+    }
+
+    #[test]
+    fn empty_config_uses_the_safe_defaults() {
+        let config = Config::parse("").unwrap();
+        assert!(config.policy.dry_run, "dry_run must default to true");
+        assert_eq!(config.llm.max_concurrent, 1);
+        assert_eq!(config.policy.min_confidence, 0.75);
+        assert_eq!(config.digest.time_of_day(), Some((7, 0)));
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.flag_policy(), FlagPolicy::default());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let message = error_of("[policy]\nmin_confidnce = 0.5\n");
+        assert!(message.contains("min_confidnce"), "{message}");
+    }
+
+    #[test]
+    fn min_confidence_must_be_between_0_and_1() {
+        for bad in ["1.5", "-0.1"] {
+            let message = error_of(&format!("[policy]\nmin_confidence = {bad}\n"));
+            assert!(message.contains("policy.min_confidence"), "{message}");
+        }
+        assert!(Config::parse("[policy]\nmin_confidence = 1.0\n").is_ok());
+        assert!(Config::parse("[policy]\nmin_confidence = nan\n").is_err());
+    }
+
+    #[test]
+    fn max_concurrent_must_be_at_least_one() {
+        let message = error_of("[llm]\nmax_concurrent = 0\n");
+        assert!(message.contains("llm.max_concurrent"), "{message}");
+    }
+
+    #[test]
+    fn llm_base_url_needs_a_scheme() {
+        let message = error_of("[llm]\nbase_url = \"127.0.0.1:11434\"\n");
+        assert!(message.contains("llm.base_url"), "{message}");
+    }
+
+    #[test]
+    fn red_flag_colour_is_rejected() {
+        let message = error_of("[flags.to_pay]\ncolour = \"red\"\n");
+        assert!(message.contains("flags.to_pay.colour"), "{message}");
+        assert!(message.contains("reserved"), "{message}");
+    }
+
+    #[test]
+    fn unknown_flag_colour_is_rejected() {
+        assert!(Config::parse("[flags.to_pay]\ncolour = \"pink\"\n").is_err());
+    }
+
+    #[test]
+    fn flag_settings_override_defaults_and_keep_the_rest() {
+        let config = Config::parse(
+            r#"
+            [policy]
+            min_confidence = 0.9
+            [flags.to_pay]
+            enabled = true
+            colour = "blue"
+            name = "Bills"
+            "#,
+        )
+        .unwrap();
+        let policy = config.flag_policy();
+        assert!(policy.to_pay);
+        assert!(policy.reply_needed, "untouched flags keep their defaults");
+        assert!(!policy.deadline);
+        assert_eq!(policy.min_confidence, 0.9);
+        assert_eq!(policy.colour_for(TriageFlag::ToPay), FlagColour::Blue);
+        assert_eq!(
+            policy.colour_for(TriageFlag::ReplyNeeded),
+            FlagColour::Orange
+        );
+        assert_eq!(config.flag_name(TriageFlag::ToPay), "Bills");
+        assert_eq!(config.flag_name(TriageFlag::Unsure), "Unsure");
+    }
+
+    #[test]
+    fn digest_time_must_be_hh_mm() {
+        for good in ["00:00", "07:30", "23:59"] {
+            assert!(Config::parse(&format!("[digest]\ntime = \"{good}\"\n")).is_ok());
+        }
+        for bad in [
+            "24:00", "7:30", "07:60", "0730", "noon", "07:30:00", "+7:30",
+        ] {
+            let message = error_of(&format!("[digest]\ntime = \"{bad}\"\n"));
+            assert!(message.contains("digest.time"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn account_defaults() {
+        let config = Config::parse(ACCOUNT).unwrap();
+        let account = config.account("work").unwrap();
+        assert_eq!(account.tls, Tls::Tls);
+        assert_eq!(account.port(), 993);
+        assert_eq!(account.inbox, "INBOX");
+    }
+
+    #[test]
+    fn starttls_defaults_to_port_143() {
+        let text = ACCOUNT.to_string() + "tls = \"starttls\"\n";
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.accounts[0].port(), 143);
+    }
+
+    #[test]
+    fn account_names_must_be_unique() {
+        let message = error_of(&format!("{ACCOUNT}{ACCOUNT}"));
+        assert!(message.contains("unique"), "{message}");
+        assert!(message.contains("work"), "{message}");
+    }
+
+    #[test]
+    fn account_names_that_share_an_env_var_clash() {
+        let text = r#"
+            [[accounts]]
+            name = "my-mail"
+            host = "a.example.com"
+            username = "a"
+            [[accounts]]
+            name = "my_mail"
+            host = "b.example.com"
+            username = "b"
+        "#;
+        assert!(error_of(text).contains("LETS_TRIAGE_MAIL_PASSWORD_MY_MAIL"));
+    }
+
+    #[test]
+    fn plain_text_is_only_allowed_for_loopback() {
+        let message = error_of(&(ACCOUNT.to_string() + "tls = \"none\"\n"));
+        assert!(message.contains("accounts[work].tls"), "{message}");
+
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let text = format!(
+                "[[accounts]]\nname = \"t\"\nhost = \"{host}\"\nusername = \"u\"\ntls = \"none\"\n"
+            );
+            assert!(Config::parse(&text).is_ok(), "{host} should be accepted");
+        }
+    }
+
+    #[test]
+    fn missing_account_field_is_reported() {
+        let message = error_of("[[accounts]]\nname = \"work\"\nhost = \"h\"\n");
+        assert!(message.contains("username"), "{message}");
+    }
+
+    #[test]
+    fn env_var_name_is_uppercased_with_underscores() {
+        assert_eq!(
+            password_env_var("personal"),
+            "LETS_TRIAGE_MAIL_PASSWORD_PERSONAL"
+        );
+        assert_eq!(
+            password_env_var("my-work.mail"),
+            "LETS_TRIAGE_MAIL_PASSWORD_MY_WORK_MAIL"
+        );
+    }
+
+    fn account_with_command(command: &str) -> AccountConfig {
+        let config = Config::parse(ACCOUNT).unwrap();
+        AccountConfig {
+            password_command: command.to_string(),
+            ..config.accounts[0].clone()
+        }
+    }
+
+    #[test]
+    fn password_comes_from_the_environment() {
+        let account = account_with_command("");
+        let secret = account
+            .password_with_env(|name| {
+                (name == "LETS_TRIAGE_MAIL_PASSWORD_WORK").then(|| String::from("hunter2"))
+            })
+            .unwrap();
+        assert_eq!(secret.expose(), "hunter2");
+    }
+
+    #[test]
+    fn missing_password_names_the_env_var() {
+        let message = account_with_command("")
+            .password_with_env(|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("LETS_TRIAGE_MAIL_PASSWORD_WORK"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn password_command_output_is_trimmed() {
+        let secret = account_with_command("echo '  s3cret  '")
+            .password()
+            .unwrap();
+        assert_eq!(secret.expose(), "s3cret");
+    }
+
+    #[test]
+    fn password_command_wins_over_the_environment() {
+        let secret = account_with_command("echo from-command")
+            .password_with_env(|_| Some(String::from("from-env")))
+            .unwrap();
+        assert_eq!(secret.expose(), "from-command");
+    }
+
+    #[test]
+    fn failing_password_command_does_not_echo_its_output() {
+        let error = account_with_command("echo topsecret; exit 3")
+            .password()
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("work"), "{message}");
+        assert!(!message.contains("topsecret"), "{message}");
+        assert!(!format!("{error:?}").contains("topsecret"));
+    }
+
+    #[test]
+    fn empty_password_command_output_is_an_error() {
+        assert!(account_with_command("true").password().is_err());
+    }
+
+    #[test]
+    fn secret_never_prints() {
+        let secret = Secret::new("hunter2");
+        assert_eq!(format!("{secret:?}"), "***");
+        assert_eq!(format!("{secret:#?}"), "***");
+
+        // The api key inside a whole config is covered too.
+        let config = Config::parse("[llm]\napi_key = \"hunter2\"\n").unwrap();
+        assert!(!format!("{config:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn load_reports_a_missing_file() {
+        let error = Config::load(Path::new("/nonexistent/config.toml")).unwrap_err();
+        assert!(error.to_string().contains("/nonexistent/config.toml"));
+    }
+}

@@ -114,6 +114,29 @@ impl TriageFlag {
     }
 }
 
+/// The colour each [`TriageFlag`] is shown in. Configurable, so other users can pick their own
+/// meanings; [`TriageFlag::colour`] gives the defaults. The config loader rejects red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlagColours {
+    pub reply_needed: FlagColour,
+    pub deadline: FlagColour,
+    pub to_pay: FlagColour,
+    pub bookkeeping: FlagColour,
+    pub unsure: FlagColour,
+}
+
+impl Default for FlagColours {
+    fn default() -> Self {
+        FlagColours {
+            reply_needed: TriageFlag::ReplyNeeded.colour(),
+            deadline: TriageFlag::Deadline.colour(),
+            to_pay: TriageFlag::ToPay.colour(),
+            bookkeeping: TriageFlag::Bookkeeping.colour(),
+            unsure: TriageFlag::Unsure.colour(),
+        }
+    }
+}
+
 /// Which flags the user has enabled, and how sure the model must be to act.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlagPolicy {
@@ -122,6 +145,8 @@ pub struct FlagPolicy {
     pub to_pay: bool,
     pub bookkeeping: bool,
     pub unsure: bool,
+    /// The colour of each flag.
+    pub colours: FlagColours,
     /// Below this confidence the message gets "Unsure" instead of an action flag.
     pub min_confidence: f32,
 }
@@ -135,12 +160,25 @@ impl Default for FlagPolicy {
             to_pay: false,
             bookkeeping: false,
             unsure: true,
+            colours: FlagColours::default(),
             min_confidence: 0.75,
         }
     }
 }
 
 impl FlagPolicy {
+    /// The colour configured for a flag. Use this instead of [`TriageFlag::colour`] when
+    /// setting flags on the server, so the user's config is respected.
+    pub fn colour_for(&self, flag: TriageFlag) -> FlagColour {
+        match flag {
+            TriageFlag::ReplyNeeded => self.colours.reply_needed,
+            TriageFlag::Deadline => self.colours.deadline,
+            TriageFlag::ToPay => self.colours.to_pay,
+            TriageFlag::Bookkeeping => self.colours.bookkeeping,
+            TriageFlag::Unsure => self.colours.unsure,
+        }
+    }
+
     fn is_enabled(&self, flag: TriageFlag) -> bool {
         match flag {
             TriageFlag::ReplyNeeded => self.reply_needed,
@@ -329,6 +367,28 @@ mod tests {
     fn nothing_to_do_means_no_flag() {
         let v = verdict(Category::Personal);
         assert_eq!(choose_flag(Trust::Trusted, &v, &all_flags_enabled()), None);
+    }
+
+    #[test]
+    fn default_policy_uses_the_documented_colours() {
+        let policy = FlagPolicy::default();
+        assert_eq!(
+            policy.colour_for(TriageFlag::ReplyNeeded),
+            FlagColour::Orange
+        );
+        assert_eq!(policy.colour_for(TriageFlag::Unsure), FlagColour::Gray);
+    }
+
+    #[test]
+    fn configured_colour_overrides_the_default() {
+        let policy = FlagPolicy {
+            colours: FlagColours {
+                to_pay: FlagColour::Blue,
+                ..FlagColours::default()
+            },
+            ..FlagPolicy::default()
+        };
+        assert_eq!(policy.colour_for(TriageFlag::ToPay), FlagColour::Blue);
     }
 
     #[test]
