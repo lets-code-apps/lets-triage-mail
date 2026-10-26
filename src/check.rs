@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{AccountConfig, LlmConfig, password_env_var};
+use crate::config::{AccountConfig, Config, FlagMode, LlmConfig, password_env_var};
 use crate::decider::{
     AuthResult, DecideError, Decider, Evidence, LlmDecider, LlmSettings, install_tls_provider,
 };
@@ -191,21 +191,37 @@ pub fn format_items(items: &[CheckItem]) -> String {
 
 const CONFIG: &str = "Config";
 
-/// The item for `policy.dry_run`. Turning it off is allowed, but it is the switch that makes
-/// the service write flags, so `check` points it out.
-pub fn dry_run_item(dry_run: bool) -> CheckItem {
-    if dry_run {
-        CheckItem::ok(
-            CONFIG,
-            "dry-run is on: mail is classified and logged, nothing is changed on the server",
-        )
-    } else {
-        CheckItem::warn(
-            CONFIG,
-            "dry-run is off: flags will be written to your mailboxes",
-            "keep policy.dry_run = true until `stats` shows verdicts you agree with",
-        )
-    }
+/// One item per account saying what the service will do to its mailbox: write flags (live),
+/// only log (dry-run), or classify for the digest only. Going live is the switch that makes
+/// the service write, so a live account is a warning that points it out.
+pub fn mode_items(config: &Config) -> Vec<CheckItem> {
+    config
+        .accounts
+        .iter()
+        .map(|account| {
+            let name = &account.name;
+            match account.flag_mode(&config.policy) {
+                FlagMode::DryRun => CheckItem::ok(
+                    CONFIG,
+                    format!(
+                        "account {name}: dry-run is on: mail is classified and logged, nothing is changed on the server"
+                    ),
+                ),
+                FlagMode::Live => CheckItem::warn(
+                    CONFIG,
+                    format!("account {name}: dry-run is off: flags will be written to this mailbox"),
+                    "keep dry_run = true until `stats` shows verdicts you agree with; \
+                     `dry_run = false` on one account turns on only that account",
+                ),
+                FlagMode::ClassifyOnly => CheckItem::ok(
+                    CONFIG,
+                    format!(
+                        "account {name}: flagging is off: mail is classified for the digest only and never written to"
+                    ),
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Opens (creating if needed) the state database to prove the path is usable.
@@ -1088,11 +1104,28 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_off_is_a_warning() {
-        assert_eq!(dry_run_item(true).status, Status::Ok);
-        let item = dry_run_item(false);
-        assert_eq!(item.status, Status::Warn);
-        assert!(item.message.contains("flags will be written"));
+    fn each_accounts_mode_is_reported_and_only_live_is_a_warning() {
+        let account = |name: &str, extra: &str| {
+            format!("[[accounts]]\nname = \"{name}\"\nhost = \"h\"\nusername = \"u\"\n{extra}")
+        };
+        let config = Config::parse(&format!(
+            "{}{}{}",
+            account("zoho", "dry_run = false\n"),
+            account("gmail", ""),
+            account("wp", "flagging = false\n"),
+        ))
+        .unwrap();
+        let items = mode_items(&config);
+        assert_eq!(
+            statuses(&items),
+            [Status::Warn, Status::Ok, Status::Ok],
+            "{items:#?}"
+        );
+        assert!(
+            items[0].message.contains("zoho") && items[0].message.contains("flags will be written")
+        );
+        assert!(items[1].message.contains("gmail") && items[1].message.contains("dry-run is on"));
+        assert!(items[2].message.contains("wp") && items[2].message.contains("flagging is off"));
     }
 
     #[test]

@@ -30,14 +30,12 @@ pub async fn run(config_path: &Path, account: Option<&str>, json: bool) -> anyho
 
     let accounts = select_accounts(&config, account)?;
 
-    let section = vec![
-        CheckItem::ok(
-            "Config",
-            format!("{} loads and validates", config_path.display()),
-        ),
-        check::dry_run_item(config.policy.dry_run),
-        check::database_item(&config.db_path()),
-    ];
+    let mut section = vec![CheckItem::ok(
+        "Config",
+        format!("{} loads and validates", config_path.display()),
+    )];
+    section.extend(check::mode_items(&config));
+    section.push(check::database_item(&config.db_path()));
     finish_section(&mut report, section, json);
 
     finish_section(&mut report, check::probe_model(&config.llm).await, json);
@@ -65,7 +63,7 @@ fn finish_section(report: &mut Report, section: Vec<CheckItem>, json: bool) {
 }
 
 /// The accounts to check: the named one, or all of them.
-fn select_accounts<'a>(
+pub(super) fn select_accounts<'a>(
     config: &'a Config,
     name: Option<&str>,
 ) -> anyhow::Result<Vec<&'a AccountConfig>> {

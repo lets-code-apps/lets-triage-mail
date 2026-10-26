@@ -1,4 +1,4 @@
-//! The account worker: watches one inbox and classifies new mail. Dry-run only for now.
+//! The account worker: watches one inbox, classifies new mail, and sets and clears our flags.
 //!
 //! [`run_account`] runs until its [`CancellationToken`] fires. Its loop, per connection:
 //!
@@ -6,19 +6,40 @@
 //! 2. Fetch size and flags of every UID above the saved one, then process each message
 //!    ([`Ctx::process_message`]).
 //! 3. Retry earlier model failures that are due.
-//! 4. Wait: `IDLE` (renewed every ~5 minutes, far below the 29-minute limit of RFC 2177), or
+//! 4. Now and then (every [`WorkerTiming::clear_interval`]) run the auto-clear pass
+//!    ([`Ctx::clear_pass`]) over the flags we set earlier.
+//! 5. Wait: `IDLE` (renewed every ~5 minutes, far below the 29-minute limit of RFC 2177), or
 //!    a 60-second sleep if the server has no `IDLE`. Then start again at step 1.
 //!
 //! Re-selecting the mailbox at every wake-up is deliberate. It is cheap, it tells us the new
 //! `UIDNEXT`, and it notices a changed UIDVALIDITY in one place, with no special code for
 //! "the server renumbered the mailbox while we were idle".
 //!
-//! # Dry-run only
+//! # What may change on the server
 //!
-//! Phase 4 adds the flagging. Until then **nothing in this file changes server state**:
-//! [`run_account`] refuses to start when `dry_run = false`, and a source-scan test fails if the
-//! flag-writing method of the session is ever mentioned here. Phase 4 plugs in at the single
-//! place marked `PHASE 4` in [`Ctx::triage`].
+//! Only flags, and only ours. This file has exactly one way to write: a `UID STORE` of flag
+//! keywords through [`FlagBackend::change_flags`], used in two places: setting a colour
+//! ([`Ctx::set_flag`]) and removing one we set earlier ([`Ctx::review_owned`]). A source-scan
+//! test fails if anything that moves, copies, appends or deletes mail is ever mentioned here.
+//!
+//! Whether the service writes at all is decided per account by
+//! [`AccountConfig::flag_mode`]: `Live` writes, `DryRun` only logs what it would do, and
+//! `ClassifyOnly` (`flagging = false`) never chooses a flag. A live account must also have
+//! custom keywords (see [`ensure_keywords`]), or the worker refuses to start: a bare
+//! `\Flagged` shows as red in Apple Mail, and red is the user's.
+//!
+//! The decisions themselves (may we set this colour, is this flag still ours, should it clear)
+//! are pure functions in [`crate::flagging`]; this file gathers their inputs and carries out
+//! the answer.
+//!
+//! # The auto-clear pass: when it runs
+//!
+//! It runs on the worker's own wake-ups, throttled to once per `clear_interval` (15 minutes),
+//! instead of on a separate timer or connection. Reasons: the worker's connection is already
+//! open and selected on the inbox; one task means no two STOREs can race on the same message;
+//! and nothing here is urgent, since a flag that clears a few minutes late costs nothing. The
+//! price is that the pass can only start when the worker wakes (at the latest every IDLE
+//! renewal, 5 minutes).
 //!
 //! # Errors: what ends the worker
 //!
@@ -37,21 +58,30 @@
 //! ([`backoff_delay`]). Retries run at wake-ups, so the real delay is "at least the backoff,
 //! at most one more IDLE renewal".
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use jiff::civil::Date;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{IdleEnd, ImapError, ImapSession, ImapSettings, MessageMeta};
-use crate::config::{AccountConfig, Config, ConfigError};
+use crate::config::{AccountConfig, Config, ConfigError, FlagMode};
 use crate::decider::{Decider, Evidence};
-use crate::engine::{FlagPolicy, Trust, choose_flag, screen_sender};
+use crate::engine::{FlagPolicy, TriageFlag, Trust, Verdict, choose_flag, screen_sender};
+use crate::flagging::{
+    ApplyPlan, LeaveReason, OwnedState, clear_reason, normalise_message_id, owned_state, plan_apply,
+};
+use crate::flags::{StoreChange, clear_change};
 use crate::message::{HEADERS_ONLY_THRESHOLD, ParsedMessage, parse_headers_only, parse_message};
 use crate::precheck::{SOURCE_MODEL, SOURCE_RULE, precheck};
-use crate::senders::plan_batches;
-use crate::store::{LabelRecord, MailboxState, MessageKey, ProcessedRecord, Store, StoreError};
+use crate::senders::{HarvestError, harvest_known_senders, plan_batches};
+use crate::store::{
+    LabelRecord, MailboxState, MessageKey, OwnedFlag, ProcessedRecord, Store, StoreError,
+};
 
 /// How many UIDs one metadata fetch covers.
 const META_BATCH: u32 = 100;
@@ -77,6 +107,9 @@ pub struct WorkerTiming {
     pub retry_initial: Duration,
     /// Ceiling for the classification retry wait.
     pub retry_max: Duration,
+    /// How often the auto-clear pass looks at the flags we set. It runs at a wake-up, so the
+    /// real gap is "at least this, at most one more IDLE renewal".
+    pub clear_interval: Duration,
 }
 
 impl Default for WorkerTiming {
@@ -88,6 +121,7 @@ impl Default for WorkerTiming {
             reconnect_max: Duration::from_secs(5 * 60),
             retry_initial: Duration::from_secs(60),
             retry_max: Duration::from_secs(60 * 60),
+            clear_interval: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -99,9 +133,16 @@ impl Default for WorkerTiming {
 /// Why a worker ended or an attempt failed.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    /// `dry_run = false` was requested before phase 4 exists.
-    #[error("flagging is not implemented yet (phase 4); set `policy.dry_run = true`")]
-    FlaggingNotImplemented,
+    /// The account is live, but its mailbox cannot store flag colours.
+    #[error(
+        "account {account:?} would write flags, but its mailbox does not allow custom keywords \
+         (PERMANENTFLAGS lacks \\*). A bare \\Flagged shows as red in Apple Mail, and red is yours. \
+         Set `flagging = false` or `dry_run = true` for this account"
+    )]
+    LiveWithoutKeywords {
+        /// The account's name in the config.
+        account: String,
+    },
     /// The password could not be found.
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -122,10 +163,21 @@ impl WorkerError {
         match self {
             WorkerError::Imap(error) => imap_error_is_fatal(error),
             // Retrying a missing password, a corrupt database or a panic would only repeat it.
-            WorkerError::FlaggingNotImplemented
+            WorkerError::LiveWithoutKeywords { .. }
             | WorkerError::Config(_)
             | WorkerError::Store(_)
             | WorkerError::Task(_) => true,
+        }
+    }
+}
+
+/// The Sent-folder refresh inside the clear pass shares its error cases with the worker.
+impl From<HarvestError> for WorkerError {
+    fn from(error: HarvestError) -> WorkerError {
+        match error {
+            HarvestError::Imap(error) => WorkerError::Imap(error),
+            HarvestError::Store(error) => WorkerError::Store(error),
+            HarvestError::Task(error) => WorkerError::Task(error),
         }
     }
 }
@@ -266,6 +318,37 @@ pub fn is_own_message(from: &str, own: Option<&str>) -> bool {
     own.is_some_and(|own| own == from)
 }
 
+/// Splits owned flags into those that belong to the mailbox's current UIDVALIDITY and the
+/// rest. A UID only means something together with its UIDVALIDITY, so the rest can never be
+/// acted on.
+fn split_by_uidvalidity(
+    owned: Vec<OwnedFlag>,
+    uid_validity: u32,
+) -> (Vec<OwnedFlag>, Vec<OwnedFlag>) {
+    owned
+        .into_iter()
+        .partition(|flag| flag.key.uidvalidity == uid_validity)
+}
+
+/// The guard for going live: an account that writes flags needs a mailbox that can store the
+/// colour keywords. `Err` (fatal) when it does not.
+///
+/// Without custom keywords a STORE would add a bare `\Flagged`, which Apple Mail shows as red,
+/// the user's own colour. Checked on every `SELECT`, not only in `check`, because the server's
+/// answer can change and `check` may never have been run.
+pub fn ensure_keywords(
+    account: &str,
+    mode: FlagMode,
+    keywords_allowed: bool,
+) -> Result<(), WorkerError> {
+    if mode == FlagMode::Live && !keywords_allowed {
+        return Err(WorkerError::LiveWithoutKeywords {
+            account: account.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -277,6 +360,42 @@ fn now_unix() -> i64 {
 // ---------------------------------------------------------------------------------------------
 // The worker
 // ---------------------------------------------------------------------------------------------
+
+/// What the flag logic needs from a mailbox: read one message's flags, change them.
+///
+/// A trait only so the unit tests can stand in a fake mailbox and prove what *would* be sent to
+/// a server, without one. Production uses [`ImapSession`]. The methods return
+/// `impl Future + Send` (as [`Decider`] does) so that the worker's future stays `Send` and can
+/// run on tokio's thread pool.
+trait FlagBackend {
+    /// The flags the server reports for `uid` right now, or `None` if the message is gone.
+    fn current_flags(
+        &mut self,
+        uid: u32,
+    ) -> impl Future<Output = Result<Option<Vec<String>>, ImapError>> + Send;
+
+    /// Applies a flag change to `uid`.
+    fn change_flags(
+        &mut self,
+        uid: u32,
+        change: &StoreChange,
+    ) -> impl Future<Output = Result<(), ImapError>> + Send;
+}
+
+impl FlagBackend for ImapSession {
+    async fn current_flags(&mut self, uid: u32) -> Result<Option<Vec<String>>, ImapError> {
+        Ok(self
+            .fetch_meta(&[uid])
+            .await?
+            .into_iter()
+            .next()
+            .map(|meta| meta.flags))
+    }
+
+    async fn change_flags(&mut self, uid: u32, change: &StoreChange) -> Result<(), ImapError> {
+        self.store_flags(uid, change).await
+    }
+}
 
 /// What happened to one message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +414,33 @@ pub enum Outcome {
 
 /// Whether a loop should go on.
 type Flow = ControlFlow<()>;
+
+/// What [`Ctx::set_flag`] did about the flag a message was meant to get.
+enum FlagOutcome {
+    /// `choose_flag` found nothing to set (or the account does not flag).
+    NotWanted,
+    /// Dry-run: logged what would happen, changed nothing.
+    WouldSet,
+    /// The STORE succeeded. Carries the ownership record to save.
+    Set(OwnedFlag),
+    /// Left alone on purpose: the user flagged it first, or the colour was red.
+    LeftAlone,
+    /// The message vanished from the server before we could flag it.
+    Gone,
+}
+
+/// What one run of the clear pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClearReport {
+    /// Flags removed from the server.
+    cleared: u32,
+    /// Dry-run: flags that would have been removed.
+    would_clear: u32,
+    /// Messages whose flag the user changed; ours no more.
+    user_owned: u32,
+    /// Flagged messages that no longer exist.
+    gone: u32,
+}
 
 /// Runs the worker for one account until `shutdown` fires, using the default timing.
 ///
@@ -327,12 +473,6 @@ pub async fn run_account_with_timing<D: Decider>(
     shutdown: CancellationToken,
     timing: WorkerTiming,
 ) -> Result<(), WorkerError> {
-    // PHASE 4: remove this guard when flagging exists. Until then it is impossible to reach
-    // any state-changing IMAP command from here.
-    if !config.policy.dry_run {
-        return Err(WorkerError::FlaggingNotImplemented);
-    }
-
     // `password_command` runs a shell command and waits for it, which would block the async
     // runtime, so it goes to the blocking pool. It runs once; reconnects reuse the result, so
     // a flapping network does not pop up a keychain prompt every few seconds.
@@ -410,7 +550,10 @@ impl<D: Decider> Ctx<'_, D> {
         *failures = 0;
 
         let use_idle = session.capabilities().await?.idle;
-        tracing::info!(account = %self.account.name, idle = use_idle, "connected");
+        tracing::info!(
+            account = %self.account.name, idle = use_idle, mode = self.mode().as_str(),
+            "connected"
+        );
 
         let inbox = self.account.inbox.as_str();
         let name = self.account.name.clone();
@@ -419,8 +562,12 @@ impl<D: Decider> Ctx<'_, D> {
             .with_store(move |store| store.mailbox_state(&name, &mailbox))
             .await?;
 
+        // When the clear pass last ran on this connection; `None` means "run it right away".
+        let mut last_clear: Option<Instant> = None;
+
         loop {
             let info = session.select(inbox).await?;
+            ensure_keywords(&self.account.name, self.mode(), info.keywords_allowed)?;
 
             let (mut state, change) = plan_cursor(saved, info.uid_validity, info.uid_next);
             match change {
@@ -452,6 +599,17 @@ impl<D: Decider> Ctx<'_, D> {
                 .is_break()
             {
                 return finish(session).await;
+            }
+
+            if last_clear.is_none_or(|at| at.elapsed() >= self.timing.clear_interval) {
+                if self
+                    .clear_pass(&mut session, state.uidvalidity)
+                    .await?
+                    .is_break()
+                {
+                    return finish(session).await;
+                }
+                last_clear = Some(Instant::now());
             }
 
             if use_idle {
@@ -584,14 +742,16 @@ impl<D: Decider> Ctx<'_, D> {
             return Ok(Outcome::Skipped(SkipReason::Unparseable));
         };
 
-        self.triage(key, &parsed, failed_attempts).await
+        self.triage(session, key, &parsed, failed_attempts).await
     }
 
     /// The pipeline after parsing: own-address skip, rule and known-sender lookup,
-    /// `screen_sender`, decider, `choose_flag`, record. No IMAP session needed, which is what
-    /// lets the unit tests run it with a fake decider and an in-memory database.
-    async fn triage(
+    /// `screen_sender`, decider, `choose_flag`, then the flag itself, then the record. The
+    /// mailbox is reached only through [`FlagBackend`], which is what lets the unit tests run
+    /// it with a fake decider, a fake mailbox and an in-memory database.
+    async fn triage<B: FlagBackend>(
         &self,
+        backend: &mut B,
         key: &MessageKey,
         parsed: &ParsedMessage,
         failed_attempts: u32,
@@ -688,32 +848,41 @@ impl<D: Decider> Ctx<'_, D> {
             None
         };
 
-        // PHASE 4: `dry_run` is always true here (see `run_account_with_timing`). This is the
-        // one place where flagging plugs in: when `dry_run` is false, send the STORE for
-        // `flag` first and write the record below only if it succeeded.
-        if self.account.flagging {
+        // The STORE comes first and the records after it. A STORE that fails (`?`) records
+        // nothing, so after the reconnect the message is looked at again; a record is never
+        // written for a flag that is not on the server.
+        let outcome = match flag {
+            Some(flag) => {
+                self.set_flag(backend, key, flag, &verdict, parsed.message_id.as_deref())
+                    .await?
+            }
+            None => FlagOutcome::NotWanted,
+        };
+        let (recorded_flag, ownership) = match outcome {
+            FlagOutcome::Gone => return Ok(Outcome::Gone),
+            // Dry-run keeps the would-be flag in the log tables, so `stats` can show it.
+            FlagOutcome::WouldSet => (flag, None),
+            FlagOutcome::Set(owned) => (flag, Some(owned)),
+            FlagOutcome::NotWanted | FlagOutcome::LeftAlone => (None, None),
+        };
+        if flag.is_none() {
             tracing::info!(
                 account = %self.account.name,
                 uid = key.uid,
                 category = verdict.category.as_str(),
                 source,
-                flag = ?flag.map(|flag| self.config.flag_name(flag)),
-                colour = ?flag.map(|flag| self.policy.colour_for(flag)),
-                "dry-run: would set flag (nothing was changed on the server)"
-            );
-        } else {
-            tracing::info!(
-                account = %self.account.name,
-                uid = key.uid,
-                category = verdict.category.as_str(),
-                source,
-                "classified for the digest (flagging is off for this account)"
+                "{}",
+                if self.account.flagging {
+                    "classified: no flag needed"
+                } else {
+                    "classified for the digest (flagging is off for this account)"
+                }
             );
         }
 
         let record = ProcessedRecord {
             verdict: Some(verdict.clone()),
-            flag,
+            flag: recorded_flag,
             source: String::from(source),
             ..base
         };
@@ -721,14 +890,273 @@ impl<D: Decider> Ctx<'_, D> {
             key: key.clone(),
             features: features_json(&evidence, trust, parsed.from_domain()),
             verdict,
-            flag,
+            flag: recorded_flag,
         };
         self.with_store(move |store| {
+            if let Some(owned) = &ownership {
+                store.record_flag(owned)?;
+            }
             store.record_processed(&record)?;
             store.record_label(&label)
         })
         .await?;
         Ok(Outcome::Processed)
+    }
+
+    /// Sets the chosen flag on the server, when the account is live.
+    ///
+    /// The flags are read again **right before** the STORE, not taken from the download a
+    /// moment ago: the user may have flagged the message in between (mail takes seconds to
+    /// classify with a local model). Any `\Flagged` found then means "the user got there
+    /// first" and the message is left alone. See [`plan_apply`].
+    async fn set_flag<B: FlagBackend>(
+        &self,
+        backend: &mut B,
+        key: &MessageKey,
+        flag: TriageFlag,
+        verdict: &Verdict,
+        message_id: Option<&str>,
+    ) -> Result<FlagOutcome, WorkerError> {
+        let colour = self.policy.colour_for(flag);
+        let name = self.config.flag_name(flag);
+
+        if self.mode() != FlagMode::Live {
+            tracing::info!(
+                account = %self.account.name, uid = key.uid,
+                category = verdict.category.as_str(), flag = name, colour = ?colour,
+                "dry-run: would set flag (nothing was changed on the server)"
+            );
+            return Ok(FlagOutcome::WouldSet);
+        }
+
+        let Some(current) = backend.current_flags(key.uid).await? else {
+            return Ok(FlagOutcome::Gone);
+        };
+        match plan_apply(&current, colour) {
+            ApplyPlan::Leave(LeaveReason::AlreadyFlagged) => {
+                tracing::info!(
+                    account = %self.account.name, uid = key.uid, wanted = name,
+                    "the message is already flagged (by you); leaving it alone"
+                );
+                Ok(FlagOutcome::LeftAlone)
+            }
+            ApplyPlan::Leave(LeaveReason::ReservedRed) => {
+                tracing::error!(
+                    account = %self.account.name, uid = key.uid, wanted = name,
+                    "refusing to set red, which is reserved for you; check [flags] in the config"
+                );
+                Ok(FlagOutcome::LeftAlone)
+            }
+            ApplyPlan::Store(change) => {
+                backend.change_flags(key.uid, &change).await?;
+                tracing::info!(
+                    account = %self.account.name, uid = key.uid,
+                    category = verdict.category.as_str(), flag = name, colour = ?colour,
+                    "set flag"
+                );
+                Ok(FlagOutcome::Set(OwnedFlag {
+                    key: key.clone(),
+                    message_id: message_id.and_then(normalise_message_id),
+                    colour,
+                    flag: Some(flag),
+                    deadline: (flag == TriageFlag::Deadline)
+                        .then_some(verdict.deadline)
+                        .flatten(),
+                    reason: Some(verdict.reason.clone()),
+                    set_at: now_unix(),
+                }))
+            }
+        }
+    }
+
+    // ---- the auto-clear pass ----------------------------------------------------------
+
+    /// Looks at every flag we set in this inbox and, where it is due, clears it.
+    ///
+    /// Steps: drop records of an old UIDVALIDITY (their UIDs mean nothing now, so nothing is
+    /// ever stored for them); refresh the Sent harvest if a "Reply needed" flag is waiting for
+    /// its reply; read the current flags of all owned messages; then [`Ctx::review_owned`].
+    async fn clear_pass(
+        &self,
+        session: &mut ImapSession,
+        uid_validity: u32,
+    ) -> Result<Flow, WorkerError> {
+        // `flagging = false` never wrote a flag, so there is nothing of ours to look after.
+        if !self.account.flagging {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let (name, mailbox) = (self.account.name.clone(), self.account.inbox.clone());
+        let owned = self
+            .with_store(move |store| store.owned_flags(&name, &mailbox))
+            .await?;
+        if owned.is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        // `set_mailbox_state` already deletes these when it sees the new UIDVALIDITY; this is
+        // the second line of defence. Never a STORE for a UID of an older numbering: it could
+        // hit a different message.
+        let (current, stale) = split_by_uidvalidity(owned, uid_validity);
+        for old in stale {
+            tracing::warn!(
+                account = %self.account.name, uid = old.key.uid,
+                "forgetting a flag record from before the UIDVALIDITY change; nothing is stored"
+            );
+            let key = old.key;
+            self.with_store(move |store| store.clear_flag_record(&key))
+                .await?;
+        }
+        if current.is_empty() {
+            return Ok(ControlFlow::Continue(()));
+        }
+
+        // A reply shows up in Sent, not in the inbox, so bring the reply ids up to date. The
+        // harvest reads only new Sent messages and leaves Sent selected; select the inbox
+        // again afterwards because everything below, and the IDLE that follows, needs it.
+        if current
+            .iter()
+            .any(|flag| flag.flag == Some(TriageFlag::ReplyNeeded))
+        {
+            harvest_known_senders(
+                session,
+                self.store,
+                self.account,
+                self.config.policy.known_senders_from_sent,
+            )
+            .await?;
+            let reselected = session.select(&self.account.inbox).await?;
+            if reselected.uid_validity != uid_validity {
+                // Renumbered while we were looking at Sent. The main loop handles that.
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+
+        let uids: Vec<u32> = current.iter().map(|flag| flag.key.uid).collect();
+        let mut server_flags: HashMap<u32, Vec<String>> = HashMap::new();
+        for chunk in uids.chunks(META_BATCH as usize) {
+            for meta in session.fetch_meta(chunk).await? {
+                server_flags.insert(meta.uid, meta.flags);
+            }
+        }
+
+        let today = jiff::Zoned::now().date();
+        let report = self
+            .review_owned(session, current, &server_flags, today)
+            .await?;
+        if report != ClearReport::default() {
+            tracing::info!(
+                account = %self.account.name, cleared = report.cleared,
+                would_clear = report.would_clear, taken_over_by_user = report.user_owned,
+                gone = report.gone, "flag review finished"
+            );
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Decides and acts for each flag we own, given what the server reports for them.
+    ///
+    /// For every record:
+    ///
+    /// 1. Message gone (deleted or moved by the user): forget the record, STORE nothing.
+    /// 2. Flags differ from what we set: the user took over. Mark it user-owned; never again.
+    /// 3. Still ours: if [`clear_reason`] says so, re-read the flags once more, then one STORE
+    ///    removing `\Flagged` and our bits, then forget the record.
+    ///
+    /// In dry-run the same decisions are only logged ("would clear"), and neither the server
+    /// nor the database changes.
+    async fn review_owned<B: FlagBackend>(
+        &self,
+        backend: &mut B,
+        owned: Vec<OwnedFlag>,
+        server_flags: &HashMap<u32, Vec<String>>,
+        today: Date,
+    ) -> Result<ClearReport, WorkerError> {
+        let live = self.mode() == FlagMode::Live;
+        let mut report = ClearReport::default();
+
+        for record in owned {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            let uid = record.key.uid;
+            let account = self.account.name.as_str();
+
+            let Some(flags) = server_flags.get(&uid) else {
+                report.gone += 1;
+                tracing::info!(
+                    account,
+                    uid,
+                    "a flagged message is gone from the inbox; forgetting it"
+                );
+                if live {
+                    let key = record.key.clone();
+                    self.with_store(move |store| store.clear_flag_record(&key))
+                        .await?;
+                }
+                continue;
+            };
+
+            if owned_state(flags, record.colour) == OwnedState::ChangedByUser {
+                report.user_owned += 1;
+                tracing::info!(
+                    account,
+                    uid,
+                    "the flag was changed by you; leaving this message alone from now on"
+                );
+                if live {
+                    let key = record.key.clone();
+                    self.with_store(move |store| store.mark_user_owned(&key).map(|_| ()))
+                        .await?;
+                }
+                continue;
+            }
+
+            // Has the user answered? Only "Reply needed" asks, and only when the message has
+            // an id to match against the Sent folder.
+            let replied = match (record.flag, record.message_id.clone()) {
+                (Some(TriageFlag::ReplyNeeded), Some(id)) => {
+                    let name = self.account.name.clone();
+                    self.with_store(move |store| store.has_reply_to(&name, &id))
+                        .await?
+                }
+                _ => false,
+            };
+            let Some(reason) = clear_reason(record.flag, record.deadline, replied, today) else {
+                continue;
+            };
+
+            if !live {
+                report.would_clear += 1;
+                tracing::info!(
+                    account,
+                    uid,
+                    reason = reason.as_str(),
+                    "dry-run: would clear flag (nothing was changed on the server)"
+                );
+                continue;
+            }
+
+            // Look once more right before writing: the user may have just changed the flag.
+            let Some(fresh) = backend.current_flags(uid).await? else {
+                continue; // gone since the batch read; the next pass records that
+            };
+            if owned_state(&fresh, record.colour) == OwnedState::ChangedByUser {
+                // Leave it for the next pass, which marks it user-owned in the normal way.
+                continue;
+            }
+            backend.change_flags(uid, &clear_change()).await?;
+            let key = record.key.clone();
+            self.with_store(move |store| store.clear_flag_record(&key))
+                .await?;
+            report.cleared += 1;
+            tracing::info!(account, uid, reason = reason.as_str(), "cleared flag");
+        }
+        Ok(report)
+    }
+
+    /// What this account may do to the server (see [`AccountConfig::flag_mode`]).
+    fn mode(&self) -> FlagMode {
+        self.account.flag_mode(&self.config.policy)
     }
 
     fn key(&self, uidvalidity: u32, uid: u32) -> MessageKey {
@@ -770,6 +1198,104 @@ impl<D: Decider> Ctx<'_, D> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Backfill
+// ---------------------------------------------------------------------------------------------
+
+/// What [`backfill_account`] found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackfillReport {
+    /// Messages in the inbox that arrived within the window.
+    pub found: usize,
+    /// Classified (and flagged, on a live account) now.
+    pub processed: usize,
+    /// Left alone: already processed, flagged by the user, the account's own mail, unreadable.
+    pub skipped: usize,
+    /// The model failed; the message is in the retry queue and the running service retries it.
+    pub deferred: usize,
+    /// Messages that disappeared while the backfill ran.
+    pub gone: usize,
+    /// True if shutdown (Ctrl-C) stopped the run before it finished.
+    pub interrupted: bool,
+}
+
+/// Runs the normal pipeline over inbox mail that arrived since `since`, oldest first.
+///
+/// It is the same [`Ctx::process_message`] the live worker uses, so everything holds here too:
+/// already processed mail is skipped, the account's dry-run setting decides whether anything
+/// is written, flags are re-read before a STORE, and the model's concurrency limit applies
+/// (the shared decider holds the permits; messages are handled one at a time anyway).
+///
+/// **It never touches the worker's saved position** (`mailbox_state`). The live worker's
+/// cursor only moves forward through new mail, and a backfill that wrote it could move it
+/// backwards and make the worker re-read old mail, or forwards and make it skip new mail.
+/// Messages the backfill has handled are in the `processed` table, which is all the worker
+/// needs to skip them later.
+///
+/// Opens its own connection, so it can run next to a running service.
+pub async fn backfill_account<D: Decider>(
+    account: &AccountConfig,
+    config: &Config,
+    decider: Arc<D>,
+    store: Arc<Mutex<Store>>,
+    shutdown: CancellationToken,
+    since: Date,
+) -> Result<BackfillReport, WorkerError> {
+    let for_password = account.clone();
+    let password = tokio::task::spawn_blocking(move || for_password.password()).await??;
+    let settings = account.imap_settings(&password);
+    let timing = WorkerTiming::default();
+    let ctx = Ctx {
+        account,
+        config,
+        policy: config.flag_policy(),
+        decider: decider.as_ref(),
+        store: &store,
+        shutdown: &shutdown,
+        timing: &timing,
+        own: own_address(account),
+    };
+
+    let mut session = ImapSession::connect(&settings).await?;
+    let info = session.select(&account.inbox).await?;
+    ensure_keywords(&account.name, ctx.mode(), info.keywords_allowed)?;
+
+    let uids = session.search_since(since).await?;
+    let mut report = BackfillReport {
+        found: uids.len(),
+        ..BackfillReport::default()
+    };
+    tracing::info!(
+        account = %account.name, since = %since, messages = uids.len(), mode = ctx.mode().as_str(),
+        "backfill starting"
+    );
+
+    'batches: for chunk in uids.chunks(META_BATCH as usize) {
+        // The server may answer in any order; oldest first is what we promised.
+        let mut metas = session.fetch_meta(chunk).await?;
+        metas.sort_by_key(|meta| meta.uid);
+        for meta in metas {
+            if shutdown.is_cancelled() {
+                report.interrupted = true;
+                break 'batches;
+            }
+            let key = ctx.key(info.uid_validity, meta.uid);
+            match ctx.process_message(&mut session, &meta, &key, 0).await? {
+                Outcome::Processed => report.processed += 1,
+                Outcome::Skipped(_) => report.skipped += 1,
+                Outcome::Deferred => report.deferred += 1,
+                Outcome::Gone => report.gone += 1,
+                Outcome::Cancelled => {
+                    report.interrupted = true;
+                    break 'batches;
+                }
+            }
+        }
+    }
+    let _ = session.logout().await;
+    Ok(report)
+}
+
 /// Log out politely after a shutdown request. A failure here does not matter: we are leaving.
 async fn finish(session: ImapSession) -> Result<(), WorkerError> {
     let _ = session.logout().await;
@@ -805,6 +1331,7 @@ mod tests {
     use super::*;
     use crate::decider::DecideError;
     use crate::engine::{Category, Payment, Rule, Verdict};
+    use crate::flags::FlagColour;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const SECS: fn(u64) -> Duration = Duration::from_secs;
@@ -949,30 +1476,75 @@ mod tests {
         for error in transient {
             assert!(!imap_error_is_fatal(&error), "{error}");
         }
-        assert!(WorkerError::FlaggingNotImplemented.is_fatal());
+        assert!(
+            WorkerError::LiveWithoutKeywords {
+                account: "a".into()
+            }
+            .is_fatal()
+        );
     }
 
-    /// Hard rule: no state-changing IMAP command in the dry-run worker. The forbidden words
-    /// are assembled at runtime so this test does not match itself.
     #[test]
-    fn worker_source_has_no_state_changing_calls() {
+    fn going_live_needs_custom_keywords() {
+        // Live without keywords: refused, with a message that says what to do.
+        let error = ensure_keywords("zoho", FlagMode::Live, false).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("zoho"), "{text}");
+        assert!(text.contains("custom keywords"), "{text}");
+        assert!(text.contains("flagging = false"), "{text}");
+        assert!(text.contains("dry_run = true"), "{text}");
+        // Everything else is fine: keywords present, or nothing is written anyway.
+        assert!(ensure_keywords("zoho", FlagMode::Live, true).is_ok());
+        assert!(ensure_keywords("wp", FlagMode::DryRun, false).is_ok());
+        assert!(ensure_keywords("wp", FlagMode::ClassifyOnly, false).is_ok());
+    }
+
+    /// Hard rule: the worker may change flags (through `store_flags`, which checks for custom
+    /// keywords) and nothing else. No raw `STORE`, and nothing that appends, moves, copies,
+    /// expunges or deletes mail. The forbidden words are assembled at runtime so this test does
+    /// not match itself.
+    #[test]
+    fn worker_source_only_changes_flags() {
         let production_code = include_str!("worker.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
         for forbidden in [
-            ["store", "_flags"].concat(),
             ["uid", "_store"].concat(),
             [".app", "end("].concat(),
             [".exp", "unge("].concat(),
+            [".uid", "_expunge("].concat(),
             [".uid", "_mv("].concat(),
+            [".mv", "("].concat(),
             [".uid", "_copy("].concat(),
+            [".copy", "("].concat(),
+            [".del", "ete("].concat(),
+            ["\\Del", "eted"].concat(),
         ] {
             assert!(
                 !production_code.contains(&forbidden),
-                "the dry-run worker must not use {forbidden}"
+                "the worker must not use {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn flags_for_an_older_uidvalidity_are_set_apart() {
+        let flag = |uidvalidity| OwnedFlag {
+            key: MessageKey {
+                uidvalidity,
+                ..key(1)
+            },
+            message_id: None,
+            colour: crate::flags::FlagColour::Orange,
+            flag: Some(TriageFlag::ReplyNeeded),
+            deadline: None,
+            reason: None,
+            set_at: 0,
+        };
+        let (current, stale) = split_by_uidvalidity(vec![flag(1), flag(2), flag(1)], 1);
+        assert_eq!((current.len(), stale.len()), (2, 1));
+        assert_eq!(stale[0].key.uidvalidity, 2);
     }
 
     // ---- the pipeline with a fake decider ----------------------------------------------
@@ -1035,6 +1607,96 @@ mod tests {
         }
     }
 
+    // ---- a fake mailbox ----------------------------------------------------------------
+
+    /// A stand-in for the server: the flags of each UID, plus a log of every change sent to it.
+    /// Changes are applied (remove, then add) so tests can check the end state too.
+    #[derive(Default)]
+    struct FakeMailbox {
+        flags: HashMap<u32, Vec<String>>,
+        changes: Vec<(u32, StoreChange)>,
+        fail_changes: bool,
+    }
+
+    impl FakeMailbox {
+        fn with_message(uid: u32, flags: &[&str]) -> FakeMailbox {
+            let mut mailbox = FakeMailbox::default();
+            mailbox.flags.insert(uid, flag_list(flags));
+            mailbox
+        }
+    }
+
+    impl FlagBackend for FakeMailbox {
+        async fn current_flags(&mut self, uid: u32) -> Result<Option<Vec<String>>, ImapError> {
+            Ok(self.flags.get(&uid).cloned())
+        }
+
+        async fn change_flags(&mut self, uid: u32, change: &StoreChange) -> Result<(), ImapError> {
+            if self.fail_changes {
+                return Err(ImapError::Timeout);
+            }
+            self.changes.push((uid, change.clone()));
+            let flags = self.flags.entry(uid).or_default();
+            flags.retain(|f| !change.remove.iter().any(|r| r.eq_ignore_ascii_case(f)));
+            for add in &change.add {
+                if !flags.iter().any(|f| f.eq_ignore_ascii_case(add)) {
+                    flags.push((*add).to_owned());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn flag_list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// Everything a `Ctx` borrows, owned in one place, so a test can build a context in a line.
+    struct Fixture {
+        account: AccountConfig,
+        config: Config,
+        store: Arc<Mutex<Store>>,
+        shutdown: CancellationToken,
+        timing: WorkerTiming,
+    }
+
+    impl Fixture {
+        /// `extra` is added to the account's TOML (for example `dry_run = false`). The policy
+        /// stays at its default (`dry_run = true`), so a test that wants a live account must
+        /// say so on the account, which is also the intended way to use the setting.
+        fn new(extra: &str) -> Fixture {
+            let account = toml::from_str(&format!(
+                "name = \"test\"\nhost = \"127.0.0.1\"\nusername = \"me@example.org\"\n{extra}"
+            ))
+            .unwrap();
+            Fixture {
+                account,
+                config: Config::default(),
+                store: Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+                shutdown: CancellationToken::new(),
+                timing: WorkerTiming::default(),
+            }
+        }
+
+        /// An account that writes flags.
+        fn live() -> Fixture {
+            Fixture::new("dry_run = false\n")
+        }
+
+        fn ctx<'a, D: Decider>(&'a self, decider: &'a D) -> Ctx<'a, D> {
+            Ctx {
+                account: &self.account,
+                config: &self.config,
+                policy: self.config.flag_policy(),
+                decider,
+                store: &self.store,
+                shutdown: &self.shutdown,
+                timing: &self.timing,
+                own: own_address(&self.account),
+            }
+        }
+    }
+
     /// Runs `triage` once with the given decider and returns the outcome and the store.
     async fn run_triage(
         decider: &FakeDecider,
@@ -1057,7 +1719,13 @@ mod tests {
             timing: &timing,
             own: own_address(&account),
         };
-        let outcome = ctx.triage(&key(5), &parsed(from), 0).await.unwrap();
+        // Dry-run: the mailbox must never be asked to change anything.
+        let mut mailbox = FakeMailbox::default();
+        let outcome = ctx
+            .triage(&mut mailbox, &key(5), &parsed(from), 0)
+            .await
+            .unwrap();
+        assert!(mailbox.changes.is_empty(), "dry-run changed the mailbox");
         (outcome, store)
     }
 
@@ -1096,11 +1764,13 @@ mod tests {
             timing: &timing,
             own: own_address(&account),
         };
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
         let outcome = ctx
-            .triage(&key(5), &parsed("anna@friend.example"), 0)
+            .triage(&mut mailbox, &key(5), &parsed("anna@friend.example"), 0)
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Processed);
+        assert!(mailbox.changes.is_empty());
         let store = store.lock().unwrap();
         // Classified and recorded for the digest, but no flag, not even a would-be one.
         assert!(store.is_processed(&key(5)).unwrap());
@@ -1214,14 +1884,479 @@ mod tests {
         assert!(!store.lock().unwrap().is_processed(&key(5)).unwrap());
     }
 
+    // ---- setting flags (task 4.1) --------------------------------------------------------
+
+    async fn triage_live(
+        fx: &Fixture,
+        mailbox: &mut FakeMailbox,
+        verdict: Verdict,
+    ) -> Result<Outcome, WorkerError> {
+        let decider = FakeDecider::answering(verdict);
+        fx.ctx(&decider)
+            .triage(mailbox, &key(5), &parsed("anna@friend.example"), 0)
+            .await
+    }
+
     #[tokio::test]
-    async fn flagging_is_refused_until_phase_4() {
-        let account = account("me@example.org");
-        let mut config = Config::default();
-        config.policy.dry_run = false;
-        let decider = Arc::new(FakeDecider::failing());
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let result = run_account(&account, &config, decider, store, CancellationToken::new()).await;
-        assert!(matches!(result, Err(WorkerError::FlaggingNotImplemented)));
+    async fn a_live_account_stores_the_flag_and_records_ownership() {
+        // The policy says dry-run; the account says live. The account wins.
+        let fx = Fixture::live();
+        assert!(fx.config.policy.dry_run);
+        let mut mailbox = FakeMailbox::with_message(5, &["\\Seen"]);
+
+        let outcome = triage_live(&fx, &mut mailbox, reply_needed())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Processed);
+        assert_eq!(mailbox.changes.len(), 1, "exactly one change is sent");
+        let (uid, change) = &mailbox.changes[0];
+        assert_eq!(*uid, 5);
+        assert_eq!(change.add, ["\\Flagged", "$MailFlagBit0"]);
+        assert_eq!(change.remove, ["$MailFlagBit1", "$MailFlagBit2"]);
+        // The end state on the "server" is orange, and \Seen is still there.
+        let on_server = &mailbox.flags[&5];
+        let strs: Vec<&str> = on_server.iter().map(String::as_str).collect();
+        assert_eq!(FlagColour::from_flags(&strs), Some(FlagColour::Orange));
+        assert!(on_server.iter().any(|f| f == "\\Seen"));
+
+        let store = fx.store.lock().unwrap();
+        let owned = store.owned_flags("test", "INBOX").unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].key, key(5));
+        assert_eq!(owned[0].colour, FlagColour::Orange);
+        assert_eq!(owned[0].flag, Some(TriageFlag::ReplyNeeded));
+        // The Message-ID is stored in matching form, for the reply check later.
+        assert_eq!(owned[0].message_id.as_deref(), Some("1@example.org"));
+        assert_eq!(store.flag_counts(0).unwrap()[0].label, "reply_needed");
+    }
+
+    #[tokio::test]
+    async fn a_deadline_flag_remembers_its_date() {
+        let mut fx = Fixture::live();
+        fx.config.flags.deadline.enabled = Some(true);
+        let verdict = Verdict {
+            needs_reply: false,
+            deadline: Some(jiff::civil::date(2026, 11, 30)),
+            ..reply_needed()
+        };
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
+        triage_live(&fx, &mut mailbox, verdict).await.unwrap();
+
+        let owned = fx
+            .store
+            .lock()
+            .unwrap()
+            .owned_flags("test", "INBOX")
+            .unwrap();
+        assert_eq!(owned[0].flag, Some(TriageFlag::Deadline));
+        assert_eq!(owned[0].colour, FlagColour::Yellow);
+        assert_eq!(owned[0].deadline, Some(jiff::civil::date(2026, 11, 30)));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_account_stores_nothing_and_records_no_ownership() {
+        let fx = Fixture::new("dry_run = true\n");
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
+        let outcome = triage_live(&fx, &mut mailbox, reply_needed())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Processed);
+        assert!(mailbox.changes.is_empty());
+        let store = fx.store.lock().unwrap();
+        assert!(store.owned_flags("test", "INBOX").unwrap().is_empty());
+        // The would-be flag is still logged for `stats`.
+        assert_eq!(store.flag_counts(0).unwrap()[0].label, "reply_needed");
+    }
+
+    #[tokio::test]
+    async fn an_account_with_flagging_off_never_stores_even_when_live() {
+        let fx = Fixture::new("dry_run = false\nflagging = false\n");
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
+        let outcome = triage_live(&fx, &mut mailbox, reply_needed())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Processed);
+        assert!(mailbox.changes.is_empty());
+        let store = fx.store.lock().unwrap();
+        assert!(store.owned_flags("test", "INBOX").unwrap().is_empty());
+        assert!(store.flag_counts(0).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_the_user_flagged_in_the_meantime_is_left_alone() {
+        // The download showed no flag; by the time we write, the user has flagged it red.
+        let fx = Fixture::live();
+        let mut mailbox = FakeMailbox::with_message(5, &["\\Flagged"]);
+
+        let outcome = triage_live(&fx, &mut mailbox, reply_needed())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Processed,
+            "still classified for the digest"
+        );
+        assert!(mailbox.changes.is_empty(), "the user's flag was touched");
+        let store = fx.store.lock().unwrap();
+        assert!(store.owned_flags("test", "INBOX").unwrap().is_empty());
+        assert!(store.flag_counts(0).unwrap().is_empty(), "we set no flag");
+        assert!(store.is_processed(&key(5)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn red_is_never_stored_even_if_the_policy_asks_for_it() {
+        let fx = Fixture::live();
+        let decider = FakeDecider::answering(reply_needed());
+        let mut ctx = fx.ctx(&decider);
+        // The config loader rejects red, so reach past it: a second line of defence.
+        ctx.policy.colours.reply_needed = FlagColour::Red;
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
+
+        let outcome = ctx
+            .triage(&mut mailbox, &key(5), &parsed("anna@friend.example"), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Processed);
+        assert!(mailbox.changes.is_empty());
+        assert!(
+            fx.store
+                .lock()
+                .unwrap()
+                .owned_flags("test", "INBOX")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_store_records_nothing_so_the_message_is_retried() {
+        let fx = Fixture::live();
+        let mut mailbox = FakeMailbox::with_message(5, &[]);
+        mailbox.fail_changes = true;
+
+        let result = triage_live(&fx, &mut mailbox, reply_needed()).await;
+
+        assert!(matches!(result, Err(WorkerError::Imap(_))), "{result:?}");
+        let store = fx.store.lock().unwrap();
+        assert!(store.owned_flags("test", "INBOX").unwrap().is_empty());
+        assert!(!store.is_processed(&key(5)).unwrap(), "must be tried again");
+    }
+
+    #[tokio::test]
+    async fn a_message_that_vanished_is_not_flagged_or_recorded() {
+        let fx = Fixture::live();
+        let mut mailbox = FakeMailbox::default(); // UID 5 does not exist
+        let outcome = triage_live(&fx, &mut mailbox, reply_needed())
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Gone);
+        assert!(mailbox.changes.is_empty());
+        assert!(!fx.store.lock().unwrap().is_processed(&key(5)).unwrap());
+    }
+
+    // ---- the auto-clear pass (task 4.2) ---------------------------------------------------
+
+    const TODAY: Date = jiff::civil::date(2026, 11, 10);
+
+    /// A "Reply needed" record for UID `uid`, as `set_flag` would have written it.
+    fn owned_reply(uid: u32) -> OwnedFlag {
+        OwnedFlag {
+            key: key(uid),
+            message_id: Some("1@example.org".into()),
+            colour: FlagColour::Orange,
+            flag: Some(TriageFlag::ReplyNeeded),
+            deadline: None,
+            reason: Some("asks".into()),
+            set_at: 100,
+        }
+    }
+
+    fn owned_deadline(uid: u32, date: Date) -> OwnedFlag {
+        OwnedFlag {
+            colour: FlagColour::Yellow,
+            flag: Some(TriageFlag::Deadline),
+            deadline: Some(date),
+            message_id: None,
+            ..owned_reply(uid)
+        }
+    }
+
+    const ORANGE: [&str; 3] = ["\\Seen", "\\Flagged", "$MailFlagBit0"];
+
+    /// Runs the review for `records` against a mailbox that shows `server` for UID 5.
+    async fn review(
+        fx: &Fixture,
+        records: Vec<OwnedFlag>,
+        server: &[&str],
+        today: Date,
+    ) -> (ClearReport, FakeMailbox) {
+        {
+            let store = fx.store.lock().unwrap();
+            for record in &records {
+                store.record_flag(record).unwrap();
+            }
+        }
+        let mut mailbox = FakeMailbox::with_message(5, server);
+        let seen: HashMap<u32, Vec<String>> = mailbox.flags.clone();
+        let decider = FakeDecider::failing();
+        let report = fx
+            .ctx(&decider)
+            .review_owned(&mut mailbox, records, &seen, today)
+            .await
+            .unwrap();
+        (report, mailbox)
+    }
+
+    fn owned_now(fx: &Fixture) -> Vec<OwnedFlag> {
+        fx.store
+            .lock()
+            .unwrap()
+            .owned_flags("test", "INBOX")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reply_in_sent_clears_reply_needed() {
+        let fx = Fixture::live();
+        // The user's reply, as the Sent harvest would have stored it.
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &ORANGE, TODAY).await;
+
+        assert_eq!(report.cleared, 1);
+        // One change: remove \Flagged and all three bits. Nothing is added.
+        assert_eq!(mailbox.changes, [(5, clear_change())]);
+        // \Seen survives; the colour is gone; the record is forgotten.
+        assert_eq!(mailbox.flags[&5], ["\\Seen"]);
+        assert!(owned_now(&fx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_reply_the_flag_stays() {
+        let fx = Fixture::live();
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &ORANGE, TODAY).await;
+        assert_eq!(report, ClearReport::default());
+        assert!(mailbox.changes.is_empty());
+        assert_eq!(owned_now(&fx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_another_message_does_not_clear_it() {
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["someone-else@example.org".into()])
+            .unwrap();
+        let (_, mailbox) = review(&fx, vec![owned_reply(5)], &ORANGE, TODAY).await;
+        assert!(mailbox.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_colour_the_user_changed_becomes_user_owned_and_is_never_touched() {
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+        // Green instead of the orange we set. Even with the reply present, hands off.
+        let green = ["\\Flagged", "$MailFlagBit0", "$MailFlagBit1"];
+
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &green, TODAY).await;
+
+        assert_eq!(report.user_owned, 1);
+        assert!(mailbox.changes.is_empty());
+        let store = fx.store.lock().unwrap();
+        assert!(store.is_user_owned(&key(5)).unwrap());
+        assert!(store.owned_flags("test", "INBOX").unwrap().is_empty());
+        drop(store);
+
+        // And it stays that way: a later pass has nothing to look at, and recording a new
+        // flag for the message cannot take it back.
+        fx.store
+            .lock()
+            .unwrap()
+            .record_flag(&owned_reply(5))
+            .unwrap();
+        assert!(owned_now(&fx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flag_the_user_removed_becomes_user_owned() {
+        let fx = Fixture::live();
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &["\\Seen"], TODAY).await;
+        assert_eq!(report.user_owned, 1);
+        assert!(mailbox.changes.is_empty());
+        assert!(fx.store.lock().unwrap().is_user_owned(&key(5)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_red_flag_means_the_user_took_over() {
+        let fx = Fixture::live();
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &["\\Flagged"], TODAY).await;
+        assert_eq!(report.user_owned, 1);
+        assert!(mailbox.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deadline_flag_clears_after_its_date_and_not_before() {
+        let yellow = ["\\Flagged", "$MailFlagBit1"];
+
+        let fx = Fixture::live();
+        let record = owned_deadline(5, jiff::civil::date(2026, 11, 9));
+        let (report, mailbox) = review(&fx, vec![record], &yellow, TODAY).await;
+        assert_eq!(report.cleared, 1);
+        assert_eq!(mailbox.changes, [(5, clear_change())]);
+
+        // On the deadline day itself the flag stays.
+        let fx = Fixture::live();
+        let record = owned_deadline(5, jiff::civil::date(2026, 11, 10));
+        let (report, mailbox) = review(&fx, vec![record], &yellow, TODAY).await;
+        assert_eq!(report, ClearReport::default());
+        assert!(mailbox.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deadline_flag_without_a_date_is_never_cleared() {
+        let fx = Fixture::live();
+        let record = OwnedFlag {
+            deadline: None,
+            ..owned_deadline(5, jiff::civil::date(2020, 1, 1))
+        };
+        let (_, mailbox) = review(&fx, vec![record], &["\\Flagged", "$MailFlagBit1"], TODAY).await;
+        assert!(mailbox.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flags_that_wait_for_the_user_are_never_cleared() {
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+        let record = OwnedFlag {
+            colour: FlagColour::Green,
+            flag: Some(TriageFlag::ToPay),
+            deadline: Some(jiff::civil::date(2020, 1, 1)),
+            ..owned_reply(5)
+        };
+        let green = ["\\Flagged", "$MailFlagBit0", "$MailFlagBit1"];
+        let (_, mailbox) = review(&fx, vec![record], &green, TODAY).await;
+        assert!(mailbox.changes.is_empty());
+        assert_eq!(owned_now(&fx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_account_only_says_what_it_would_clear() {
+        let fx = Fixture::new("dry_run = true\n");
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+        let (report, mailbox) = review(&fx, vec![owned_reply(5)], &ORANGE, TODAY).await;
+        assert_eq!(report.would_clear, 1);
+        assert_eq!(report.cleared, 0);
+        assert!(mailbox.changes.is_empty(), "dry-run changed the mailbox");
+        // Neither does the database change.
+        assert_eq!(owned_now(&fx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_account_does_not_even_mark_user_changes() {
+        let fx = Fixture::new("dry_run = true\n");
+        let (report, _) = review(&fx, vec![owned_reply(5)], &["\\Seen"], TODAY).await;
+        assert_eq!(report.user_owned, 1, "reported");
+        assert!(!fx.store.lock().unwrap().is_user_owned(&key(5)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_flagged_message_that_is_gone_is_forgotten_without_a_store() {
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .record_flag(&owned_reply(7))
+            .unwrap();
+        let mut mailbox = FakeMailbox::default();
+        let decider = FakeDecider::failing();
+        let report = fx
+            .ctx(&decider)
+            .review_owned(&mut mailbox, vec![owned_reply(7)], &HashMap::new(), TODAY)
+            .await
+            .unwrap();
+        assert_eq!(report.gone, 1);
+        assert!(mailbox.changes.is_empty());
+        assert!(owned_now(&fx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flag_changed_just_before_the_store_is_not_cleared() {
+        // The batch read showed our orange flag; the re-read right before the STORE shows
+        // that the user has since turned it green.
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+        fx.store
+            .lock()
+            .unwrap()
+            .record_flag(&owned_reply(5))
+            .unwrap();
+        let batch: HashMap<u32, Vec<String>> = HashMap::from([(5, flag_list(&ORANGE))]);
+        let mut mailbox =
+            FakeMailbox::with_message(5, &["\\Flagged", "$MailFlagBit0", "$MailFlagBit1"]);
+        let decider = FakeDecider::failing();
+
+        let report = fx
+            .ctx(&decider)
+            .review_owned(&mut mailbox, vec![owned_reply(5)], &batch, TODAY)
+            .await
+            .unwrap();
+
+        assert_eq!(report.cleared, 0);
+        assert!(mailbox.changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_clear_keeps_the_record_for_the_next_pass() {
+        let fx = Fixture::live();
+        fx.store
+            .lock()
+            .unwrap()
+            .add_reply_ids("test", &["1@example.org".into()])
+            .unwrap();
+        fx.store
+            .lock()
+            .unwrap()
+            .record_flag(&owned_reply(5))
+            .unwrap();
+        let batch: HashMap<u32, Vec<String>> = HashMap::from([(5, flag_list(&ORANGE))]);
+        let mut mailbox = FakeMailbox::with_message(5, &ORANGE);
+        mailbox.fail_changes = true;
+        let decider = FakeDecider::failing();
+
+        let result = fx
+            .ctx(&decider)
+            .review_owned(&mut mailbox, vec![owned_reply(5)], &batch, TODAY)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            owned_now(&fx).len(),
+            1,
+            "the record must survive a failed STORE"
+        );
     }
 }

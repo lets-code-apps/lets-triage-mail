@@ -316,6 +316,29 @@ pub enum Tls {
     None,
 }
 
+/// What the service may do to one account's mailbox. Worked out by [`AccountConfig::flag_mode`]
+/// from `flagging` and `dry_run`; the one place that combines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagMode {
+    /// Flags are set and cleared on the server.
+    Live,
+    /// Mail is classified and the would-be flags are logged; nothing is written.
+    DryRun,
+    /// `flagging = false`: mail is classified for the digest only, and no flag is chosen.
+    ClassifyOnly,
+}
+
+impl FlagMode {
+    /// A short name for logs and `check` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlagMode::Live => "live",
+            FlagMode::DryRun => "dry-run",
+            FlagMode::ClassifyOnly => "classify-only",
+        }
+    }
+}
+
 /// One `[[accounts]]` entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,11 +460,21 @@ impl AccountConfig {
         self.dry_run.unwrap_or(policy.dry_run)
     }
 
-    /// Whether the service really writes flags on this account: flagging is on **and** the
-    /// account is not in dry-run. `flagging = false` wins over everything: such an account is
-    /// never written to, whatever `dry_run` says.
+    /// What the service does on this account. `flagging = false` wins over everything: such
+    /// an account is never written to, whatever `dry_run` says.
+    pub fn flag_mode(&self, policy: &PolicyConfig) -> FlagMode {
+        if !self.flagging {
+            FlagMode::ClassifyOnly
+        } else if self.dry_run(policy) {
+            FlagMode::DryRun
+        } else {
+            FlagMode::Live
+        }
+    }
+
+    /// Whether the service really writes flags on this account.
     pub fn writes_flags(&self, policy: &PolicyConfig) -> bool {
-        self.flagging && !self.dry_run(policy)
+        self.flag_mode(policy) == FlagMode::Live
     }
 
     /// The IMAP port: the configured one, or the standard port for the TLS mode.
@@ -902,6 +935,8 @@ mod tests {
         assert!(!b.dry_run(&config.policy), "account override: live");
         assert!(!a.writes_flags(&config.policy));
         assert!(b.writes_flags(&config.policy));
+        assert_eq!(a.flag_mode(&config.policy), FlagMode::DryRun);
+        assert_eq!(b.flag_mode(&config.policy), FlagMode::Live);
 
         let live = Config::parse(&format!(
             "[policy]\ndry_run = false\n{ACCOUNT_A}dry_run = true\n"
@@ -919,6 +954,7 @@ mod tests {
         let account = &config.accounts[0];
         assert!(!account.dry_run(&config.policy));
         assert!(!account.writes_flags(&config.policy));
+        assert_eq!(account.flag_mode(&config.policy), FlagMode::ClassifyOnly);
     }
 
     #[test]

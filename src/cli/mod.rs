@@ -1,7 +1,7 @@
 //! The command-line interface: the argument types (parsed by `clap`) and the dispatch.
 //!
 //! Each subcommand lives in its own file and exposes one `async fn run` that returns
-//! `anyhow::Result<()>`. `run` (dry-run only), `check` and `classify` work; the others are
+//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `rules` and `backfill` work; the others are
 //! still stubs, see `docs/PLAN.md`.
 
 mod backfill;
@@ -54,7 +54,7 @@ impl Cli {
 /// The top-level subcommands, as listed in `docs/SPEC.md` section 4.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Watch the accounts and classify new mail (dry-run only: logs, changes nothing)
+    /// Watch the accounts, classify new mail, and set and clear flags (per account: live or dry-run)
     Run,
     /// Test the model and each account; show server capabilities and folders
     Check {
