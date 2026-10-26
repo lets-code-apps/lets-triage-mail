@@ -766,7 +766,10 @@ mod tests {
         assert!(parse_date("26-01-01").is_none());
         assert!(parse_date("2026-1-01").is_none());
         assert!(parse_date("2026-11-30T10:00").is_none());
-        assert_eq!(parse_date("2026-11-30"), Some(jiff::civil::date(2026, 11, 30)));
+        assert_eq!(
+            parse_date("2026-11-30"),
+            Some(jiff::civil::date(2026, 11, 30))
+        );
     }
 
     // --- prompt ---

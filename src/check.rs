@@ -30,7 +30,9 @@ use crate::config::{AccountConfig, LlmConfig, password_env_var};
 use crate::decider::{
     AuthResult, DecideError, Decider, Evidence, LlmDecider, LlmSettings, install_tls_provider,
 };
-use crate::imap::{ImapError, ImapSession, ImapSettings, ResolvedFolders, ServerCapabilities};
+use crate::imap::{
+    ImapError, ImapSession, ImapSettings, ResolvedFolders, ServerCapabilities, decode_modified_utf7,
+};
 use crate::store::Store;
 
 /// How long listing the models may take. It is a cheap request, so this is short.
@@ -590,11 +592,13 @@ pub async fn probe_imap(
     // A configured Sent folder is taken at its word by the service, so prove it can be
     // opened. SELECT changes nothing on the server.
     if !configured_sent.is_empty() {
-        let what = format!("selecting the configured Sent folder {configured_sent}");
+        // Folder names are shown decoded (`Wysłane`), but `select` gets the raw name.
+        let shown = decode_modified_utf7(configured_sent);
+        let what = format!("selecting the configured Sent folder {shown}");
         match step(&what, session.select(configured_sent)).await {
             Ok(_) => items.push(CheckItem::ok(
                 area,
-                format!("configured Sent folder {configured_sent} can be opened"),
+                format!("configured Sent folder {shown} can be opened"),
             )),
             Err(message) => items.push(CheckItem::fail(
                 area,
@@ -687,8 +691,10 @@ pub fn mailbox_items(
     let selected = CheckItem::ok(
         area,
         format!(
-            "{folder} selected: {} messages, UIDVALIDITY {}",
-            info.exists, info.uid_validity
+            "{} selected: {} messages, UIDVALIDITY {}",
+            decode_modified_utf7(folder),
+            info.exists,
+            info.uid_validity
         ),
     );
     let keywords = match (info.keywords_allowed, flagging) {
@@ -721,10 +727,19 @@ pub fn mailbox_items(
 /// The Sent folder item: the configured one, the detected one, or a warning that there is none.
 pub fn sent_item(area: &str, configured: &str, resolved: &ResolvedFolders) -> CheckItem {
     if !configured.is_empty() {
-        return CheckItem::ok(area, format!("Sent folder (configured): {configured}"));
+        return CheckItem::ok(
+            area,
+            format!(
+                "Sent folder (configured): {}",
+                decode_modified_utf7(configured)
+            ),
+        );
     }
     match &resolved.sent {
-        Some(sent) => CheckItem::ok(area, format!("Sent folder (detected): {sent}")),
+        Some(sent) => CheckItem::ok(
+            area,
+            format!("Sent folder (detected): {}", decode_modified_utf7(sent)),
+        ),
         None => CheckItem::warn(
             area,
             "no Sent folder found",
@@ -1046,6 +1061,29 @@ mod tests {
                 host: String::from("h")
             })
             .contains("localhost")
+        );
+    }
+
+    #[test]
+    fn folder_names_are_shown_decoded() {
+        let resolved = ResolvedFolders {
+            inbox: "INBOX".into(),
+            sent: Some("[Gmail]/Wys&AUI-ane".into()),
+            delimiter: Some("/".into()),
+            prefix: String::new(),
+        };
+        let detected = sent_item("a", "", &resolved);
+        assert!(
+            detected.message.contains("[Gmail]/Wysłane"),
+            "{}",
+            detected.message
+        );
+        assert!(!detected.message.contains("&AUI-"), "{}", detected.message);
+        let configured = sent_item("a", "[Gmail]/Wys&AUI-ane", &resolved);
+        assert!(
+            configured.message.contains("Wysłane"),
+            "{}",
+            configured.message
         );
     }
 

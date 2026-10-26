@@ -36,7 +36,8 @@ const MAX_SUBJECT_CHARS: usize = 300;
 const MAX_REASON_CHARS: usize = 500;
 
 /// The schema, one script per version. Index 0 takes a database from version 0 to 1.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE mailbox_state (
         account     TEXT NOT NULL,
         mailbox     TEXT NOT NULL,
@@ -153,7 +154,8 @@ const MIGRATIONS: &[&str] = &["
         message_id TEXT NOT NULL,
         PRIMARY KEY (account, message_id)
     ) WITHOUT ROWID;
-    "];
+    ",
+];
 
 /// Everything that can go wrong in the store.
 ///
@@ -1407,7 +1409,8 @@ mod tests {
     #[test]
     fn replies_seen_in_sent_are_remembered_per_account() {
         let mut s = store();
-        s.add_reply_ids("a", &["one@x".into(), "two@x".into()]).unwrap();
+        s.add_reply_ids("a", &["one@x".into(), "two@x".into()])
+            .unwrap();
         // Adding the same id again is harmless.
         s.add_reply_ids("a", &["one@x".into()]).unwrap();
         assert!(s.has_reply_to("a", "one@x").unwrap());

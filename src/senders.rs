@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::AccountConfig;
-use crate::imap::{ImapError, ImapSession};
+use crate::imap::{ImapError, ImapSession, decode_modified_utf7};
 use crate::store::{Store, StoreError};
 
 /// How many UIDs one `UID FETCH` covers. Big enough to be fast, small enough that the
@@ -182,10 +182,13 @@ pub async fn harvest_known_senders(
         ..HarvestReport::default()
     };
     if rescanned {
-        tracing::info!(account = %account.name, %folder, "UIDVALIDITY changed; rescanning Sent");
+        tracing::info!(
+            account = %account.name, folder = %decode_modified_utf7(&folder),
+            "UIDVALIDITY changed; rescanning Sent"
+        );
     }
     tracing::info!(
-        account = %account.name, %folder, batches = ranges.len(),
+        account = %account.name, folder = %decode_modified_utf7(&folder), batches = ranges.len(),
         "harvesting known senders"
     );
 
@@ -202,8 +205,18 @@ pub async fn harvest_known_senders(
             .cloned()
             .collect();
 
+        // The ids of messages the user answered, for clearing "Reply needed" flags.
+        let reply_ids: Vec<String> = envelopes
+            .iter()
+            .flat_map(|envelope| envelope.reply_ids.iter())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect();
+
         let (name, mailbox, validity) = (account.name.clone(), folder.clone(), info.uid_validity);
         let new_senders = with_store(store, move |store| {
+            store.add_reply_ids(&name, &reply_ids)?;
             let mut added = 0u32;
             for address in &addresses {
                 if store.add_known_sender(&name, address)? {

@@ -203,7 +203,11 @@ impl Outcome {
             format!("Category:    {}", v.category.as_str()),
             format!("Confidence:  {:.2}", v.confidence),
             format!("Needs reply: {}", yes_no(v.needs_reply)),
-            format!("Deadline:    {}", v.deadline.map_or_else(|| "none".into(), |date| date.to_string())),
+            format!(
+                "Deadline:    {}",
+                v.deadline
+                    .map_or_else(|| "none".into(), |date| date.to_string())
+            ),
             format!("Payment:     {}", v.payment.as_str()),
             format!("Reason:      {}", v.reason),
             format!("Decided by:  {decided_by}"),

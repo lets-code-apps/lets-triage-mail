@@ -36,6 +36,7 @@
 
 pub mod folders;
 pub mod session;
+pub mod utf7;
 pub mod worker;
 
 use std::fmt;
@@ -45,6 +46,7 @@ pub use folders::{ListedFolder, ResolvedFolders, resolve_folders};
 pub use session::{
     EnvelopeAddresses, IdleEnd, ImapSession, MailboxInfo, MessageMeta, ServerCapabilities,
 };
+pub use utf7::decode_modified_utf7;
 
 /// How to protect the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

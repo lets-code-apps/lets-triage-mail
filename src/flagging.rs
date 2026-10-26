@@ -288,7 +288,10 @@ mod tests {
     #[test]
     fn an_untouched_flag_is_intact_even_with_other_flags_around() {
         let current = flags(&["\\Seen", "\\Flagged", "$MailFlagBit0", "\\Answered"]);
-        assert_eq!(owned_state(&current, FlagColour::Orange), OwnedState::Intact);
+        assert_eq!(
+            owned_state(&current, FlagColour::Orange),
+            OwnedState::Intact
+        );
     }
 
     #[test]
@@ -335,7 +338,10 @@ mod tests {
     #[test]
     fn a_deadline_clears_the_day_after_it_and_not_on_it() {
         let clear = |deadline| clear_reason(Some(TriageFlag::Deadline), deadline, false, TODAY);
-        assert_eq!(clear(Some(date(2026, 11, 9))), Some(ClearReason::DeadlinePassed));
+        assert_eq!(
+            clear(Some(date(2026, 11, 9))),
+            Some(ClearReason::DeadlinePassed)
+        );
         assert_eq!(clear(Some(date(2026, 11, 10))), None, "still the last day");
         assert_eq!(clear(Some(date(2026, 11, 11))), None);
     }
@@ -383,7 +389,10 @@ mod tests {
                 "{flag:?}"
             );
         }
-        assert_eq!(clear_reason(None, Some(date(2020, 1, 1)), true, TODAY), None);
+        assert_eq!(
+            clear_reason(None, Some(date(2020, 1, 1)), true, TODAY),
+            None
+        );
     }
 
     // ---- reply ids ----------------------------------------------------------------------
@@ -414,7 +423,8 @@ mod tests {
 
     #[test]
     fn other_headers_comments_and_garbage_are_ignored() {
-        let raw = b"Subject: <not-an-id@x>\r\nIn-Reply-To: (comment) <ok@x> trailing\r\nBroken: <\r\n";
+        let raw =
+            b"Subject: <not-an-id@x>\r\nIn-Reply-To: (comment) <ok@x> trailing\r\nBroken: <\r\n";
         assert_eq!(reply_ids_from_header(raw), ["ok@x"]);
         assert!(reply_ids_from_header(b"").is_empty());
         assert!(reply_ids_from_header(b"\xff\xfe not a header").is_empty());
@@ -426,6 +436,9 @@ mod tests {
     fn a_huge_references_header_is_capped() {
         let ids: String = (0..500).map(|n| format!("<id{n}@x> ")).collect();
         let raw = format!("References: {ids}\r\n");
-        assert_eq!(reply_ids_from_header(raw.as_bytes()).len(), MAX_IDS_PER_MESSAGE);
+        assert_eq!(
+            reply_ids_from_header(raw.as_bytes()).len(),
+            MAX_IDS_PER_MESSAGE
+        );
     }
 }
