@@ -29,7 +29,7 @@ scraper = "0.29.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "net", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "net", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7.20", default-features = false }
 toml = "1.1.8"

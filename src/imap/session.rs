@@ -16,11 +16,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
+use async_imap::imap_proto::rfc4315::UidSetMember;
+use async_imap::imap_proto::{Response, ResponseCode, Status};
 use async_imap::types::{Capabilities, Capability, Flag, Mailbox, NameAttribute};
 use async_imap::{Client, Session};
 use futures::TryStreamExt;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -109,6 +111,49 @@ pub struct MailboxInfo {
     /// True if `PERMANENTFLAGS` contains `\*`, which means clients may create new keywords such
     /// as `$MailFlagBit0`. Without it, flag colours cannot be stored.
     pub keywords_allowed: bool,
+}
+
+/// Where the server put an appended message, from its `APPENDUID` response (RFC 4315).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppendResult {
+    /// The `UIDVALIDITY` of the folder the message went into.
+    pub uid_validity: Option<u32>,
+    /// The UID it got. `None` when the server has no `UIDPLUS` and said nothing.
+    pub uid: Option<u32>,
+}
+
+/// Quotes a folder name for a command: `"` around it, with `\` and `"` escaped (RFC 3501
+/// quoted string). A name with a line break or NUL cannot be quoted, and is refused: sending
+/// it could end the command early and start another one.
+fn quote_folder(name: &str) -> Result<String, ImapError> {
+    if name.is_empty() || name.contains(['\r', '\n', '\0']) {
+        return Err(ImapError::InvalidFolderName(name.to_owned()));
+    }
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for c in name.chars() {
+        if c == '\\' || c == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+/// Reads the UID out of an `APPENDUID` response code. A range (a multi-message append) is
+/// not something we send, so only its first UID is taken.
+fn appended_uid(code: &ResponseCode<'_>) -> AppendResult {
+    match code {
+        ResponseCode::AppendUid(uid_validity, members) => AppendResult {
+            uid_validity: Some(*uid_validity),
+            uid: members.first().map(|member| match member {
+                UidSetMember::Uid(uid) => *uid,
+                UidSetMember::UidRange(range) => *range.start(),
+            }),
+        },
+        _ => AppendResult::default(),
+    }
 }
 
 /// `\*` in `PERMANENTFLAGS` means "the client may create new keywords" (RFC 3501 §2.3.2).
@@ -665,6 +710,73 @@ impl ImapSession {
         Ok((ImapSession { inner, selected }, end))
     }
 
+    /// `APPEND` one message to a folder, **without any flags**, so it arrives unread.
+    ///
+    /// This is how the daily digest is written. It is the only command here that adds mail
+    /// to a mailbox, and it never changes or removes an existing message.
+    ///
+    /// `async-imap` has an `append`, but it throws away the server's final answer, and that
+    /// answer holds the `APPENDUID` (the UID the new message got), which we need to recognise
+    /// our own digest later. So the command is written out here: send the line with the size,
+    /// wait for the server's `+` go-ahead, send the message, then read until the tagged answer.
+    ///
+    /// Fails if the folder does not exist; it is never created.
+    pub async fn append_message(
+        &mut self,
+        folder: &str,
+        content: &[u8],
+    ) -> Result<AppendResult, ImapError> {
+        let command = format!("APPEND {} {{{}}}", quote_folder(folder)?, content.len());
+        let tag = self.inner.run_command(command).await?;
+
+        // 1. The server answers `+` when it is ready for the message. A tagged answer here
+        //    means it refused (for example, no such folder).
+        loop {
+            let response = self
+                .inner
+                .read_response()
+                .await?
+                .ok_or(async_imap::error::Error::ConnectionLost)?;
+            match response.parsed() {
+                Response::Continue(_) => break,
+                Response::Done {
+                    tag: done, status, ..
+                } if *done == tag => {
+                    return Err(refused(status, "APPEND was refused"));
+                }
+                // Untracked chatter such as `* 3 EXISTS`.
+                _ => {}
+            }
+        }
+
+        // 2. The message itself, then the CRLF that ends the command.
+        let stream: &mut MaybeTls = self.inner.as_mut();
+        stream.write_all(content).await?;
+        stream.write_all(b"\r\n").await?;
+        stream.flush().await?;
+
+        // 3. The tagged answer. On success it may carry `[APPENDUID <validity> <uid>]`.
+        loop {
+            let response = self
+                .inner
+                .read_response()
+                .await?
+                .ok_or(async_imap::error::Error::ConnectionLost)?;
+            if let Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } = response.parsed()
+                && *done == tag
+            {
+                return match status {
+                    Status::Ok => Ok(outcome.code.as_ref().map(appended_uid).unwrap_or_default()),
+                    other => Err(refused(other, "APPEND failed")),
+                };
+            }
+        }
+    }
+
     /// End the session politely.
     pub async fn logout(mut self) -> Result<(), ImapError> {
         self.inner.logout().await?;
@@ -676,6 +788,15 @@ impl ImapSession {
     /// value; tests use it to `APPEND` seed messages.
     pub fn into_inner(self) -> Session<MaybeTls> {
         self.inner
+    }
+}
+
+/// The error for a tagged answer that is not `OK`.
+fn refused(status: &Status, what: &str) -> ImapError {
+    let text = format!("{what} ({status:?})");
+    match status {
+        Status::Bad => async_imap::error::Error::Bad(text).into(),
+        _ => async_imap::error::Error::No(text).into(),
     }
 }
 
@@ -741,6 +862,40 @@ mod tests {
         assert_eq!(since_query(date(2026, 10, 26)), "SINCE 26-Oct-2026");
         assert_eq!(since_query(date(2027, 1, 5)), "SINCE 5-Jan-2027");
         assert_eq!(since_query(date(2026, 12, 31)), "SINCE 31-Dec-2026");
+    }
+
+    #[test]
+    fn folder_names_are_quoted_and_escaped() {
+        assert_eq!(quote_folder("INBOX").unwrap(), "\"INBOX\"");
+        assert_eq!(
+            quote_folder("Letters \"to\" me\\x").unwrap(),
+            "\"Letters \\\"to\\\" me\\\\x\""
+        );
+        for bad in ["", "a\r\nb", "a\nb", "a\0b"] {
+            assert!(
+                matches!(quote_folder(bad), Err(ImapError::InvalidFolderName(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn appenduid_gives_the_uid_and_validity() {
+        let code = ResponseCode::AppendUid(38505, vec![UidSetMember::Uid(3955)]);
+        assert_eq!(
+            appended_uid(&code),
+            AppendResult {
+                uid_validity: Some(38505),
+                uid: Some(3955)
+            }
+        );
+        let range = ResponseCode::AppendUid(7, vec![UidSetMember::UidRange(4..=6)]);
+        assert_eq!(appended_uid(&range).uid, Some(4));
+        // Any other code, or none, means "no APPENDUID".
+        assert_eq!(
+            appended_uid(&ResponseCode::UidNotSticky),
+            AppendResult::default()
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 pub mod check;
 pub mod config;
 pub mod decider;
+pub mod digest;
 pub mod engine;
 pub mod evidence;
 pub mod flagging;

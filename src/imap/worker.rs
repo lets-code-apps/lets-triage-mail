@@ -198,6 +198,7 @@ fn imap_error_is_fatal(error: &ImapError) -> bool {
         | ImapError::Imap(_)
         | ImapError::NoMailboxSelected
         | ImapError::EmptyUidSet
+        | ImapError::InvalidFolderName(_)
         | ImapError::MissingData(_) => false,
     }
 }
