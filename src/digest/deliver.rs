@@ -581,6 +581,222 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"second");
     }
 
+    // ---- the whole flow for a dry-run account (no server needed) --------------------------
+
+    use crate::engine::{Category, Payment, TriageFlag, Verdict};
+    use crate::store::{MessageKey, ProcessedRecord};
+
+    /// A dry-run account (the config default) and a config whose data directory is `dir`.
+    fn dry_run_setup(dir: &Path) -> (AccountConfig, Config, Arc<Mutex<Store>>) {
+        let config = Config::parse(&format!(
+            "[storage]\ndb_path = \"{}\"\n",
+            dir.join("state.db").display()
+        ))
+        .unwrap();
+        let account: AccountConfig = toml::from_str(
+            "name = \"Work\"\nhost = \"127.0.0.1\"\nusername = \"me@example.org\"\ntls = \"none\"\n",
+        )
+        .unwrap();
+        assert!(account.dry_run(&config.policy));
+        (
+            account,
+            config,
+            Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+        )
+    }
+
+    fn record(store: &Store, uid: u32, subject: &str, flag: Option<TriageFlag>) {
+        store
+            .record_processed(&ProcessedRecord {
+                key: MessageKey {
+                    account: "Work".into(),
+                    mailbox: "INBOX".into(),
+                    uidvalidity: 1,
+                    uid,
+                },
+                message_id: None,
+                sender: Some("alice@example.org".into()),
+                subject: Some(subject.into()),
+                verdict: Some(Verdict {
+                    category: Category::Personal,
+                    needs_reply: true,
+                    deadline: None,
+                    payment: Payment::NotApplicable,
+                    confidence: 0.9,
+                    reason: "Asks you a question.".into(),
+                }),
+                flag,
+                source: "model".into(),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_account_gets_a_preview_file_and_the_day_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (account, config, store) = dry_run_setup(dir.path());
+        record(
+            &store.lock().unwrap(),
+            1,
+            "<script>alert(1)</script> Lunch?",
+            Some(TriageFlag::ReplyNeeded),
+        );
+        let now = jiff::Zoned::now();
+
+        let delivery = send_digest(&account, &config, &store, &now).await.unwrap();
+
+        let Delivery::Saved(path) = delivery else {
+            panic!("a dry-run account must never be appended to: {delivery:?}");
+        };
+        assert_eq!(path.parent().unwrap(), dir.path().join("digests"));
+        let saved = std::fs::read(&path).unwrap();
+        let message = mail_parser::MessageParser::default().parse(&saved).unwrap();
+        let text = message.body_text(0).unwrap();
+        assert!(text.contains("Reply needed (1)"), "{text}");
+        assert!(text.contains("alice@example.org"), "{text}");
+        assert!(text.contains("Dry-run: nothing was flagged"), "{text}");
+        let html = message.body_html(0).unwrap();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+
+        // Recorded, so the schedule does not write it again today, and no digest record for
+        // the worker: nothing was appended.
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.last_digest_date("Work").unwrap(),
+            Some(now.date().to_string())
+        );
+        assert!(guard.last_digest_at("Work").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn preparing_a_digest_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (account, config, store) = dry_run_setup(dir.path());
+        record(
+            &store.lock().unwrap(),
+            1,
+            "hello",
+            Some(TriageFlag::ReplyNeeded),
+        );
+
+        prepare_digest(&account, &config, &store, &jiff::Zoned::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.lock().unwrap().last_digest_date("Work").unwrap(),
+            None
+        );
+        assert!(!dir.path().join("digests").exists());
+    }
+
+    // ---- the live path, against the scripted fake server ------------------------------------
+
+    use crate::imap::fake_server::{AppendReply, fake_server};
+
+    /// A live account (`dry_run = false`) that talks to the fake server on `port`.
+    fn live_account(port: u16) -> AccountConfig {
+        toml::from_str(&format!(
+            "name = \"Work\"\nhost = \"127.0.0.1\"\nport = {port}\nusername = \"me@example.org\"\n\
+             tls = \"none\"\npassword_command = \"echo pass\"\ndry_run = false\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_live_account_appends_and_records_the_digest_by_uid_and_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, config, store) = dry_run_setup(dir.path());
+        let (port, received) = fake_server(AppendReply::WithUid).await;
+        let account = live_account(port);
+        record(
+            &store.lock().unwrap(),
+            1,
+            "Lunch?",
+            Some(TriageFlag::ReplyNeeded),
+        );
+
+        let delivery = send_digest(&account, &config, &store, &jiff::Zoned::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery,
+            Delivery::Appended {
+                folder: "INBOX".into(),
+                uid: Some(12)
+            }
+        );
+
+        // What the server received is our digest, with a Message-ID that the store knows.
+        let sent = received.await.unwrap();
+        let message = mail_parser::MessageParser::default().parse(&sent).unwrap();
+        let message_id = message.message_id().unwrap().to_owned();
+        assert!(message_id.ends_with(&format!("@{MESSAGE_ID_DOMAIN}")));
+        assert!(message.body_text(0).unwrap().contains("Lunch?"));
+        assert!(
+            !message.body_text(0).unwrap().contains("Dry-run"),
+            "a live account's digest is not a preview"
+        );
+
+        let guard = store.lock().unwrap();
+        assert!(guard.is_own_digest_message_id("Work", &message_id).unwrap());
+        // APPENDUID said validity 77, UID 12.
+        let key = MessageKey {
+            account: "Work".into(),
+            mailbox: "INBOX".into(),
+            uidvalidity: 77,
+            uid: 12,
+        };
+        assert!(guard.is_own_digest(&key).unwrap());
+        assert!(guard.last_digest_date("Work").unwrap().is_some());
+        // No file: a live account is not previewed.
+        assert!(!dir.path().join("digests").exists());
+    }
+
+    #[tokio::test]
+    async fn without_appenduid_the_digest_is_still_recognised_by_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, config, store) = dry_run_setup(dir.path());
+        let (port, received) = fake_server(AppendReply::WithoutUid).await;
+
+        let delivery = send_digest(&live_account(port), &config, &store, &jiff::Zoned::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery,
+            Delivery::Appended {
+                folder: "INBOX".into(),
+                uid: None
+            }
+        );
+        let sent = received.await.unwrap();
+        let message = mail_parser::MessageParser::default().parse(&sent).unwrap();
+        let guard = store.lock().unwrap();
+        assert!(
+            guard
+                .is_own_digest_message_id("Work", message.message_id().unwrap())
+                .unwrap()
+        );
+        assert!(guard.last_digest_date("Work").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_refused_append_records_no_day_so_the_schedule_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, config, store) = dry_run_setup(dir.path());
+        let (port, _) = fake_server(AppendReply::NoSuchFolder).await;
+
+        let error = send_digest(&live_account(port), &config, &store, &jiff::Zoned::now())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no such folder"), "{error}");
+        assert_eq!(
+            store.lock().unwrap().last_digest_date("Work").unwrap(),
+            None
+        );
+    }
+
     /// Hard rule: the digest only appends mail. It never changes flags and never moves,
     /// copies, expunges or deletes anything. The forbidden words are assembled at runtime so
     /// this test does not match itself.

@@ -87,7 +87,7 @@ fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
     if count == 1 { one } else { many }
 }
 
-const DRY_RUN_NOTE: &str = "Dry-run: nothing was flagged on the server. The flags below are the ones that would have been set.";
+const DRY_RUN_NOTE: &str = "Dry-run: nothing was flagged on the server. Any flags below are the ones that would have been set.";
 
 /// The one-line headline: how many messages need the user.
 fn headline(digest: &Digest) -> String {
@@ -624,10 +624,7 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
             message.date().map(|d| d.to_timestamp()),
             Some(1_792_998_000)
         );
-        assert_eq!(
-            header_values(&message, "X-Lets-Triage-Mail"),
-            ["digest"]
-        );
+        assert_eq!(header_values(&message, "X-Lets-Triage-Mail"), ["digest"]);
         assert_eq!(message.text_body().len(), 1);
         assert_eq!(message.html_body().len(), 1);
         assert_eq!(

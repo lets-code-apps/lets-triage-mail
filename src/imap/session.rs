@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::rfc4315::UidSetMember;
-use async_imap::imap_proto::{Response, ResponseCode, Status};
+use async_imap::imap_proto::{Outcome, Response, ResponseCode, Status};
 use async_imap::types::{Capabilities, Capability, Flag, Mailbox, NameAttribute};
 use async_imap::{Client, Session};
 use futures::TryStreamExt;
@@ -740,9 +740,11 @@ impl ImapSession {
             match response.parsed() {
                 Response::Continue(_) => break,
                 Response::Done {
-                    tag: done, status, ..
+                    tag: done,
+                    status,
+                    outcome,
                 } if *done == tag => {
-                    return Err(refused(status, "APPEND was refused"));
+                    return Err(refused(status, outcome, "APPEND was refused"));
                 }
                 // Untracked chatter such as `* 3 EXISTS`.
                 _ => {}
@@ -771,7 +773,7 @@ impl ImapSession {
             {
                 return match status {
                     Status::Ok => Ok(outcome.code.as_ref().map(appended_uid).unwrap_or_default()),
-                    other => Err(refused(other, "APPEND failed")),
+                    other => Err(refused(other, outcome, "APPEND failed")),
                 };
             }
         }
@@ -792,8 +794,12 @@ impl ImapSession {
 }
 
 /// The error for a tagged answer that is not `OK`.
-fn refused(status: &Status, what: &str) -> ImapError {
-    let text = format!("{what} ({status:?})");
+///
+/// The server's own words (`no such folder`) are included: they are what tells the user what
+/// to fix. `Outcome::information` is the text after the optional `[CODE]`.
+fn refused(status: &Status, outcome: &Outcome<'_>, what: &str) -> ImapError {
+    let said = outcome.information.as_deref().unwrap_or("no reason given");
+    let text = format!("{what} ({status:?}): {said}");
     match status {
         Status::Bad => async_imap::error::Error::Bad(text).into(),
         _ => async_imap::error::Error::No(text).into(),
@@ -1052,6 +1058,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    use crate::imap::fake_server::{AppendReply, fake_server};
+
+    async fn connect_to_fake(port: u16) -> ImapSession {
+        let settings = ImapSettings {
+            host: "127.0.0.1".into(),
+            port,
+            tls: TlsMode::PlainLoopbackOnly,
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        ImapSession::connect(&settings).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn append_sends_the_message_and_reads_the_appenduid() {
+        let (port, received) = fake_server(AppendReply::WithUid).await;
+        let mut session = connect_to_fake(port).await;
+        let message = b"Subject: hi\r\n\r\nline one\r\nline two\r\n".to_vec();
+
+        let result = session.append_message("INBOX", &message).await.unwrap();
+        assert_eq!(
+            result,
+            AppendResult {
+                uid_validity: Some(77),
+                uid: Some(12)
+            }
+        );
+        assert_eq!(received.await.unwrap(), message);
+        // The connection works after the APPEND.
+        assert!(session.capabilities().await.unwrap().uidplus);
+    }
+
+    #[tokio::test]
+    async fn append_without_uidplus_gives_no_uid() {
+        let (port, received) = fake_server(AppendReply::WithoutUid).await;
+        let mut session = connect_to_fake(port).await;
+        let result = session.append_message("INBOX", b"x\r\n").await.unwrap();
+        assert_eq!(result, AppendResult::default());
+        assert_eq!(received.await.unwrap(), b"x\r\n");
+    }
+
+    #[tokio::test]
+    async fn append_to_a_refused_folder_is_an_error_and_the_connection_survives() {
+        let (port, _) = fake_server(AppendReply::NoSuchFolder).await;
+        let mut session = connect_to_fake(port).await;
+        let error = session
+            .append_message("Missing", b"x\r\n")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ImapError::Imap(_)), "{error:?}");
+        assert!(error.to_string().contains("no such folder"), "{error}");
+        assert!(session.capabilities().await.is_ok());
     }
 
     /// Hard rule: v1 never deletes, moves or expunges mail.

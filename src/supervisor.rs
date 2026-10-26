@@ -9,8 +9,9 @@
 //!   and need no IMAP server.
 //! - [`serve`] starts one task per account in a [`JoinSet`], waits for them, and enforces the
 //!   shutdown grace period. It is also generic over the per-account future.
-//! - [`run_service`] plugs in the real parts: [`run_account`] for the inbox and a periodic
-//!   Sent-folder harvest on its own connection.
+//! - [`run_service`] plugs in the real parts: [`run_account`] for the inbox, a periodic
+//!   Sent-folder harvest on its own connection, and the daily digest loop, which connects only
+//!   when a digest is due.
 //!
 //! # Why one task per account, and what `JoinSet` is for
 //!
@@ -37,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{AccountConfig, Config};
 use crate::decider::Decider;
+use crate::digest::schedule::{DigestTiming, digest_loop};
 use crate::imap::worker::{WorkerError, backoff_delay, run_account};
 use crate::imap::{ImapError, ImapSession};
 use crate::senders::harvest_known_senders;
@@ -59,6 +61,8 @@ pub struct SupervisorTiming {
     pub harvest_interval: Duration,
     /// How long to wait before harvesting again after a failure.
     pub harvest_retry: Duration,
+    /// How the daily digest loop checks the clock and retries.
+    pub digest: DigestTiming,
 }
 
 impl Default for SupervisorTiming {
@@ -71,6 +75,7 @@ impl Default for SupervisorTiming {
             // times a day is plenty. A fixed interval is simpler than reacting to events.
             harvest_interval: Duration::from_secs(6 * 60 * 60),
             harvest_retry: Duration::from_secs(15 * 60),
+            digest: DigestTiming::default(),
         }
     }
 }
@@ -272,7 +277,8 @@ where
 // The real service
 // ---------------------------------------------------------------------------------------------
 
-/// Runs the inbox worker and the Sent harvest of every account until `shutdown` fires.
+/// Runs the inbox worker, the Sent harvest and the daily digest of every account until
+/// `shutdown` fires.
 ///
 /// The config and the decider are shared with all tasks through `Arc`: cloning an `Arc` copies
 /// a pointer and bumps a counter, not the data. Tasks must own what they use (`'static`),
@@ -299,7 +305,7 @@ pub async fn run_service<D: Decider + Send + Sync + 'static>(
     .await
 }
 
-/// One account: the supervised inbox worker next to the Sent harvester.
+/// One account: the supervised inbox worker next to the Sent harvester and the digest loop.
 async fn account_unit<D: Decider + Send + Sync>(
     config: Arc<Config>,
     index: usize,
@@ -310,8 +316,9 @@ async fn account_unit<D: Decider + Send + Sync>(
 ) -> AccountEnd {
     let account = &config.accounts[index];
     // A child token fires when the parent does, and can also be cancelled on its own. The
-    // harvester must stop when the inbox worker gives up, or this task would never end.
-    let harvest_stop = shutdown.child_token();
+    // side loops (harvest, digest) must stop when the inbox worker gives up, or this task
+    // would never end.
+    let side_stop = shutdown.child_token();
 
     let inbox = async {
         let end = supervise(&account.name, &shutdown, &timing, || {
@@ -324,14 +331,17 @@ async fn account_unit<D: Decider + Send + Sync>(
             )
         })
         .await;
-        harvest_stop.cancel();
+        side_stop.cancel();
         end
     };
-    let harvest = harvest_loop(account, &config, &store, &harvest_stop, &timing);
+    let harvest = harvest_loop(account, &config, &store, &side_stop, &timing);
+    // The digest has its own short-lived connections (the worker's is busy in IDLE) and
+    // never touches the worker's code: the worker is not allowed to write mail at all.
+    let digest = digest_loop(account, &config, &store, &side_stop, &timing.digest);
 
-    // `join!` runs both futures concurrently inside this one task, so aborting the task
-    // stops both. The harvester returns `()`, so only the inbox result is kept.
-    let (end, ()) = tokio::join!(inbox, harvest);
+    // `join!` runs all three futures concurrently inside this one task, so aborting the task
+    // stops all of them. The side loops return `()`, so only the inbox result is kept.
+    let (end, (), ()) = tokio::join!(inbox, harvest, digest);
     end
 }
 

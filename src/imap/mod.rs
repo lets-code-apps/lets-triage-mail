@@ -34,6 +34,8 @@
 //!   flag keywords.
 //! - The password is never logged, and plain text is refused for non-loopback hosts.
 
+#[cfg(test)]
+pub(crate) mod fake_server;
 pub mod folders;
 pub mod session;
 pub mod utf7;
