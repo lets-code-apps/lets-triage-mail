@@ -5,8 +5,11 @@
 //!
 //! # Privacy and safety
 //!
-//! - Only the `ENVELOPE` is fetched, never a body, and nothing on the server is changed.
-//! - Only addresses are stored, in the `known_senders` table.
+//! - Only the `ENVELOPE` and two header fields (`In-Reply-To`, `References`, fetched with
+//!   `PEEK`) are read, never a body, and nothing on the server is changed.
+//! - Only addresses are stored, in the `known_senders` table, and the Message-IDs the user
+//!   answered, in `sent_replies`. The auto-clear pass uses those ids to clear "Reply needed"
+//!   flags once the user has replied.
 //!
 //! # Incremental by UID
 //!

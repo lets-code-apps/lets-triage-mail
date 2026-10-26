@@ -65,10 +65,30 @@ cargo run --release -- run
 ```
 
 `run` keeps one connection per account, classifies new mail as it arrives and logs the flag it
-would set. It also reads each Sent folder every few hours to learn who you write to. Nothing is
-changed on the server: `policy.dry_run = false` is refused until flagging exists. Press Ctrl-C
+would set. It also reads each Sent folder every few hours to learn who you write to. With
+`policy.dry_run = true` (the default) nothing is changed on the server. Press Ctrl-C
 (or send SIGTERM) to stop; a second Ctrl-C exits at once. If one account cannot log in, the
 others keep running and the failed one is retried after 5 minutes, then 10, up to an hour.
+
+## Go live on one account
+
+When `stats` shows verdicts you agree with, turn flagging on for **one** account first by adding
+`dry_run = false` to that `[[accounts]]` entry and leaving `[policy] dry_run = true`:
+
+```toml
+[[accounts]]
+name = "zoho"
+# ...
+dry_run = false   # only this account writes flags; the others stay in dry-run
+```
+
+`run` then sets an Apple Mail flag colour on new mail there and clears it again when you have
+replied (orange "Reply needed") or the date has passed (yellow "Deadline"). It never uses red,
+never touches a message you flagged, and leaves a message alone for good once you change its
+flag. A mailbox without custom keywords cannot store colours, so `run` refuses to go live on it.
+
+`backfill --days 7 --account zoho` runs the same pipeline over the last week of the inbox
+(respecting dry-run) without moving the worker's position.
 
 ## Background
 
