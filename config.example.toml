@@ -31,6 +31,8 @@ max_concurrent = 1
 [policy]
 # Start with dry_run = true: everything is classified and logged, but nothing on the
 # server is changed. Look at the results for a few days, then set this to false.
+# You can also go live one account at a time: set `dry_run = false` on that account below
+# and keep this at true for the rest.
 dry_run = true
 # Below this confidence (0 to 1) a message gets the "Unsure" flag instead of an action flag.
 min_confidence = 0.75
@@ -115,6 +117,13 @@ sent_folder = ""
 # such as wp.pl). Mail is then classified for the digest only and never flagged: without
 # keywords, a flag would show as red in Apple Mail, and red is yours.
 # flagging = true
+# Per-account dry-run. Overrides [policy] dry_run for this account only; leave it out to
+# follow the policy. Typical use: keep [policy] dry_run = true and set `dry_run = false` on
+# one low-volume account to watch real flags in Apple Mail before turning on the others.
+# A live account needs custom keywords (`check` tells you); the service refuses to start it
+# otherwise, because a bare \Flagged shows red and red is yours. With `flagging = false` the
+# account is never written to, whatever dry_run says.
+# dry_run = false
 # Optional: read this provider's own DKIM and spam headers when it does not write
 # Authentication-Results. Known values: "wp" (wp.pl: X-WP-DKIM-Status, X-WP-SPAM).
 # OFF by default, because a sender can write these headers too: a spammer can add
