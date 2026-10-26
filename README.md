@@ -56,6 +56,26 @@ cargo run --release -- check
 Use `--account NAME` to check one account and `--json` for machine-readable output. The exit code
 is non-zero if anything failed. `check` never changes anything on the mail server.
 
+## Run in the background (macOS)
+
+A LaunchAgent starts the service at login and restarts it after a crash. It runs as you, so the
+login Keychain works for `password_command`. It assumes `cargo install --path .` put the binary
+in `~/.cargo/bin`; otherwise edit the path in the plist.
+
+```sh
+L=io.github.lets-code-apps.lets-triage-mail
+mkdir -p ~/Library/Logs/lets-triage-mail ~/Library/LaunchAgents
+sed "s|/Users/YOU|$HOME|g" contrib/launchd/$L.plist > ~/Library/LaunchAgents/$L.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$L.plist   # install and start
+launchctl print gui/$(id -u)/$L                                    # status
+launchctl kickstart -k gui/$(id -u)/$L                             # restart (after a config change)
+launchctl bootout gui/$(id -u)/$L                                  # stop; delete the plist to uninstall
+```
+
+Logs: `~/Library/Logs/lets-triage-mail/lets-triage-mail.log`. A failed start (for example a
+config error) is retried every 30 seconds; a clean stop is not. A Linux systemd unit would be a
+welcome contribution.
+
 ## Run it in dry-run
 
 Once `check` passes, watch your inboxes without changing anything:

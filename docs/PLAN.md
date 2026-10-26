@@ -52,7 +52,7 @@ Every agent reads `CLAUDE.md` first. In addition:
 |---|---|---|
 | 0.1 | `flags.rs`: colour ⇄ IMAP keywords, red never settable | done |
 | 0.2 | `engine.rs`: sender screening, verdict → flag | done |
-| 0.3 | **App skeleton**: `clap` CLI with all `SPEC.md` §4 subcommands as stubs, `tracing` logging, `anyhow` in the binary and `thiserror` in the library, `tokio` runtime in `main` | to do |
+| 0.3 | **App skeleton**: `clap` CLI with all `SPEC.md` §4 subcommands as stubs, `tracing` logging, `anyhow` in the binary and `thiserror` in the library, `tokio` runtime in `main` | done |
 
 **0.3 details.** `main.rs` parses the CLI and dispatches; each command lives in `src/cli/<name>.rs`
 and returns `anyhow::Result<()>`. Unimplemented commands print "not implemented yet" and exit
@@ -354,7 +354,7 @@ Found on 2026-10-25: wp.pl filed a DKIM-valid message from the user's own Gmail 
 
 | # | Task |
 |---|---|
-| 6.1 | `contrib/` launchd plist with KeepAlive; install notes in the README |
+| 6.1 | `contrib/` launchd plist with KeepAlive; install notes in the README (done: LaunchAgent, restart only on failure, README section "Run in the background") |
 | 6.2 | README quickstart: install, config, `check`, dry-run, going live; provider compatibility table |
 | 6.3 | Releases: `cargo-dist` for macOS arm64 and Linux binaries, Homebrew tap `lets-code-apps/tap` |
 | 6.4 | CONTRIBUTING.md, issue templates, SECURITY.md with the threat model (`OPEN_SOURCE.md`) |

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for lets-triage-mail. launchd does not expand "~" or $HOME, so every path below
+  starts with /Users/YOU; the README replaces it with your home directory using sed.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.lets-code-apps.lets-triage-mail</string>
+
+  <!-- launchd has a minimal PATH, so the binary needs its absolute path (this is where
+       `cargo install` puts it). The config is found through HOME, which launchd sets. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.cargo/bin/lets-triage-mail</string>
+    <string>run</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart only after a failure (non-zero exit or a crash). A clean exit 0, such as the
+       one after `launchctl bootout` sends SIGTERM, is not fought. Plain `true` would restart
+       even after a clean stop. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- At least 30 s between starts, so a config error does not become a hot loop. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- On stop, launchd sends SIGTERM, then SIGKILL after this many seconds. The service needs
+       up to 10 s to finish its current step, so the default of 20 s is raised for margin. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+
+  <!-- Logs go to stderr; launchd does not create the directory (see the README). -->
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/lets-triage-mail/lets-triage-mail.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/lets-triage-mail/lets-triage-mail.log</string>
+</dict>
+</plist>
