@@ -1060,7 +1060,14 @@ async fn append_message_reports_the_uid_and_leaves_the_message_unread() {
     assert_eq!(Some(info.uid_validity), first.uid_validity);
     assert_eq!(info.exists, 2);
     let metas = session.fetch_meta(&[1, 2]).await.unwrap();
-    assert!(metas.iter().all(|m| m.flags.is_empty()), "{metas:?}");
+    // Unread and unflagged. `\Recent` may be there: the server sets it on new mail itself,
+    // and no client can set or clear it.
+    assert!(
+        metas
+            .iter()
+            .all(|m| m.flags.iter().all(|f| f.eq_ignore_ascii_case("\\Recent"))),
+        "{metas:?}"
+    );
     session.logout().await.unwrap();
 }
 
