@@ -34,6 +34,8 @@
 //!   flag keywords.
 //! - The password is never logged, and plain text is refused for non-loopback hosts.
 
+#[cfg(test)]
+pub(crate) mod fake_server;
 pub mod folders;
 pub mod session;
 pub mod utf7;
@@ -44,7 +46,8 @@ use std::net::IpAddr;
 
 pub use folders::{ListedFolder, ResolvedFolders, resolve_folders};
 pub use session::{
-    EnvelopeAddresses, IdleEnd, ImapSession, MailboxInfo, MessageMeta, ServerCapabilities,
+    AppendResult, EnvelopeAddresses, IdleEnd, ImapSession, MailboxInfo, MessageMeta,
+    ServerCapabilities,
 };
 pub use utf7::decode_modified_utf7;
 
@@ -155,6 +158,9 @@ pub enum ImapError {
     /// `store_flags` was called before any mailbox was selected.
     #[error("no mailbox is selected")]
     NoMailboxSelected,
+    /// A folder name that cannot be sent safely (empty, or with a line break or NUL).
+    #[error("{0:?} is not a usable folder name")]
+    InvalidFolderName(String),
     /// A command was given an empty list of UIDs.
     #[error("the UID list is empty")]
     EmptyUidSet,

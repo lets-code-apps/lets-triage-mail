@@ -280,21 +280,52 @@ Tasks 4.1–4.3 depend on phase 3. 4.2 and 4.3 can run in parallel after 4.1.
 
 ## Phase 5: Daily digest
 
-### 5.1 Build and render (`digest/build.rs`)
-- Gather the last 24 h from the store: flagged items by colour, newsletters, noise counts, unsure
-  items. Ask the model for one-line summaries (newsletters, flagged items) through the same
-  decider client and semaphore.
+### 5.1 Build and render (`digest/build.rs`, `digest/render.rs`)
+- Gather the period since the previous digest (24 h for the first one, never more than 48 h)
+  from the store: flagged items by flag, newsletters/marketing/cold outreach as counts with the
+  noisiest senders, spam and phishing counts, one "other mail" count.
+- **Changed (2026-10-26): no model calls.** The plan was to ask the model for one-line summaries
+  through the decider. Message bodies are never stored, so that would mean downloading the mail
+  again. Each line uses the verdict's stored `reason` (a one-sentence model summary written while
+  classifying) instead. See `DECISIONS.md`.
 - Render plain text and simple HTML (light and dark mode, no remote content), as
   `multipart/alternative`, with our `Message-ID` domain and the `X-Lets-Triage-Mail: digest`
-  header. Crate: `mail-builder`. Summaries are model output from hostile input: escape them in HTML.
-- *Tests:* snapshot tests of the rendered text and HTML from a fixed store.
+  header. Crate: `mail-builder` 2. Senders, subjects and reasons are hostile: every one is
+  flattened to a safe line (`clean_line`) and escaped in HTML (`escape_html`); the subject cannot
+  carry a line break into a header.
+- A classify-only account (`flagging = false`) has no stored flags, so the digest asks the engine
+  which flag each message *would* get (`choose_flag` with `Trust::Unknown`), because for wp.pl
+  the digest is the main output.
+- An empty day still gets a short digest ("Nothing needed your attention"), which also tells
+  the owner the service is alive.
+- *Tests:* whole-string tests of the rendered text from a fixed model, an HTML test with a
+  `<script>` subject, a "no remote content" test, and the composed message read back with
+  `mail-parser`. (Plain `assert_eq!`; `insta` was not worth a dependency for one snapshot.)
+- *Done.*
 
-### 5.2 Deliver and schedule (`digest/schedule.rs`)
-- APPEND without `\Seen` to the configured folder, once a day at the configured local time.
-  Catch-up after sleep; `last_digest_date` guarantees one digest per day per account.
-- The worker skips our own digest when classifying.
-- `digest [--account X] [--dry]`: build and print, or append immediately (the scheduled digest
-  runs inside `run`).
+### 5.2 Deliver and schedule (`digest/deliver.rs`, `digest/schedule.rs`)
+- APPEND without `\Seen` to `[digest] folder` (default INBOX), once a day at `[digest] time`
+  local time, per account. `next_step` (pure) decides: due once the time has passed and today's
+  digest is missing, which also covers catch-up after sleep and a first start in the afternoon.
+  `last_digest_date` guarantees one digest per day per account. The loop looks at the wall clock
+  every minute (a monotonic sleep does not run while the Mac sleeps) and retries a failure after
+  15 minutes.
+- The loop is a third future in the account unit in `supervisor.rs`, next to the inbox worker and
+  the Sent harvest, on its own short-lived connection. **The worker never appends** (its source
+  scan test still forbids it); `digest/` has its own scan test that allows `append` and forbids
+  everything else that writes.
+- **A dry-run account is never appended to.** Its digest is written to
+  `<data dir>/digests/<account>-<date>.eml` (0600; the newest 14 per account are kept). Classify-only
+  accounts that are not dry-run do get the APPEND.
+- **The worker skips its own digests by record, not by header** (a sender can write any header).
+  The random Message-ID is stored before the APPEND, the `APPENDUID` after it (table
+  `own_digests`); the worker skips by UID before downloading and by Message-ID after. A forged
+  `X-Lets-Triage-Mail` header from a stranger is classified like any mail.
+- `digest [--account X] [--dry]`: `--dry` prints the plain text and changes nothing; otherwise it
+  delivers as above and records the day.
+- `check` reports the digest time and whether the digest folder can be opened.
+- *Done.* The Dovecot tests were written but, as always, run in CI only; the APPEND itself is
+  also tested locally against a scripted fake IMAP server (`imap/fake_server.rs`).
 
 ### 5.3 Spam-folder watch, read-only (`imap/junk.rs`)
 Found on 2026-10-25: wp.pl filed a DKIM-valid message from the user's own Gmail account into

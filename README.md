@@ -90,6 +90,22 @@ flag. A mailbox without custom keywords cannot store colours, so `run` refuses t
 `backfill --days 7 --account zoho` runs the same pipeline over the last week of the inbox
 (respecting dry-run) without moving the worker's position.
 
+## The daily digest
+
+Once a day at `[digest] time` (local time) `run` appends one summary email per account to
+`[digest] folder` (default `INBOX`), unread: what needs you, grouped by flag, and counts of the
+rest. After a sleep it catches up on wake. English only. It uses the model's one-line reasons
+from classification, so it makes no model calls and stores no bodies, and its HTML loads nothing
+from the network.
+
+An account in dry-run is never appended to. Its digest is saved as
+`~/.local/share/lets-triage-mail/digests/<account>-<date>.eml` (open it in Mail to preview).
+
+```sh
+lets-triage-mail digest --dry               # print today's digest, change nothing
+lets-triage-mail digest --account zoho      # write it now
+```
+
 ## Background
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,

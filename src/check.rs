@@ -15,12 +15,13 @@
 //! # Hard rule
 //!
 //! `check` must never change anything on a mail server. The probes only log in, ask for
-//! capabilities, `LIST` and `SELECT`. There is no `STORE`, `APPEND` or folder creation here.
+//! capabilities, `LIST` and `SELECT`. There is no `STORE`, no append (not even a test digest)
+//! and no folder creation here.
 //! The only thing `check` writes is the local state database, which it creates if it is missing
 //! (the normal `run` would do the same).
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -517,8 +518,34 @@ fn account_area(name: &str) -> String {
     format!("Account {name}")
 }
 
-/// Runs all checks for one account: password, login, capabilities, inbox, Sent folder.
-pub async fn probe_account(account: &AccountConfig) -> Vec<CheckItem> {
+/// What `check` needs to know about the daily digest of one account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestCheck {
+    /// The configured time of day, `HH:MM`.
+    pub time: String,
+    /// The folder the digest is appended to.
+    pub folder: String,
+    /// The account is in dry-run: its digest is saved as a file, never appended.
+    pub dry_run: bool,
+    /// Where those files go.
+    pub previews_dir: PathBuf,
+}
+
+impl DigestCheck {
+    /// The digest settings that apply to one account.
+    pub fn for_account(config: &Config, account: &AccountConfig) -> DigestCheck {
+        DigestCheck {
+            time: config.digest.time.clone(),
+            folder: config.digest.folder.clone(),
+            dry_run: account.dry_run(&config.policy),
+            previews_dir: crate::digest::deliver::previews_dir(config),
+        }
+    }
+}
+
+/// Runs all checks for one account: password, login, capabilities, inbox, Sent folder and the
+/// digest folder.
+pub async fn probe_account(account: &AccountConfig, digest: &DigestCheck) -> Vec<CheckItem> {
     let area = account_area(&account.name);
 
     // Reading the password may run the user's `password_command` (for example the macOS
@@ -544,6 +571,7 @@ pub async fn probe_account(account: &AccountConfig) -> Vec<CheckItem> {
             &account.inbox,
             &account.sent_folder,
             account.flagging,
+            digest,
         )
         .await,
     );
@@ -561,6 +589,7 @@ pub async fn probe_imap(
     inbox: &str,
     configured_sent: &str,
     flagging: bool,
+    digest: &DigestCheck,
 ) -> Vec<CheckItem> {
     let mut items = Vec::new();
 
@@ -586,8 +615,12 @@ pub async fn probe_imap(
         ),
     ));
 
+    let mut uidplus = false;
     match step("reading capabilities", session.capabilities()).await {
-        Ok(caps) => items.push(capability_item(area, &caps)),
+        Ok(caps) => {
+            uidplus = caps.uidplus;
+            items.push(capability_item(area, &caps));
+        }
         Err(message) => items.push(CheckItem::fail(area, message, RETRY_HINT)),
     }
 
@@ -623,6 +656,16 @@ pub async fn probe_imap(
             )),
         }
     }
+
+    // The digest folder is only needed when the digest is really appended. SELECT changes
+    // nothing; the folder is never created here or by the service.
+    let opened = if digest.dry_run {
+        Ok(())
+    } else {
+        let what = format!("selecting the digest folder {}", digest.folder);
+        step(&what, session.select(&digest.folder)).await.map(drop)
+    };
+    items.push(digest_item(area, digest, uidplus, opened));
 
     // Be polite to the server. A failed logout does not matter for a read-only check.
     let _ = step("logging out", session.logout()).await;
@@ -740,6 +783,52 @@ pub fn mailbox_items(
     vec![selected, keywords]
 }
 
+/// The digest item: when it is written and where it goes.
+///
+/// `opened` is the result of selecting the digest folder (`Ok` without a check for a dry-run
+/// account, which never appends). `uidplus` says whether the server can tell us the UID of an
+/// appended message; without it the worker recognises its digest by Message-ID instead, which
+/// works the same.
+pub fn digest_item(
+    area: &str,
+    digest: &DigestCheck,
+    uidplus: bool,
+    opened: Result<(), String>,
+) -> CheckItem {
+    if digest.dry_run {
+        return CheckItem::ok(
+            area,
+            format!(
+                "digest at {} is saved as a file in {} (dry-run: nothing is appended to the mailbox)",
+                digest.time,
+                digest.previews_dir.display()
+            ),
+        );
+    }
+    match opened {
+        Err(message) => CheckItem::fail(
+            area,
+            message,
+            "create the folder in your mail client, or change [digest] folder; the service never creates folders",
+        ),
+        Ok(()) if uidplus => CheckItem::ok(
+            area,
+            format!(
+                "digest at {} goes to {} (folder can be opened)",
+                digest.time, digest.folder
+            ),
+        ),
+        Ok(()) => CheckItem::warn(
+            area,
+            format!(
+                "digest at {} goes to {} (folder can be opened)",
+                digest.time, digest.folder
+            ),
+            "the server has no UIDPLUS, so the digest is recognised by its Message-ID only; that works, but it is the less direct way",
+        ),
+    }
+}
+
 /// The Sent folder item: the configured one, the detected one, or a warning that there is none.
 pub fn sent_item(area: &str, configured: &str, resolved: &ResolvedFolders) -> CheckItem {
     if !configured.is_empty() {
@@ -775,6 +864,48 @@ mod tests {
 
     use super::*;
     use crate::imap::MailboxInfo;
+
+    fn digest_check(dry_run: bool) -> DigestCheck {
+        DigestCheck {
+            time: "07:30".into(),
+            folder: "INBOX".into(),
+            dry_run,
+            previews_dir: PathBuf::from("/data/digests"),
+        }
+    }
+
+    #[test]
+    fn the_digest_item_reports_time_and_folder() {
+        let item = digest_item("a", &digest_check(false), true, Ok(()));
+        assert_eq!(item.status, Status::Ok);
+        assert!(item.message.contains("07:30") && item.message.contains("INBOX"));
+    }
+
+    #[test]
+    fn a_missing_digest_folder_fails_with_a_hint() {
+        let item = digest_item(
+            "a",
+            &digest_check(false),
+            true,
+            Err("no such folder".into()),
+        );
+        assert_eq!(item.status, Status::Fail);
+        assert!(item.hint.unwrap().contains("never creates folders"));
+    }
+
+    #[test]
+    fn a_server_without_uidplus_gets_a_warning() {
+        let item = digest_item("a", &digest_check(false), false, Ok(()));
+        assert_eq!(item.status, Status::Warn);
+    }
+
+    #[test]
+    fn a_dry_run_account_has_no_digest_folder_to_check() {
+        // The folder result is ignored: nothing is appended, so a bad folder is no problem.
+        let item = digest_item("a", &digest_check(true), true, Err("ignored".into()));
+        assert_eq!(item.status, Status::Ok);
+        assert!(item.message.contains("/data/digests"));
+    }
 
     fn llm_config(server: &MockServer) -> LlmConfig {
         LlmConfig {

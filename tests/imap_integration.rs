@@ -23,6 +23,16 @@ use lets_triage_mail::senders::{Skipped, harvest_known_senders};
 use lets_triage_mail::store::{MailboxState, MessageKey, Store};
 use tokio_util::sync::CancellationToken;
 
+/// The digest settings the `check` tests use: appended to the inbox, not a dry-run.
+fn digest_check() -> lets_triage_mail::check::DigestCheck {
+    lets_triage_mail::check::DigestCheck {
+        time: "07:00".into(),
+        folder: "INBOX".into(),
+        dry_run: false,
+        previews_dir: std::path::PathBuf::from("digests"),
+    }
+}
+
 /// This one needs no server: the refusal happens before any connection is made.
 #[tokio::test]
 async fn refuses_plain_text_to_a_remote_host() {
@@ -298,7 +308,15 @@ async fn check_probe_passes_against_dovecot() {
     let settings = fresh_account();
     seed_inbox(&settings, &["one", "two"]).await;
 
-    let items = probe_imap("Account test", &settings, "INBOX", "", true).await;
+    let items = probe_imap(
+        "Account test",
+        &settings,
+        "INBOX",
+        "",
+        true,
+        &digest_check(),
+    )
+    .await;
     assert!(items.iter().all(|i| i.status != Status::Fail), "{items:#?}");
     let text = lets_triage_mail::check::format_items(&items);
     assert!(text.contains("2 messages"), "{text}");
@@ -312,7 +330,15 @@ async fn check_probe_reports_a_wrong_password_with_a_hint() {
 
     let mut settings = fresh_account();
     settings.password = "not-the-password".into();
-    let items = probe_imap("Account test", &settings, "INBOX", "", true).await;
+    let items = probe_imap(
+        "Account test",
+        &settings,
+        "INBOX",
+        "",
+        true,
+        &digest_check(),
+    )
+    .await;
     assert_eq!(items.len(), 1, "{items:#?}");
     assert_eq!(items[0].status, Status::Fail);
     assert!(items[0].hint.as_deref().unwrap().contains("password"));
@@ -941,8 +967,14 @@ async fn supervisor_keeps_a_good_account_running_next_to_a_rejected_login() {
     let mut wrong_password = worker_account(&bad);
     wrong_password.name = "bad".into();
     wrong_password.password_command = "echo wrong-password".into();
+    // Both accounts are in dry-run, so their daily digest (due after 07:00) is a file. Keep
+    // it out of the real data directory.
+    let data_dir = tempfile::tempdir().unwrap();
     let config = Config {
         accounts: vec![worker_account(&good), wrong_password],
+        storage: lets_triage_mail::config::StorageConfig {
+            db_path: Some(data_dir.path().join("state.db")),
+        },
         ..Config::default()
     };
     assert!(config.policy.dry_run);
@@ -982,4 +1014,267 @@ async fn supervisor_keeps_a_good_account_running_next_to_a_rejected_login() {
         "everything stopped inside the grace period"
     );
     assert!(!report.every_account_failed());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The daily digest (tasks 5.1 and 5.2)
+// ---------------------------------------------------------------------------------------------
+
+/// A config whose data directory is a throwaway folder, so a dry-run digest never writes its
+/// preview file into the real `~/.local/share/lets-triage-mail`.
+fn config_in(dir: &std::path::Path) -> Config {
+    Config::parse(&format!(
+        "[storage]\ndb_path = \"{}\"\n",
+        dir.join("state.db").display()
+    ))
+    .expect("config")
+}
+
+/// The whole message at `uid` in the inbox, fetched with PEEK (so it stays unread).
+async fn inbox_message(settings: &ImapSettings, uid: u32) -> Vec<u8> {
+    let mut session = ImapSession::connect(settings).await.unwrap();
+    session.select_inbox().await.unwrap();
+    let body = session
+        .fetch_body_peek(uid)
+        .await
+        .unwrap()
+        .expect("message exists");
+    session.logout().await.unwrap();
+    body
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn append_message_reports_the_uid_and_leaves_the_message_unread() {
+    let settings = fresh_account();
+    let mut session = ImapSession::connect(&settings).await.unwrap();
+    let message = common::sample_message("appended");
+
+    let first = session.append_message("INBOX", &message).await.unwrap();
+    let second = session.append_message("INBOX", &message).await.unwrap();
+    assert_eq!((first.uid, second.uid), (Some(1), Some(2)));
+    assert!(first.uid_validity.is_some());
+    assert_eq!(first.uid_validity, second.uid_validity);
+
+    let info = session.select_inbox().await.unwrap();
+    assert_eq!(Some(info.uid_validity), first.uid_validity);
+    assert_eq!(info.exists, 2);
+    let metas = session.fetch_meta(&[1, 2]).await.unwrap();
+    assert!(metas.iter().all(|m| m.flags.is_empty()), "{metas:?}");
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn append_to_a_missing_folder_fails_and_creates_nothing() {
+    let mut session = ImapSession::connect(&fresh_account()).await.unwrap();
+    let message = common::sample_message("lost");
+    assert!(
+        session
+            .append_message("No/Such/Folder", &message)
+            .await
+            .is_err()
+    );
+    // The connection is still usable, and the folder was not created.
+    let folders = session.resolve_folders().await.unwrap();
+    assert_eq!(folders.inbox, "INBOX");
+    assert!(session.select("No/Such/Folder").await.is_err());
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_digest_lands_unread_in_the_inbox_and_the_worker_does_not_classify_it() {
+    use lets_triage_mail::digest::deliver::{Delivery, send_digest};
+
+    let settings = fresh_account();
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    // Live on this account, so a classified digest would be flagged orange (the fake model
+    // says "reply needed" about everything). Not a dry-run: the digest is appended.
+    let extra = "dry_run = false\n";
+    let worker = start_worker_with(&settings, false, Duration::from_secs(1), extra);
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+    let validity = worker.state().unwrap().uidvalidity;
+
+    // One real message for the digest to report.
+    seed_inbox(&settings, &["please-answer"]).await; // UID 1
+    wait_until(Duration::from_secs(15), "the message to be flagged", || {
+        worker.is_processed(validity, 1)
+    })
+    .await;
+
+    let account = worker_account_with(&settings, extra);
+    let delivery = send_digest(&account, &config, &worker.store, &jiff::Zoned::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery,
+        Delivery::Appended {
+            folder: "INBOX".into(),
+            uid: Some(2)
+        }
+    );
+
+    // Give the worker several IDLE rounds to (wrongly) pick it up.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !worker.is_processed(validity, 2),
+        "the worker must not classify its own digest"
+    );
+    let flags = server_flags(&settings, 2).await;
+    assert!(flags.is_empty(), "unread and unflagged: {flags:?}");
+    assert!(
+        worker
+            .store
+            .lock()
+            .unwrap()
+            .is_own_digest(&inbox_key(validity, 2))
+            .unwrap()
+    );
+    let today = jiff::Zoned::now().date().to_string();
+    assert_eq!(
+        worker
+            .store
+            .lock()
+            .unwrap()
+            .last_digest_date("test")
+            .unwrap()
+            .as_deref(),
+        Some(today.as_str())
+    );
+
+    // It is a real multipart message with the header and the one flagged message in it.
+    let raw = inbox_message(&settings, 2).await;
+    let message = mail_parser::MessageParser::default().parse(&raw).unwrap();
+    assert!(message.subject().unwrap().starts_with("Daily triage"));
+    let text = message.body_text(0).unwrap();
+    assert!(text.contains("Reply needed (1)"), "{text}");
+    assert!(text.contains("please-answer"), "{text}");
+    assert!(message.body_html(0).unwrap().contains("<html"));
+    assert!(String::from_utf8_lossy(&raw).contains("X-Lets-Triage-Mail: digest"));
+
+    // The original message is still the only one that was flagged.
+    assert!(is_orange(&server_flags(&settings, 1).await));
+    worker.stop().await;
+}
+
+/// A sender can write any header. A stranger's message that claims to be a digest is mail
+/// like any other.
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_forged_digest_header_from_a_stranger_is_classified() {
+    let settings = fresh_account();
+    let worker = start_worker_with(
+        &settings,
+        false,
+        Duration::from_secs(1),
+        "dry_run = false\n",
+    );
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+    let validity = worker.state().unwrap().uidvalidity;
+
+    let forged = "From: Mallory <mallory@evil.example>\r\nTo: me@example.org\r\n\
+                  Subject: Daily triage - work - 2026-10-26\r\n\
+                  Message-ID: <forged@lets-triage-mail.invalid>\r\n\
+                  X-Lets-Triage-Mail: digest\r\n\
+                  Date: Mon, 26 Oct 2026 07:00:00 +0000\r\n\r\n\
+                  Please send me money.\r\n";
+    append_raw(&settings, "INBOX", None, forged.as_bytes().to_vec()).await;
+    wait_until(
+        Duration::from_secs(15),
+        "the forged digest to be classified",
+        || worker.is_processed(validity, 1),
+    )
+    .await;
+    assert!(is_orange(&server_flags(&settings, 1).await));
+    worker.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_dry_run_account_gets_no_append_and_a_preview_file() {
+    use lets_triage_mail::digest::deliver::{Delivery, send_digest};
+
+    let settings = fresh_account();
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    // No `dry_run` override: the policy's dry-run (the default) applies.
+    let account = worker_account(&settings);
+    assert!(account.dry_run(&config.policy));
+
+    let delivery = send_digest(&account, &config, &store, &jiff::Zoned::now())
+        .await
+        .unwrap();
+    let Delivery::Saved(path) = delivery else {
+        panic!("a dry-run account must not be appended to: {delivery:?}");
+    };
+    assert!(path.starts_with(dir.path().join("digests")), "{path:?}");
+    let saved = std::fs::read(&path).unwrap();
+    assert!(String::from_utf8_lossy(&saved).contains("X-Lets-Triage-Mail: digest"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // The mailbox is untouched, and the day is recorded so the schedule does not repeat it.
+    let mut session = ImapSession::connect(&settings).await.unwrap();
+    assert_eq!(session.select_inbox().await.unwrap().exists, 0);
+    session.logout().await.unwrap();
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .last_digest_date("test")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_missing_digest_folder_fails_without_recording_the_day() {
+    use lets_triage_mail::digest::deliver::send_digest;
+
+    let settings = fresh_account();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_in(dir.path());
+    config.digest.folder = "No/Such/Folder".into();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let account = worker_account_with(&settings, "dry_run = false\n");
+
+    let result = send_digest(&account, &config, &store, &jiff::Zoned::now()).await;
+    assert!(result.is_err());
+    // Nothing recorded as sent, so the schedule tries again.
+    assert_eq!(
+        store.lock().unwrap().last_digest_date("test").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn check_reports_a_missing_digest_folder() {
+    use lets_triage_mail::check::{DigestCheck, Status, probe_imap};
+
+    let settings = fresh_account();
+    let digest = DigestCheck {
+        folder: "No/Such/Folder".into(),
+        ..digest_check()
+    };
+    let items = probe_imap("Account test", &settings, "INBOX", "", true, &digest).await;
+    let failed: Vec<_> = items.iter().filter(|i| i.status == Status::Fail).collect();
+    assert_eq!(failed.len(), 1, "{items:#?}");
+    assert!(failed[0].message.contains("digest folder"));
 }

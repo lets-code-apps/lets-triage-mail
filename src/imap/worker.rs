@@ -198,6 +198,7 @@ fn imap_error_is_fatal(error: &ImapError) -> bool {
         | ImapError::Imap(_)
         | ImapError::NoMailboxSelected
         | ImapError::EmptyUidSet
+        | ImapError::InvalidFolderName(_)
         | ImapError::MissingData(_) => false,
     }
 }
@@ -285,6 +286,10 @@ pub enum SkipReason {
     AlreadyProcessed,
     /// The message comes from the account's own address.
     OwnAddress,
+    /// A daily digest this service appended itself (recorded in the store). Recognised by the
+    /// UID the server reported or by the random Message-ID we generated, never by a header: a
+    /// sender can write any header.
+    OwnDigest,
     /// The bytes could not be parsed as a message.
     Unparseable,
 }
@@ -293,8 +298,18 @@ pub enum SkipReason {
 ///
 /// Any `\Flagged` counts, not only the seven colours: the service never sets a flag in
 /// dry-run, and later it records what it set, so a flag seen here is the user's.
-pub fn skip_before_fetch(flags: &[String], already_processed: bool) -> Option<SkipReason> {
-    if flags
+///
+/// `own_digest` is true when the store has this exact message (by UID) as a digest we
+/// appended. A digest the store only knows by Message-ID is caught later, in `triage`, once
+/// the headers are downloaded.
+pub fn skip_before_fetch(
+    flags: &[String],
+    already_processed: bool,
+    own_digest: bool,
+) -> Option<SkipReason> {
+    if own_digest {
+        Some(SkipReason::OwnDigest)
+    } else if flags
         .iter()
         .any(|flag| flag.eq_ignore_ascii_case(crate::flags::FLAGGED))
     {
@@ -714,10 +729,12 @@ impl<D: Decider> Ctx<'_, D> {
         failed_attempts: u32,
     ) -> Result<Outcome, WorkerError> {
         let lookup = key.clone();
-        let processed = self
-            .with_store(move |store| store.is_processed(&lookup))
+        let (processed, own_digest) = self
+            .with_store(move |store| {
+                Ok((store.is_processed(&lookup)?, store.is_own_digest(&lookup)?))
+            })
             .await?;
-        if let Some(reason) = skip_before_fetch(&meta.flags, processed) {
+        if let Some(reason) = skip_before_fetch(&meta.flags, processed, own_digest) {
             tracing::debug!(account = %self.account.name, uid = meta.uid, ?reason, "skipping");
             return Ok(Outcome::Skipped(reason));
         }
@@ -758,6 +775,20 @@ impl<D: Decider> Ctx<'_, D> {
     ) -> Result<Outcome, WorkerError> {
         if is_own_message(&parsed.from_address, self.own.as_deref()) {
             return Ok(Outcome::Skipped(SkipReason::OwnAddress));
+        }
+
+        // Our own daily digest, found by its Message-ID. This is the fallback for a server
+        // without APPENDUID, and it covers the moment between the APPEND and us learning
+        // the UID. A forged `X-Lets-Triage-Mail` header does not get a message here: only a
+        // Message-ID we generated and stored does.
+        if let Some(message_id) = parsed.message_id.clone() {
+            let account = self.account.name.clone();
+            let ours = self
+                .with_store(move |store| store.is_own_digest_message_id(&account, &message_id))
+                .await?;
+            if ours {
+                return Ok(Outcome::Skipped(SkipReason::OwnDigest));
+            }
         }
 
         let (name, sender, domain) = (
@@ -1400,7 +1431,7 @@ mod tests {
 
     #[test]
     fn any_flagged_message_is_the_users() {
-        let skip = |names: &[&str], processed| skip_before_fetch(&flags(names), processed);
+        let skip = |names: &[&str], processed| skip_before_fetch(&flags(names), processed, false);
         assert_eq!(skip(&["\\Flagged"], false), Some(SkipReason::UserFlagged));
         assert_eq!(
             skip(&["\\flagged", "$MailFlagBit0"], false),
@@ -1425,14 +1456,23 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_digest_is_skipped_by_uid() {
+        assert_eq!(
+            skip_before_fetch(&[], false, true),
+            Some(SkipReason::OwnDigest)
+        );
+        assert_eq!(skip_before_fetch(&[], false, false), None);
+    }
+
+    #[test]
     fn processed_messages_are_skipped() {
         assert_eq!(
-            skip_before_fetch(&[], true),
+            skip_before_fetch(&[], true, false),
             Some(SkipReason::AlreadyProcessed)
         );
         // The user's flag is reported first.
         assert_eq!(
-            skip_before_fetch(&flags(&["\\Flagged"]), true),
+            skip_before_fetch(&flags(&["\\Flagged"]), true, false),
             Some(SkipReason::UserFlagged)
         );
     }
@@ -1704,6 +1744,16 @@ mod tests {
         username: &str,
         from: &str,
     ) -> (Outcome, Arc<Mutex<Store>>) {
+        run_triage_message(decider, prepare, username, &parsed(from)).await
+    }
+
+    /// Like [`run_triage`], for a message the test built itself.
+    async fn run_triage_message(
+        decider: &FakeDecider,
+        prepare: impl FnOnce(&Store),
+        username: &str,
+        message: &ParsedMessage,
+    ) -> (Outcome, Arc<Mutex<Store>>) {
         let store = Store::open_in_memory().unwrap();
         prepare(&store);
         let store = Arc::new(Mutex::new(store));
@@ -1721,10 +1771,7 @@ mod tests {
         };
         // Dry-run: the mailbox must never be asked to change anything.
         let mut mailbox = FakeMailbox::default();
-        let outcome = ctx
-            .triage(&mut mailbox, &key(5), &parsed(from), 0)
-            .await
-            .unwrap();
+        let outcome = ctx.triage(&mut mailbox, &key(5), message, 0).await.unwrap();
         assert!(mailbox.changes.is_empty(), "dry-run changed the mailbox");
         (outcome, store)
     }
@@ -1882,6 +1929,71 @@ mod tests {
         assert_eq!(outcome, Outcome::Skipped(SkipReason::OwnAddress));
         assert_eq!(decider.calls.load(Ordering::SeqCst), 0);
         assert!(!store.lock().unwrap().is_processed(&key(5)).unwrap());
+    }
+
+    /// A message with the given Message-ID and extra header lines, from a stranger.
+    fn stranger_with(message_id: &str, extra_headers: &str) -> ParsedMessage {
+        let raw = format!(
+            "From: Mallory <mallory@evil.example>\r\nTo: me@example.org\r\n\
+             Subject: Daily triage\r\nMessage-ID: <{message_id}>\r\n{extra_headers}\r\n\
+             Please reply.\r\n"
+        );
+        parse_message(raw.as_bytes(), None, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_digest_we_appended_is_skipped_by_its_message_id() {
+        let decider = FakeDecider::answering(reply_needed());
+        let digest = stranger_with("abc123@lets-triage-mail.invalid", "");
+        let (outcome, store) = run_triage_message(
+            &decider,
+            |store| {
+                store
+                    .begin_digest_message("test", "abc123@lets-triage-mail.invalid", "INBOX")
+                    .unwrap();
+            },
+            "me@example.org",
+            &digest,
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Skipped(SkipReason::OwnDigest));
+        assert_eq!(decider.calls.load(Ordering::SeqCst), 0);
+        // Not classified, so it does not show up in the next digest either.
+        assert!(!store.lock().unwrap().is_processed(&key(5)).unwrap());
+    }
+
+    /// A sender can write any header. A stranger's message that *claims* to be a digest is
+    /// classified like any other mail.
+    #[tokio::test]
+    async fn a_forged_digest_header_does_not_skip_the_message() {
+        let decider = FakeDecider::answering(reply_needed());
+        let forged = stranger_with(
+            "forged@lets-triage-mail.invalid",
+            "X-Lets-Triage-Mail: digest\r\n",
+        );
+        let (outcome, store) =
+            run_triage_message(&decider, |_| {}, "me@example.org", &forged).await;
+        assert_eq!(outcome, Outcome::Processed);
+        assert_eq!(decider.calls.load(Ordering::SeqCst), 1);
+        assert!(store.lock().unwrap().is_processed(&key(5)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_digest_of_another_account_does_not_skip_the_message() {
+        let decider = FakeDecider::answering(reply_needed());
+        let message = stranger_with("abc123@lets-triage-mail.invalid", "");
+        let (outcome, _) = run_triage_message(
+            &decider,
+            |store| {
+                store
+                    .begin_digest_message("other", "abc123@lets-triage-mail.invalid", "INBOX")
+                    .unwrap();
+            },
+            "me@example.org",
+            &message,
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Processed);
     }
 
     // ---- setting flags (task 4.1) --------------------------------------------------------

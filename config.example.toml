@@ -75,13 +75,18 @@ enabled = true
 colour = "gray"
 name = "Unsure"
 
+# The daily summary, written into each mailbox with IMAP APPEND (unread). If the Mac was asleep
+# at the time, it is written on wake. An account in dry-run is never appended to: its digest is
+# saved as a file in a `digests` folder next to the database, so you can preview it.
 [digest]
 # Local time of day (24 hours, HH:MM) when the daily digest email is written.
 time = "07:00"
-# The mailbox the digest is added to. INBOX makes sure you notice it.
+# The mailbox the digest is added to. INBOX makes sure you notice it. The folder must exist: the
+# service never creates folders (`check` tells you).
 folder = "INBOX"
 # The From header of the digest. Optional.
 # from = "Let's Triage Mail <triage@example.com>"
+# Only English ("en") exists in v1; any other value is an error.
 language = "en"
 
 [storage]

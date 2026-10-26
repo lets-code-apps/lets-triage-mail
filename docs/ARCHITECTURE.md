@@ -38,8 +38,10 @@ src/
     session.rs       # connect, TLS, capabilities, folder resolution (special-use, delimiter, namespace)
     worker.rs        # per-account loop: IDLE, fetch new UIDs, apply flags, auto-clear pass
   digest/
-    build.rs         # gather last-24h data, call LLM for summaries, render text + HTML
-    schedule.rs      # daily time, catch-up after sleep
+    build.rs         # stored rows -> digest model (pure); uses the stored verdict reasons, no model call
+    render.rs        # model -> text + escaped HTML -> multipart/alternative (mail-builder)
+    schedule.rs      # next_step (pure), the daily loop, catch-up after sleep
+    deliver.rs       # period, APPEND (or a preview file for a dry-run account), own-digest records
 contrib/launchd.plist
 tests/               # integration tests against a real IMAP server
 ```

@@ -44,17 +44,35 @@ gets moved.
   `last_digest_date` per account so a day is never duplicated.
 - Message: `From: Let's Triage Mail <lets-triage-mail@localhost>` (configurable), `To:` the account address,
   a proper `Date`, a unique `Message-ID`, and `multipart/alternative` (plain text plus simple HTML
-  that works in light and dark mode). Appended **without** `\Seen` so it notifies.
-- Content, roughly:
-  1. **Needs you**: everything flagged in the last 24 h, grouped by colour, one line each
-     (sender, subject, one-sentence model summary, deadline/amount if known)
-  2. **Newsletters**: a few bullets summarizing what arrived (generative model)
-  3. **Noise stats**: counts per category ("41 marketing, 12 cold outreach, 3 spam"), top noisy senders
-  4. **Unsure**: items the model was not confident about
-- The summaries come from the local generative model. Never include raw bodies beyond short
-  excerpts, and never include remote images (digest HTML must not load anything external).
-- The digest itself is skipped by the classifier (match on our own Message-ID domain plus a header,
-  e.g. `X-Lets-Triage-Mail: digest`).
+  that works in light and dark mode). Appended **without** `\Seen` so it notifies. Subject:
+  `Daily triage — <account> — <YYYY-MM-DD>`.
+- Period: from the previous digest to now (the last 24 h for the first one), never more than
+  48 h, so a week away does not produce a wall of text.
+- Content:
+  1. **Needs you**: everything flagged (or, in dry-run, would-be flagged) in the period, grouped
+     by flag in priority order (Reply needed, Deadline, To pay, Bookkeeping, Unsure), one entry
+     each: sender, subject, the model's one-sentence reason, the time, and the date for a
+     Deadline. At most 25 per flag; the rest is a count.
+  2. **The rest**: counts of newsletters, marketing and cold outreach with the noisiest senders
+     (two or more messages), counts of spam and phishing, and one count of other mail.
+  An empty day still produces a short digest ("Nothing needed your attention"), so a missing
+  digest means the service is down.
+- **English only in v1:** `[digest] language` must be `en` (or `en-GB` and the like); any other
+  value is a config error, not a silent fallback.
+- **No model calls.** Message bodies are never stored, so a fresh summary would need the mail
+  again. Each line uses the `reason` the model wrote while classifying. Never include raw
+  bodies, and never include remote images (digest HTML loads nothing external). Everything
+  that came from email is escaped in the HTML and flattened to one line in the text.
+- **Accounts:** the digest follows the account's mode. An account in dry-run (its own `dry_run`,
+  else `[policy] dry_run`) is **never appended to**: its digest is saved as
+  `<data dir>/digests/<account>-<date>.eml` (next to `state.db`, 0600, the newest 14 kept) and
+  logged, so you can preview it, and it says which flags *would* have been set. Every other
+  account gets the APPEND, including one with `flagging = false` (there the digest is the main
+  output: its would-be flags are derived from the stored verdicts).
+- **The digest is never classified.** The worker skips exactly the messages it appended: the
+  server's `APPENDUID` (UIDPLUS) is recorded, and the random `Message-ID` as a fallback. The
+  `X-Lets-Triage-Mail: digest` header is only a label for people and filters, because a sender
+  can write any header and use it to slip past the classifier.
 
 ## 3. Config (TOML, `~/.config/lets-triage-mail/config.toml`)
 
@@ -75,7 +93,7 @@ lets-triage-mail run                       # daemon: watch accounts, flag, send 
 lets-triage-mail check                     # test model + each account; show caps (IDLE, MOVE, UIDPLUS, keywords allowed), folders
 lets-triage-mail classify FILE.eml         # dry classification of one message, prints verdict + chosen flag
 lets-triage-mail backfill [--days 7] [--account X]   # same pipeline over the last N days, oldest first; never moves the worker's position
-lets-triage-mail digest [--account X] [--dry]         # build/print or append a digest immediately
+lets-triage-mail digest [--account X] [--dry]         # --dry: print the text, change nothing; else deliver now (append, or a file for a dry-run account)
 lets-triage-mail stats [--days 7]
 lets-triage-mail rules list|allow|block|remove PATTERN
 ```

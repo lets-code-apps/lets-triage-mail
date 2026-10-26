@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use lets_triage_mail::check::{self, CheckItem, Report};
+use lets_triage_mail::check::{self, CheckItem, DigestCheck, Report};
 use lets_triage_mail::config::{AccountConfig, Config};
 
 /// Runs the checks and prints the report. Fails (non-zero exit code) if anything failed.
@@ -41,7 +41,12 @@ pub async fn run(config_path: &Path, account: Option<&str>, json: bool) -> anyho
     finish_section(&mut report, check::probe_model(&config.llm).await, json);
 
     for account in accounts {
-        finish_section(&mut report, check::probe_account(account).await, json);
+        let digest = DigestCheck::for_account(&config, account);
+        finish_section(
+            &mut report,
+            check::probe_account(account, &digest).await,
+            json,
+        );
     }
 
     conclude(&report, json)
