@@ -21,3 +21,4 @@ CLAUDE.local.md
 /tmp/
 *.eml
 !tests/fixtures/*.eml
+/.vscode/
