@@ -267,7 +267,8 @@ pub struct DigestConfig {
     pub folder: String,
     /// The `From` header of the digest. `None` lets the digest code pick a default.
     pub from: Option<String>,
-    /// Language of the digest text, as a short code such as `en`.
+    /// Language of the digest text, as a short code. Only `en` is supported in v1; any other
+    /// value is a config error.
     pub language: String,
 }
 
@@ -283,6 +284,13 @@ impl Default for DigestConfig {
 }
 
 impl DigestConfig {
+    /// Whether `language` is English: `en`, or a regional form such as `en-GB` or `en_US`,
+    /// in any case.
+    pub fn language_is_supported(&self) -> bool {
+        let language = self.language.trim().to_ascii_lowercase();
+        language == "en" || language.starts_with("en-") || language.starts_with("en_")
+    }
+
     /// The configured time as `(hour, minute)`. Always `Some` after [`Config::validate`].
     pub fn time_of_day(&self) -> Option<(u8, u8)> {
         let (hours, minutes) = self.time.split_once(':')?;
@@ -748,8 +756,16 @@ impl Config {
         if digest.from.as_deref().is_some_and(|f| f.trim().is_empty()) {
             return Err(ConfigError::invalid("digest.from", "must not be empty"));
         }
-        if digest.language.trim().is_empty() {
-            return Err(ConfigError::invalid("digest.language", "must not be empty"));
+        if !digest.language_is_supported() {
+            // Rejected instead of ignored with a warning: a config that says "pl" and then
+            // quietly gets English is a surprise, and an error at startup is not.
+            return Err(ConfigError::invalid(
+                "digest.language",
+                format!(
+                    "only English (\"en\") is supported in v1, got \"{}\"",
+                    digest.language
+                ),
+            ));
         }
         Ok(())
     }
@@ -1041,6 +1057,21 @@ mod tests {
         );
         assert_eq!(config.flag_name(TriageFlag::ToPay), "Bills");
         assert_eq!(config.flag_name(TriageFlag::Unsure), "Unsure");
+    }
+
+    #[test]
+    fn only_english_is_accepted_for_the_digest() {
+        for good in ["en", "EN", "en-GB", "en_US"] {
+            assert!(
+                Config::parse(&format!("[digest]\nlanguage = \"{good}\"\n")).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in ["pl", "de", "", "english", "enx"] {
+            let message = error_of(&format!("[digest]\nlanguage = \"{bad}\"\n"));
+            assert!(message.contains("digest.language"), "{bad}: {message}");
+            assert!(message.contains("only English"), "{bad}: {message}");
+        }
     }
 
     #[test]
