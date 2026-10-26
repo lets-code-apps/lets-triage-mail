@@ -22,6 +22,15 @@
 | 2026-10-26 | Only "Reply needed" and "Deadline" clear themselves | As in FLAGS.md; "To pay", "Bookkeeping" and "Unsure" wait for the user. A deadline flag stays through the deadline day. An unreadable date never clears. |
 | 2026-10-26 | `backfill` never writes the worker's position | A backfill that moved the cursor backwards would re-read mail, forwards would skip new mail. The `processed` table is enough to skip what was handled. |
 | 2026-10-26 | IMAP folder names are decoded for display only, by a hand-written decoder | `[Gmail]/Wys&AUI-ane` is unreadable in `check`. The server needs the raw name, so there is no encoder. About 40 lines did not justify a dependency. |
+| 2026-10-26 | **The digest is English only** in v1; `[digest] language` other than `en` is a config error | A digest in a language the strings do not exist for is a silent wrong answer. Rejecting at startup is clearer than ignoring with a warning. The key stays so translations can come later. |
+| 2026-10-26 | **No model calls for the digest**; each line uses the stored verdict `reason`. Changes PLAN 5.1 | Bodies are never stored, so re-summarising means re-fetching mail and a second model pass per message. The `reason` is already a one-sentence summary written when the mail was classified. |
+| 2026-10-26 | A **dry-run account is never appended to**; its digest is a 0600 file under `<data dir>/digests/` (newest 14 kept) | Dry-run promises the mailbox is not written. The file lets the owner preview the digest first. Accounts that are not dry-run, classify-only ones included, get the APPEND: for wp.pl the digest is the main output. |
+| 2026-10-26 | The worker skips its own digest **by recorded UID (APPENDUID) and random Message-ID, not by header** | A sender can write `X-Lets-Triage-Mail: digest` and slip past the classifier. The Message-ID is stored before the APPEND (the worker can see the mail before we get the server's answer) and the UID after it. |
+| 2026-10-26 | An **empty day still gets a digest** | A silent day cannot be told from a dead service. |
+| 2026-10-26 | A digest covers **the time since the previous one, at most 48 h** | Nothing is reported twice or missed; after a long absence the last two days are what is still worth reading. `stats` has the rest. |
+| 2026-10-26 | The digest loop **polls the clock every minute** instead of sleeping until the time | A monotonic timer does not advance while the Mac sleeps, so a long sleep would end late. The poll costs one small read and gives catch-up after wake for free. |
+| 2026-10-26 | `APPEND` is written by hand in `ImapSession::append_message`, not with `async-imap`'s `append` | That one discards the server's final answer, which holds the `APPENDUID`. Checked against a scripted fake server because Dovecot runs in CI only. |
+| 2026-10-26 | `mail-builder` 2 for the message, `getrandom` for the Message-ID | The builder's own ids and boundaries are only pseudo-unique; the digest's Message-ID must be unguessable, since the worker trusts it. |
 
 ## Rejected or parked options
 
