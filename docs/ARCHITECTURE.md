@@ -42,7 +42,7 @@ src/
     render.rs        # model -> text + escaped HTML -> multipart/alternative (mail-builder)
     schedule.rs      # next_step (pure), the daily loop, catch-up after sleep
     deliver.rs       # period, APPEND (or a preview file for a dry-run account), own-digest records
-contrib/launchd.plist
+contrib/launchd/io.github.lets-code-apps.lets-triage-mail.plist
 tests/               # integration tests against a real IMAP server
 ```
 
