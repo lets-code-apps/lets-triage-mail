@@ -7,6 +7,8 @@
 
 mod cli;
 
+use std::io::IsTerminal;
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -37,5 +39,7 @@ fn init_logging(verbosity: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Colour codes are noise in a log file (launchd, `> file`); keep them for terminals only.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
