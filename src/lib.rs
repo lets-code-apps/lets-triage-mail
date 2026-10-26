@@ -8,6 +8,7 @@ pub mod config;
 pub mod decider;
 pub mod engine;
 pub mod evidence;
+pub mod flagging;
 pub mod flags;
 pub mod imap;
 pub mod message;
