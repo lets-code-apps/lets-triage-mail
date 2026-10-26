@@ -25,12 +25,27 @@ pub enum FlagColour {
 }
 
 /// The flag changes needed to give a message a colour, ready for an IMAP `STORE`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreChange {
     /// Flags to add with `+FLAGS`.
     pub add: Vec<&'static str>,
     /// Flags to remove with `-FLAGS`, so no stale bit from an earlier colour is left behind.
     pub remove: Vec<&'static str>,
+}
+
+/// The change that takes a coloured flag off a message again: one `-FLAGS` removing `\Flagged`
+/// and all three colour keywords.
+///
+/// It names every bit, not only the ones the colour used, so nothing stale survives. Only the
+/// service's own flags may be cleared (the caller checks the ownership record first); this
+/// function just builds the change.
+pub fn clear_change() -> StoreChange {
+    let mut remove = vec![FLAGGED];
+    remove.extend(BIT_KEYWORDS);
+    StoreChange {
+        add: Vec::new(),
+        remove,
+    }
 }
 
 impl FlagColour {
@@ -155,6 +170,21 @@ mod tests {
     #[test]
     fn red_is_never_set() {
         assert_eq!(FlagColour::Red.store_change(), None);
+    }
+
+    #[test]
+    fn clearing_removes_flagged_and_every_bit_and_adds_nothing() {
+        let change = clear_change();
+        assert!(change.add.is_empty());
+        assert_eq!(
+            change.remove,
+            [
+                "\\Flagged",
+                "$MailFlagBit0",
+                "$MailFlagBit1",
+                "$MailFlagBit2"
+            ]
+        );
     }
 
     #[test]

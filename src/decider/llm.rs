@@ -480,7 +480,10 @@ fn parse_verdict(text: &str) -> Result<Verdict, DecideError> {
     };
     let deadline = match value.get("deadline") {
         None | Some(Value::Null) => None,
-        Some(Value::String(date)) if is_valid_date(date.trim()) => Some(date.trim().to_owned()),
+        Some(Value::String(date)) => match parse_date(date.trim()) {
+            Some(date) => Some(date),
+            None => return Err(invalid(format!("deadline is not YYYY-MM-DD: {date:?}"))),
+        },
         Some(other) => return Err(invalid(format!("deadline is not YYYY-MM-DD: {other}"))),
     };
     let payment = match value.get("payment") {
@@ -548,31 +551,23 @@ fn parse_confidence(value: Option<&Value>) -> Result<f32, DecideError> {
     Ok(number.clamp(0.0, 1.0) as f32)
 }
 
-/// Whether `text` is a real calendar date written `YYYY-MM-DD`.
-fn is_valid_date(text: &str) -> bool {
+/// Reads a calendar date written exactly `YYYY-MM-DD`; `None` for anything else, including
+/// impossible dates such as 2026-02-30.
+///
+/// The shape is checked by hand first because `jiff` is lenient: its parser also accepts a
+/// full timestamp and would silently drop the time. A deadline from the model should be
+/// exactly what the prompt asked for.
+fn parse_date(text: &str) -> Option<jiff::civil::Date> {
     let parts: Vec<&str> = text.split('-').collect();
     let [year, month, day] = parts.as_slice() else {
-        return false;
+        return None;
     };
     let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
     if !(digits(year, 4) && digits(month, 2) && digits(day, 2)) {
-        return false;
+        return None;
     }
-    // The digit checks above make these parses infallible.
-    let (year, month, day): (u32, u32, u32) = (
-        year.parse().unwrap_or(0),
-        month.parse().unwrap_or(0),
-        day.parse().unwrap_or(0),
-    );
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1..=days_in_month).contains(&day)
+    // The digit checks make these parses infallible; `Date::new` rejects impossible dates.
+    jiff::civil::Date::new(year.parse().ok()?, month.parse().ok()?, day.parse().ok()?).ok()
 }
 
 /// Removes `<think>...</think>` blocks, which reasoning models put before the answer. An
@@ -738,7 +733,7 @@ mod tests {
         )
         .unwrap();
         assert!(v.needs_reply);
-        assert_eq!(v.deadline.as_deref(), Some("2026-11-30"));
+        assert_eq!(v.deadline, Some(jiff::civil::date(2026, 11, 30)));
         assert_eq!(v.payment, Payment::Unpaid);
     }
 
@@ -765,11 +760,16 @@ mod tests {
 
     #[test]
     fn validates_dates() {
-        assert!(is_valid_date("2028-02-29"));
-        assert!(!is_valid_date("2027-02-29"));
-        assert!(!is_valid_date("2026-13-01"));
-        assert!(!is_valid_date("26-01-01"));
-        assert!(!is_valid_date("2026-1-01"));
+        assert!(parse_date("2028-02-29").is_some());
+        assert!(parse_date("2027-02-29").is_none());
+        assert!(parse_date("2026-13-01").is_none());
+        assert!(parse_date("26-01-01").is_none());
+        assert!(parse_date("2026-1-01").is_none());
+        assert!(parse_date("2026-11-30T10:00").is_none());
+        assert_eq!(
+            parse_date("2026-11-30"),
+            Some(jiff::civil::date(2026, 11, 30))
+        );
     }
 
     // --- prompt ---

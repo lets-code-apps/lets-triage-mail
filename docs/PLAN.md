@@ -231,11 +231,26 @@ Phase 2 can start as soon as phase 0 is done, in parallel with phase 1.
 
 ## Phase 4: Flagging → milestone C
 
+**Status (2026-10-26): 4.0 to 4.3 are built; milestone C (a live account watched in Apple Mail
+on Mac and iPhone) is still to be run.** The Dovecot tests for this phase were written but, as
+always, run in CI only.
+
+### 4.0 Per-account dry-run (added)
+- `[[accounts]] dry_run = false` overrides `[policy] dry_run` for that account (`AccountConfig::
+  dry_run`, `flag_mode`). The owner goes live on one low-volume Zoho account while wp.pl and
+  Gmail stay in dry-run. `flagging = false` still wins: such an account is never written to.
+- A live account whose mailbox lacks custom keywords is a fatal error at worker connect
+  (`WorkerError::LiveWithoutKeywords`), not only a `check` failure.
+- *Done.*
+
 ### 4.1 Apply flags
 - When `dry_run = false`: one `UID STORE +FLAGS (\Flagged $MailFlagBit…)` plus `-FLAGS` for stale
   bits, from `FlagColour::store_change`. Record ownership in the same step; if the STORE fails,
   record nothing.
 - Never touch a message the user already flagged (re-check FLAGS right before the STORE).
+- *Done.* `Ctx::set_flag` in `imap/worker.rs`; the decision is `flagging::plan_apply`. Removing
+  stale bits and adding the new ones are two commands (`-FLAGS` then `+FLAGS`): IMAP cannot
+  do both in one, and the order never shows two colours at once.
 
 ### 4.2 Auto-clear pass
 - Periodically, for flags we own: re-fetch FLAGS first. If they differ from what we set, mark the
@@ -246,10 +261,18 @@ Phase 2 can start as soon as phase 0 is done, in parallel with phase 1.
 - Clearing removes `\Flagged` and our bits in one STORE.
 - *Tests:* user changed the colour → user-owned and untouched; user unflagged → untouched forever;
   reply in Sent → cleared.
+- *Done.* The pass runs on the worker's own wake-ups, at most every 15 minutes (`WorkerTiming::
+  clear_interval`): same connection, no second task that could race on a STORE. Only "Reply
+  needed" and "Deadline" clear themselves. The Sent harvest now also stores the ids from
+  `In-Reply-To`/`References` (table `sent_replies`), and the pass refreshes it first. Dry-run
+  accounts only log "would clear". A UIDVALIDITY change drops the ownership records of the old
+  numbering without any STORE.
 
 ### 4.3 `backfill [--days N] [--account X]`
 - Process older inbox mail through the same pipeline, oldest first, respecting dry-run and
   the model semaphore.
+- *Done.* `UID SEARCH SINCE`, then `Ctx::process_message` per message. It never writes the
+  worker's `mailbox_state`.
 
 **Milestone C check:** turn off dry-run on one account; watch Apple Mail on Mac and iPhone.
 

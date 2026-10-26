@@ -316,6 +316,29 @@ pub enum Tls {
     None,
 }
 
+/// What the service may do to one account's mailbox. Worked out by [`AccountConfig::flag_mode`]
+/// from `flagging` and `dry_run`; the one place that combines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagMode {
+    /// Flags are set and cleared on the server.
+    Live,
+    /// Mail is classified and the would-be flags are logged; nothing is written.
+    DryRun,
+    /// `flagging = false`: mail is classified for the digest only, and no flag is chosen.
+    ClassifyOnly,
+}
+
+impl FlagMode {
+    /// A short name for logs and `check` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlagMode::Live => "live",
+            FlagMode::DryRun => "dry-run",
+            FlagMode::ClassifyOnly => "classify-only",
+        }
+    }
+}
+
 /// One `[[accounts]]` entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -354,6 +377,13 @@ pub struct AccountConfig {
     /// known ones (`unknown variant ..., expected wp`).
     #[serde(default)]
     pub provider_headers: Option<ProviderHeaders>,
+    /// Overrides `[policy] dry_run` for this account. `None` means "follow the policy".
+    ///
+    /// This lets one low-volume account go live while the others stay in dry-run. The
+    /// override works in both directions, but the safe use is `dry_run = false` on a single
+    /// account whose results you have reviewed with `stats`.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 fn default_flagging() -> bool {
@@ -423,6 +453,30 @@ pub fn password_env_var(account_name: &str) -> String {
 }
 
 impl AccountConfig {
+    /// Whether this account is in dry-run: the account's own `dry_run` if set, otherwise the
+    /// global `[policy] dry_run`. Every place that asks "may we change this mailbox?" goes
+    /// through here, so the per-account override cannot be forgotten somewhere.
+    pub fn dry_run(&self, policy: &PolicyConfig) -> bool {
+        self.dry_run.unwrap_or(policy.dry_run)
+    }
+
+    /// What the service does on this account. `flagging = false` wins over everything: such
+    /// an account is never written to, whatever `dry_run` says.
+    pub fn flag_mode(&self, policy: &PolicyConfig) -> FlagMode {
+        if !self.flagging {
+            FlagMode::ClassifyOnly
+        } else if self.dry_run(policy) {
+            FlagMode::DryRun
+        } else {
+            FlagMode::Live
+        }
+    }
+
+    /// Whether the service really writes flags on this account.
+    pub fn writes_flags(&self, policy: &PolicyConfig) -> bool {
+        self.flag_mode(policy) == FlagMode::Live
+    }
+
     /// The IMAP port: the configured one, or the standard port for the TLS mode.
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(match self.tls {
@@ -865,6 +919,42 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let message = error_of("[policy]\nmin_confidnce = 0.5\n");
         assert!(message.contains("min_confidnce"), "{message}");
+    }
+
+    const ACCOUNT_A: &str = "[[accounts]]\nname = \"a\"\nhost = \"h\"\nusername = \"u\"\n";
+
+    #[test]
+    fn account_dry_run_overrides_the_policy_in_both_directions() {
+        let config = Config::parse(&format!(
+            "[policy]\ndry_run = true\n{ACCOUNT_A}\
+             [[accounts]]\nname = \"b\"\nhost = \"h\"\nusername = \"u\"\ndry_run = false\n"
+        ))
+        .unwrap();
+        let (a, b) = (&config.accounts[0], &config.accounts[1]);
+        assert!(a.dry_run(&config.policy), "no override: follows the policy");
+        assert!(!b.dry_run(&config.policy), "account override: live");
+        assert!(!a.writes_flags(&config.policy));
+        assert!(b.writes_flags(&config.policy));
+        assert_eq!(a.flag_mode(&config.policy), FlagMode::DryRun);
+        assert_eq!(b.flag_mode(&config.policy), FlagMode::Live);
+
+        let live = Config::parse(&format!(
+            "[policy]\ndry_run = false\n{ACCOUNT_A}dry_run = true\n"
+        ))
+        .unwrap();
+        assert!(live.accounts[0].dry_run(&live.policy), "can stay safe");
+    }
+
+    #[test]
+    fn flagging_off_never_writes_whatever_dry_run_says() {
+        let config = Config::parse(&format!(
+            "[policy]\ndry_run = false\n{ACCOUNT_A}flagging = false\n"
+        ))
+        .unwrap();
+        let account = &config.accounts[0];
+        assert!(!account.dry_run(&config.policy));
+        assert!(!account.writes_flags(&config.policy));
+        assert_eq!(account.flag_mode(&config.policy), FlagMode::ClassifyOnly);
     }
 
     #[test]

@@ -15,6 +15,13 @@
 | 2026-10-25 | Laya decision model: **v2 candidate**, not v1 (pending confirmation) | Zero-shot accuracy near chance; needs our own labelled data plus calibration; can't do summaries/dates anyway. v1 logs labels to make that possible. See CLASSIFIER.md. |
 | 2026-10-25 | Name: **Let's Triage Mail** (`lets-triage-mail`), repo `lets-code-apps/lets-triage-mail` | MailGuard was crowded (~290 GitHub repos). Follows Piotr's "Let's ..." brand (from his company, Let's Code): `lets-<verb>-<object>` for services, `lets-<verb>` for tools. "Triage" covers flagging, digests and later spam filtering and unsubscribing, not just flags. Free on crates.io, Homebrew and GitHub on 2026-10-25. |
 | 2026-10-25 | **Post-v1 roadmap**: spam/security filtering to Junk/Trash, unsubscribing, drafted replies, home-assistant integration | The service should handle the whole inbox, and it is one microservice in Piotr's local assistant setup. v1 scope is unchanged. Drafts go to the Drafts folder via APPEND; the service never sends mail. See SPEC.md §5. |
+| 2026-10-26 | **Per-account `dry_run`** overrides `[policy] dry_run` | Go live on one low-volume account first, with the others still in dry-run. `flagging = false` still wins. |
+| 2026-10-26 | A live account **without custom keywords refuses to start** (fatal at connect, not just in `check`) | A bare `\Flagged` shows red in Apple Mail, and red is the user's. |
+| 2026-10-26 | The **auto-clear pass runs in the account worker** on its wake-ups (every 15 min at most), not on a separate timer or connection | One task per mailbox means no two STOREs can race on one message, the connection is already open, and nothing about clearing is urgent. |
+| 2026-10-26 | Ownership rows store the **flag kind and the deadline date**; Sent harvest stores **reply ids** | The colour is configurable, so it cannot say whether a flag is "Reply needed" or "Deadline". Ids only, no subjects or bodies. |
+| 2026-10-26 | Only "Reply needed" and "Deadline" clear themselves | As in FLAGS.md; "To pay", "Bookkeeping" and "Unsure" wait for the user. A deadline flag stays through the deadline day. An unreadable date never clears. |
+| 2026-10-26 | `backfill` never writes the worker's position | A backfill that moved the cursor backwards would re-read mail, forwards would skip new mail. The `processed` table is enough to skip what was handled. |
+| 2026-10-26 | IMAP folder names are decoded for display only, by a hand-written decoder | `[Gmail]/Wys&AUI-ane` is unreadable in `check`. The server needs the raw name, so there is no encoder. About 40 lines did not justify a dependency. |
 
 ## Rejected or parked options
 

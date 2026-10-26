@@ -96,7 +96,7 @@ pub enum RestartDecision {
 /// it can be transient on the server side (a password being rotated, a brief auth backend
 /// outage), so we try again, slowly: a wrong password must never be hammered, since many
 /// servers lock the account. Everything else that is fatal is a local problem that a restart
-/// would only repeat: flagging not implemented yet, a missing password, a broken database,
+/// would only repeat: a live account without custom keywords, a missing password, a broken database,
 /// an insecure-transport refusal, a worker panic.
 pub fn restart_decision(
     error: &WorkerError,
@@ -430,7 +430,9 @@ mod tests {
     #[test]
     fn local_problems_are_never_restarted() {
         for error in [
-            WorkerError::FlaggingNotImplemented,
+            WorkerError::LiveWithoutKeywords {
+                account: "a".into(),
+            },
             WorkerError::Config(crate::config::ConfigError::PasswordMissing {
                 account: "a".into(),
                 env_var: "X".into(),
@@ -513,10 +515,12 @@ mod tests {
     async fn supervise_gives_up_on_non_restartable_errors() {
         let shutdown = CancellationToken::new();
         let end = supervise("a", &shutdown, &timing(), || async {
-            Err(WorkerError::FlaggingNotImplemented)
+            Err(WorkerError::LiveWithoutKeywords {
+                account: "a".into(),
+            })
         })
         .await;
-        assert!(matches!(end, AccountEnd::GaveUp(reason) if reason.contains("phase 4")));
+        assert!(matches!(end, AccountEnd::GaveUp(reason) if reason.contains("custom keywords")));
     }
 
     #[tokio::test(start_paused = true)]

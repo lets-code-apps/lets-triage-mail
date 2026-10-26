@@ -17,6 +17,17 @@
   3. model → category + `needs_reply` + `deadline` + `payment` + confidence
 - Then map to a flag colour per `FLAGS.md`, set the flag, and record it.
 - **dry_run (default on):** classify and log, set nothing. The user flips it off after reviewing.
+  `[policy] dry_run` is the default for every account; an account's own `dry_run` overrides it,
+  so one low-volume account can go live while the others stay in dry-run. An account with
+  `flagging = false` is never written to, whatever `dry_run` says. A live account whose mailbox
+  lacks custom keywords (PERMANENTFLAGS without `\*`) refuses to start: a bare `\Flagged` shows
+  red in Apple Mail and red is the user's.
+- **Setting a flag:** the flags are re-read right before the `STORE`; a message that is already
+  flagged is left alone. Ownership is recorded only after the `STORE` succeeded.
+- **Auto-clear:** about every 15 minutes the worker looks at the flags it set. If one no longer
+  matches what was set, the user changed it and the message is never touched again. "Reply
+  needed" clears when the reply is in Sent (`In-Reply-To`/`References`), "Deadline" the day after
+  its date; nothing else clears itself.
 - If the model is down or returns garbage, **do nothing** to the message, log it, and retry later
   (keep a retry queue; don't silently skip).
 
@@ -50,7 +61,7 @@ gets moved.
 Sections: `[llm]` (base_url, model, timeout, max_body_chars, max_concurrent=1), `[policy]`
 (dry_run, min_confidence, known_senders_from_sent, authserv_id), `[flags.*]` (enabled, colour,
 name), `[digest]` (time, folder, from, language), `[[accounts]]` (name, host, port, tls, username,
-password_command, inbox, sent_folder).
+password_command, inbox, sent_folder, flagging, dry_run, provider_headers).
 
 - Passwords: `password_command` (macOS: `security find-generic-password -s lets-triage-mail -a <acct> -w`)
   or env var `<NAME>_PASSWORD_<ACCOUNT>`. Never store passwords in the config or the DB.
@@ -63,7 +74,7 @@ password_command, inbox, sent_folder).
 lets-triage-mail run                       # daemon: watch accounts, flag, send digests
 lets-triage-mail check                     # test model + each account; show caps (IDLE, MOVE, UIDPLUS, keywords allowed), folders
 lets-triage-mail classify FILE.eml         # dry classification of one message, prints verdict + chosen flag
-lets-triage-mail backfill [--days 7] [--account X]
+lets-triage-mail backfill [--days 7] [--account X]   # same pipeline over the last N days, oldest first; never moves the worker's position
 lets-triage-mail digest [--account X] [--dry]         # build/print or append a digest immediately
 lets-triage-mail stats [--days 7]
 lets-triage-mail rules list|allow|block|remove PATTERN

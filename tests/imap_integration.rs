@@ -15,7 +15,9 @@ use lets_triage_mail::config::{AccountConfig, Config};
 use lets_triage_mail::decider::{DecideError, Decider, Evidence};
 use lets_triage_mail::engine::{Category, Payment, Verdict};
 use lets_triage_mail::flags::{FlagColour, StoreChange};
-use lets_triage_mail::imap::worker::{WorkerError, WorkerTiming, run_account_with_timing};
+use lets_triage_mail::imap::worker::{
+    WorkerError, WorkerTiming, backfill_account, run_account_with_timing,
+};
 use lets_triage_mail::imap::{ImapError, ImapSession, ImapSettings, TlsMode};
 use lets_triage_mail::senders::{Skipped, harvest_known_senders};
 use lets_triage_mail::store::{MailboxState, MessageKey, Store};
@@ -346,9 +348,14 @@ impl Decider for FakeDecider {
 /// The account config for the worker. The password comes from `password_command`, so the test
 /// does not have to change the process environment.
 fn worker_account(settings: &ImapSettings) -> AccountConfig {
+    worker_account_with(settings, "")
+}
+
+/// Same, with extra account settings such as `dry_run = false`.
+fn worker_account_with(settings: &ImapSettings, extra: &str) -> AccountConfig {
     let toml = format!(
         "name = \"test\"\nhost = \"{}\"\nport = {}\nusername = \"{}\"\ntls = \"none\"\n\
-         password_command = \"echo testpass\"\n",
+         password_command = \"echo testpass\"\n{extra}",
         settings.host, settings.port, settings.username
     );
     toml::from_str(&toml).expect("account config")
@@ -362,13 +369,30 @@ struct RunningWorker {
 }
 
 fn start_worker(settings: &ImapSettings, fail: bool, idle_renew: Duration) -> RunningWorker {
+    // `[policy] dry_run` keeps its default (on) and the account has no override.
+    start_worker_with(settings, fail, idle_renew, "")
+}
+
+/// A worker for an account with extra settings, for example `dry_run = false` to go live on
+/// that account only. `[policy] dry_run` stays at its default (on), which is the point of the
+/// per-account override. The clear pass runs every second so the tests need not wait long.
+fn start_worker_with(
+    settings: &ImapSettings,
+    fail: bool,
+    idle_renew: Duration,
+    account_extra: &str,
+) -> RunningWorker {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let shutdown = CancellationToken::new();
-    let (account, config) = (worker_account(settings), Config::default());
+    let (account, config) = (
+        worker_account_with(settings, account_extra),
+        Config::default(),
+    );
     assert!(config.policy.dry_run);
     let timing = WorkerTiming {
         idle_renew,
         poll_interval: Duration::from_secs(1),
+        clear_interval: Duration::from_secs(1),
         ..WorkerTiming::default()
     };
     let task = tokio::spawn({
@@ -558,6 +582,350 @@ async fn worker_queues_a_retry_when_the_model_fails() {
     assert!(!worker.is_processed(validity, 1));
     assert!(server_flags(&settings, 1).await.is_empty());
     worker.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flagging (tasks 4.1 and 4.2)
+// ---------------------------------------------------------------------------------------------
+
+/// APPEND one message to `folder`, with optional flags such as `(\\Flagged)`.
+async fn append_raw(settings: &ImapSettings, folder: &str, flags: Option<&str>, message: Vec<u8>) {
+    let session = ImapSession::connect(settings).await.expect("connect");
+    let mut raw = session.into_inner();
+    raw.append(folder, flags, None, message)
+        .await
+        .expect("append");
+    raw.logout().await.expect("logout");
+}
+
+/// The user's reply, as it would sit in Sent: it names the answered message in `In-Reply-To`.
+async fn append_reply_in_sent(settings: &ImapSettings, answered_message_id: &str) {
+    let message = format!(
+        "From: me@example.org\r\nTo: alice@example.org\r\nSubject: Re: hello\r\n\
+         Message-ID: <my-reply@tests.example.org>\r\n\
+         In-Reply-To: <{answered_message_id}>\r\nReferences: <{answered_message_id}>\r\n\
+         Date: Mon, 26 Oct 2026 10:00:00 +0000\r\n\r\nSure.\r\n"
+    );
+    append_raw(settings, "Sent", None, message.into_bytes()).await;
+}
+
+fn is_orange(flags: &[String]) -> bool {
+    FlagColour::from_flags(&as_strs(flags)) == Some(FlagColour::Orange)
+}
+
+fn owned_uids(worker: &RunningWorker) -> Vec<u32> {
+    worker
+        .store
+        .lock()
+        .unwrap()
+        .owned_flags("test", "INBOX")
+        .unwrap()
+        .iter()
+        .map(|flag| flag.key.uid)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_live_account_flags_new_mail_orange_and_records_ownership() {
+    let settings = fresh_account();
+    seed_inbox(&settings, &["old-one"]).await;
+
+    // Live on this account only: the policy stays in dry-run.
+    let worker = start_worker_with(
+        &settings,
+        false,
+        Duration::from_secs(1),
+        "dry_run = false\n",
+    );
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+    let validity = worker.state().unwrap().uidvalidity;
+
+    seed_inbox(&settings, &["needs-an-answer"]).await; // UID 2
+    wait_until(Duration::from_secs(15), "the message to be flagged", || {
+        worker.is_processed(validity, 2)
+    })
+    .await;
+
+    let flags = server_flags(&settings, 2).await;
+    assert!(is_orange(&flags), "flags on the server: {flags:?}");
+    assert_eq!(owned_uids(&worker), [2]);
+    // The old message is history: not flagged.
+    assert!(server_flags(&settings, 1).await.is_empty());
+    worker.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_message_the_user_already_flagged_is_left_untouched() {
+    let settings = fresh_account();
+    let worker = start_worker_with(
+        &settings,
+        false,
+        Duration::from_secs(1),
+        "dry_run = false\n",
+    );
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+
+    // Arrives already flagged (the user's red flag: \Flagged and no colour bits).
+    append_raw(
+        &settings,
+        "INBOX",
+        Some("(\\Flagged)"),
+        common::sample_message("user-flagged"),
+    )
+    .await;
+    // A second, plain message proves the worker got past the first one.
+    seed_inbox(&settings, &["plain"]).await;
+    let validity = worker.state().unwrap().uidvalidity;
+    wait_until(Duration::from_secs(15), "the plain message", || {
+        worker.is_processed(validity, 2)
+    })
+    .await;
+
+    assert_eq!(server_flags(&settings, 1).await, ["\\Flagged"]);
+    assert_eq!(owned_uids(&worker), [2], "only the plain message is ours");
+    worker.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_dry_run_account_and_a_flagging_off_account_store_nothing() {
+    for extra in ["dry_run = true\n", "dry_run = false\nflagging = false\n"] {
+        let settings = fresh_account();
+        let worker = start_worker_with(&settings, false, Duration::from_secs(1), extra);
+        wait_until(Duration::from_secs(10), "the first-run position", || {
+            worker.state().is_some()
+        })
+        .await;
+        let validity = worker.state().unwrap().uidvalidity;
+
+        seed_inbox(&settings, &["would-be-flagged"]).await;
+        wait_until(
+            Duration::from_secs(15),
+            "the message to be processed",
+            || worker.is_processed(validity, 1),
+        )
+        .await;
+        // Give a clear pass a chance too.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let flags = server_flags(&settings, 1).await;
+        assert!(flags.is_empty(), "{extra:?} must not store: {flags:?}");
+        assert!(owned_uids(&worker).is_empty());
+        worker.stop().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_colour_the_user_changed_becomes_user_owned_and_is_never_cleared() {
+    let settings = fresh_account();
+    let worker = start_worker_with(
+        &settings,
+        false,
+        Duration::from_secs(1),
+        "dry_run = false\n",
+    );
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+    let validity = worker.state().unwrap().uidvalidity;
+
+    seed_inbox(&settings, &["recoloured"]).await; // UID 1, Message-ID <recoloured@tests...>
+    wait_until(Duration::from_secs(15), "the message to be flagged", || {
+        owned_uids(&worker) == [1]
+    })
+    .await;
+
+    // The user changes the colour from orange to green in their mail client.
+    let mut session = ImapSession::connect(&settings).await.unwrap();
+    session.select_inbox().await.unwrap();
+    session
+        .store_flags(1, &FlagColour::Green.store_change().unwrap())
+        .await
+        .unwrap();
+    session.logout().await.unwrap();
+
+    wait_until(
+        Duration::from_secs(15),
+        "the flag to become user-owned",
+        || {
+            worker
+                .store
+                .lock()
+                .unwrap()
+                .is_user_owned(&inbox_key(validity, 1))
+                .unwrap()
+        },
+    )
+    .await;
+
+    // Even when the user replies, the service must not touch the green flag.
+    append_reply_in_sent(&settings, "recoloured@tests.example.org").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let flags = server_flags(&settings, 1).await;
+    assert_eq!(
+        FlagColour::from_flags(&as_strs(&flags)),
+        Some(FlagColour::Green),
+        "{flags:?}"
+    );
+    worker.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn a_reply_in_sent_clears_reply_needed() {
+    let settings = fresh_account();
+    let worker = start_worker_with(
+        &settings,
+        false,
+        Duration::from_secs(1),
+        "dry_run = false\n",
+    );
+    wait_until(Duration::from_secs(10), "the first-run position", || {
+        worker.state().is_some()
+    })
+    .await;
+
+    seed_inbox(&settings, &["please-answer"]).await; // UID 1
+    wait_until(Duration::from_secs(15), "the message to be flagged", || {
+        owned_uids(&worker) == [1]
+    })
+    .await;
+    assert!(is_orange(&server_flags(&settings, 1).await));
+
+    // Some time passes with no reply: the flag stays.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(is_orange(&server_flags(&settings, 1).await));
+
+    // The user answers from another device: the reply lands in Sent.
+    append_reply_in_sent(&settings, "please-answer@tests.example.org").await;
+
+    wait_until(Duration::from_secs(20), "the flag to be cleared", || {
+        owned_uids(&worker).is_empty()
+    })
+    .await;
+    let flags = server_flags(&settings, 1).await;
+    assert!(
+        !flags.iter().any(|f| f.eq_ignore_ascii_case("\\Flagged")),
+        "still flagged: {flags:?}"
+    );
+    assert!(
+        !flags.iter().any(|f| f.starts_with("$MailFlagBit")),
+        "colour bits left behind: {flags:?}"
+    );
+    worker.stop().await;
+}
+
+/// The `backfill` pipeline over mail that is already in the inbox.
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn backfill_processes_recent_mail_and_leaves_the_workers_position_alone() {
+    use jiff::ToSpan;
+
+    let settings = fresh_account();
+    seed_inbox(&settings, &["one", "two", "three"]).await;
+
+    // The worker has been here before and stands at UID 3 of this mailbox.
+    let mut session = ImapSession::connect(&settings).await.unwrap();
+    let validity = session.select_inbox().await.unwrap().uid_validity;
+    session.logout().await.unwrap();
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    store
+        .lock()
+        .unwrap()
+        .set_mailbox_state("test", "INBOX", validity, 3)
+        .unwrap();
+
+    let account = worker_account_with(&settings, "dry_run = false\n");
+    let config = Config::default();
+    let since = jiff::Zoned::now().date().checked_sub(1.day()).unwrap();
+    let run = |store: Arc<Mutex<Store>>| {
+        backfill_account(
+            &account,
+            &config,
+            Arc::new(FakeDecider { fail: false }),
+            store,
+            CancellationToken::new(),
+            since,
+        )
+    };
+
+    let report = run(Arc::clone(&store)).await.unwrap();
+    assert_eq!((report.found, report.processed), (3, 3), "{report:?}");
+    for uid in 1..=3 {
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .is_processed(&inbox_key(validity, uid))
+                .unwrap(),
+            "UID {uid}"
+        );
+        assert!(is_orange(&server_flags(&settings, uid).await), "UID {uid}");
+    }
+    // The cursor did not move, backwards or forwards.
+    let state = store
+        .lock()
+        .unwrap()
+        .mailbox_state("test", "INBOX")
+        .unwrap()
+        .unwrap();
+    assert_eq!((state.uidvalidity, state.last_uid), (validity, 3));
+
+    // A second run finds everything handled already.
+    let again = run(Arc::clone(&store)).await.unwrap();
+    assert_eq!(
+        (again.found, again.processed, again.skipped),
+        (3, 0, 3),
+        "{again:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn backfill_on_a_dry_run_account_changes_nothing_on_the_server() {
+    use jiff::ToSpan;
+
+    let settings = fresh_account();
+    seed_inbox(&settings, &["one", "two"]).await;
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    // No override: the account follows `[policy] dry_run`, which is on.
+    let account = worker_account(&settings);
+    let config = Config::default();
+    let since = jiff::Zoned::now().date().checked_sub(1.day()).unwrap();
+
+    let report = backfill_account(
+        &account,
+        &config,
+        Arc::new(FakeDecider { fail: false }),
+        Arc::clone(&store),
+        CancellationToken::new(),
+        since,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.processed, 2, "{report:?}");
+    for uid in 1..=2 {
+        assert!(server_flags(&settings, uid).await.is_empty());
+    }
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .owned_flags("test", "INBOX")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The supervisor, driven directly (the CLI builds a real `LlmDecider`, which cannot be faked

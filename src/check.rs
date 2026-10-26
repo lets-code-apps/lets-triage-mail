@@ -26,11 +26,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{AccountConfig, LlmConfig, password_env_var};
+use crate::config::{AccountConfig, Config, FlagMode, LlmConfig, password_env_var};
 use crate::decider::{
     AuthResult, DecideError, Decider, Evidence, LlmDecider, LlmSettings, install_tls_provider,
 };
-use crate::imap::{ImapError, ImapSession, ImapSettings, ResolvedFolders, ServerCapabilities};
+use crate::imap::{
+    ImapError, ImapSession, ImapSettings, ResolvedFolders, ServerCapabilities, decode_modified_utf7,
+};
 use crate::store::Store;
 
 /// How long listing the models may take. It is a cheap request, so this is short.
@@ -189,21 +191,37 @@ pub fn format_items(items: &[CheckItem]) -> String {
 
 const CONFIG: &str = "Config";
 
-/// The item for `policy.dry_run`. Turning it off is allowed, but it is the switch that makes
-/// the service write flags, so `check` points it out.
-pub fn dry_run_item(dry_run: bool) -> CheckItem {
-    if dry_run {
-        CheckItem::ok(
-            CONFIG,
-            "dry-run is on: mail is classified and logged, nothing is changed on the server",
-        )
-    } else {
-        CheckItem::warn(
-            CONFIG,
-            "dry-run is off: flags will be written to your mailboxes",
-            "keep policy.dry_run = true until `stats` shows verdicts you agree with",
-        )
-    }
+/// One item per account saying what the service will do to its mailbox: write flags (live),
+/// only log (dry-run), or classify for the digest only. Going live is the switch that makes
+/// the service write, so a live account is a warning that points it out.
+pub fn mode_items(config: &Config) -> Vec<CheckItem> {
+    config
+        .accounts
+        .iter()
+        .map(|account| {
+            let name = &account.name;
+            match account.flag_mode(&config.policy) {
+                FlagMode::DryRun => CheckItem::ok(
+                    CONFIG,
+                    format!(
+                        "account {name}: dry-run is on: mail is classified and logged, nothing is changed on the server"
+                    ),
+                ),
+                FlagMode::Live => CheckItem::warn(
+                    CONFIG,
+                    format!("account {name}: dry-run is off: flags will be written to this mailbox"),
+                    "keep dry_run = true until `stats` shows verdicts you agree with; \
+                     `dry_run = false` on one account turns on only that account",
+                ),
+                FlagMode::ClassifyOnly => CheckItem::ok(
+                    CONFIG,
+                    format!(
+                        "account {name}: flagging is off: mail is classified for the digest only and never written to"
+                    ),
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Opens (creating if needed) the state database to prove the path is usable.
@@ -590,11 +608,13 @@ pub async fn probe_imap(
     // A configured Sent folder is taken at its word by the service, so prove it can be
     // opened. SELECT changes nothing on the server.
     if !configured_sent.is_empty() {
-        let what = format!("selecting the configured Sent folder {configured_sent}");
+        // Folder names are shown decoded (`Wysłane`), but `select` gets the raw name.
+        let shown = decode_modified_utf7(configured_sent);
+        let what = format!("selecting the configured Sent folder {shown}");
         match step(&what, session.select(configured_sent)).await {
             Ok(_) => items.push(CheckItem::ok(
                 area,
-                format!("configured Sent folder {configured_sent} can be opened"),
+                format!("configured Sent folder {shown} can be opened"),
             )),
             Err(message) => items.push(CheckItem::fail(
                 area,
@@ -687,8 +707,10 @@ pub fn mailbox_items(
     let selected = CheckItem::ok(
         area,
         format!(
-            "{folder} selected: {} messages, UIDVALIDITY {}",
-            info.exists, info.uid_validity
+            "{} selected: {} messages, UIDVALIDITY {}",
+            decode_modified_utf7(folder),
+            info.exists,
+            info.uid_validity
         ),
     );
     let keywords = match (info.keywords_allowed, flagging) {
@@ -721,10 +743,19 @@ pub fn mailbox_items(
 /// The Sent folder item: the configured one, the detected one, or a warning that there is none.
 pub fn sent_item(area: &str, configured: &str, resolved: &ResolvedFolders) -> CheckItem {
     if !configured.is_empty() {
-        return CheckItem::ok(area, format!("Sent folder (configured): {configured}"));
+        return CheckItem::ok(
+            area,
+            format!(
+                "Sent folder (configured): {}",
+                decode_modified_utf7(configured)
+            ),
+        );
     }
     match &resolved.sent {
-        Some(sent) => CheckItem::ok(area, format!("Sent folder (detected): {sent}")),
+        Some(sent) => CheckItem::ok(
+            area,
+            format!("Sent folder (detected): {}", decode_modified_utf7(sent)),
+        ),
         None => CheckItem::warn(
             area,
             "no Sent folder found",
@@ -1050,11 +1081,51 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_off_is_a_warning() {
-        assert_eq!(dry_run_item(true).status, Status::Ok);
-        let item = dry_run_item(false);
-        assert_eq!(item.status, Status::Warn);
-        assert!(item.message.contains("flags will be written"));
+    fn folder_names_are_shown_decoded() {
+        let resolved = ResolvedFolders {
+            inbox: "INBOX".into(),
+            sent: Some("[Gmail]/Wys&AUI-ane".into()),
+            delimiter: Some("/".into()),
+            prefix: String::new(),
+        };
+        let detected = sent_item("a", "", &resolved);
+        assert!(
+            detected.message.contains("[Gmail]/Wysłane"),
+            "{}",
+            detected.message
+        );
+        assert!(!detected.message.contains("&AUI-"), "{}", detected.message);
+        let configured = sent_item("a", "[Gmail]/Wys&AUI-ane", &resolved);
+        assert!(
+            configured.message.contains("Wysłane"),
+            "{}",
+            configured.message
+        );
+    }
+
+    #[test]
+    fn each_accounts_mode_is_reported_and_only_live_is_a_warning() {
+        let account = |name: &str, extra: &str| {
+            format!("[[accounts]]\nname = \"{name}\"\nhost = \"h\"\nusername = \"u\"\n{extra}")
+        };
+        let config = Config::parse(&format!(
+            "{}{}{}",
+            account("zoho", "dry_run = false\n"),
+            account("gmail", ""),
+            account("wp", "flagging = false\n"),
+        ))
+        .unwrap();
+        let items = mode_items(&config);
+        assert_eq!(
+            statuses(&items),
+            [Status::Warn, Status::Ok, Status::Ok],
+            "{items:#?}"
+        );
+        assert!(
+            items[0].message.contains("zoho") && items[0].message.contains("flags will be written")
+        );
+        assert!(items[1].message.contains("gmail") && items[1].message.contains("dry-run is on"));
+        assert!(items[2].message.contains("wp") && items[2].message.contains("flagging is off"));
     }
 
     #[test]

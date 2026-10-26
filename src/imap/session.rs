@@ -41,7 +41,11 @@ const BODY_PEEK_QUERY: &str = "(UID BODY.PEEK[])";
 const HEADERS_PEEK_QUERY: &str = "(UID BODY.PEEK[HEADER])";
 // ENVELOPE is the server's own parsed summary of the header (RFC 3501 §7.4.2). It never
 // includes the body, and fetching it does not set `\Seen`.
-const ENVELOPE_QUERY: &str = "(UID ENVELOPE)";
+//
+// The Sent harvest also asks for just two header fields, `In-Reply-To` and `References`, to
+// learn which messages the user answered (so "Reply needed" can clear itself). `HEADER.FIELDS`
+// returns only the named headers, never the subject, the addresses or the body.
+const ENVELOPE_QUERY: &str = "(UID ENVELOPE BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)])";
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers
@@ -326,6 +330,9 @@ pub struct EnvelopeAddresses {
     pub uid: u32,
     /// Everyone in To, Cc and Bcc, in that order, lowercase. Duplicates are not removed.
     pub recipients: Vec<String>,
+    /// The Message-IDs this message answered (`In-Reply-To` and `References`), normalised for
+    /// matching. Empty for a message that is not a reply.
+    pub reply_ids: Vec<String>,
 }
 
 /// Join the two halves of an envelope address into `local@domain`, lowercase.
@@ -344,6 +351,22 @@ pub(crate) fn envelope_address(mailbox: Option<&[u8]>, host: Option<&[u8]>) -> O
         return None;
     }
     Some(format!("{local}@{domain}").to_lowercase())
+}
+
+/// The English month abbreviations IMAP requires in a date (RFC 3501 `date-month`). They are
+/// fixed text, not the user's locale, so they are spelled out instead of formatted.
+const IMAP_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The `SEARCH` criterion for "arrived on or after this day", such as `SINCE 26-Oct-2026`.
+///
+/// `SINCE` compares the server's internal date and ignores the time of day and the time zone
+/// (RFC 3501 §6.4.4), so the result may include some mail from the evening before. That is
+/// fine for a backfill, which skips what it has already seen.
+fn since_query(date: jiff::civil::Date) -> String {
+    let month = IMAP_MONTHS[usize::from(date.month().unsigned_abs()) - 1];
+    format!("SINCE {}-{}-{}", date.day(), month, date.year())
 }
 
 /// An authenticated connection to one IMAP account.
@@ -520,9 +543,30 @@ impl ImapSession {
                     envelope_address(address.mailbox.as_deref(), address.host.as_deref())
                 })
                 .collect();
-            result.push(EnvelopeAddresses { uid, recipients });
+            // A server that leaves the header section out simply yields no ids.
+            let reply_ids = fetch
+                .header()
+                .map(crate::flagging::reply_ids_from_header)
+                .unwrap_or_default();
+            result.push(EnvelopeAddresses {
+                uid,
+                recipients,
+                reply_ids,
+            });
         }
         Ok(result)
+    }
+
+    /// The UIDs of messages in the selected mailbox that arrived on or after `since`, oldest
+    /// first (UIDs grow with arrival). `UID SEARCH` only reads; it changes nothing.
+    pub async fn search_since(&mut self, since: jiff::civil::Date) -> Result<Vec<u32>, ImapError> {
+        if self.selected.is_none() {
+            return Err(ImapError::NoMailboxSelected);
+        }
+        let found = self.inner.uid_search(since_query(since)).await?;
+        let mut uids: Vec<u32> = found.into_iter().collect();
+        uids.sort_unstable();
+        Ok(uids)
     }
 
     /// The whole raw message, fetched with `BODY.PEEK[]` so it is **not** marked as read.
@@ -689,6 +733,14 @@ mod tests {
         assert_eq!(envelope_address(Some(b""), Some(b"example.org")), None);
         assert_eq!(envelope_address(Some(b"a b"), Some(b"example.org")), None);
         assert_eq!(envelope_address(Some(b"a"), Some(b"x@y")), None);
+    }
+
+    #[test]
+    fn since_queries_use_english_month_names_and_no_padding() {
+        use jiff::civil::date;
+        assert_eq!(since_query(date(2026, 10, 26)), "SINCE 26-Oct-2026");
+        assert_eq!(since_query(date(2027, 1, 5)), "SINCE 5-Jan-2027");
+        assert_eq!(since_query(date(2026, 12, 31)), "SINCE 31-Dec-2026");
     }
 
     #[test]

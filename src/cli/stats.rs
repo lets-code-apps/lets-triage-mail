@@ -42,8 +42,11 @@ struct AccountStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Report {
     days: u32,
-    /// Whether flags are only logged (`true`) or really set on the server.
+    /// `true` when no account is live: flags are only logged, never set on the server.
     dry_run: bool,
+    /// The accounts whose flags are really set and cleared on the server (see
+    /// `AccountConfig::flag_mode`). Empty in a pure dry-run.
+    live_accounts: Vec<String>,
     /// First and last day (`YYYY-MM-DD`, UTC) with a logged message in the period.
     first_day: Option<String>,
     last_day: Option<String>,
@@ -73,7 +76,13 @@ pub async fn run(config_path: &Path, days: u32, json: bool) -> anyhow::Result<()
         let now = unix_now();
         let raw = query(&store, &config, since(now, days), now)?;
         let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-        let report = build_report(days, config.policy.dry_run, &names, raw);
+        let live: Vec<&str> = config
+            .accounts
+            .iter()
+            .filter(|a| a.writes_flags(&config.policy))
+            .map(|a| a.name.as_str())
+            .collect();
+        let report = build_report(days, &live, &names, raw);
         if json {
             Ok(serde_json::to_string_pretty(&report)?)
         } else {
@@ -119,7 +128,9 @@ fn since(now: i64, days: u32) -> i64 {
 ///
 /// The total is computed from all rows, so it also includes mail of accounts that have
 /// since been removed from the config.
-fn build_report(days: u32, dry_run: bool, accounts: &[&str], raw: RawStats) -> Report {
+///
+/// `live` names the accounts that really write flags; the rest only log what they would do.
+fn build_report(days: u32, live: &[&str], accounts: &[&str], raw: RawStats) -> Report {
     let per_account: Vec<AccountStats> = accounts
         .iter()
         .zip(raw.top_senders)
@@ -158,7 +169,8 @@ fn build_report(days: u32, dry_run: bool, accounts: &[&str], raw: RawStats) -> R
     };
     Report {
         days,
-        dry_run,
+        dry_run: live.is_empty(),
+        live_accounts: live.iter().map(|name| (*name).to_owned()).collect(),
         first_day: raw.range.map(|(first, _)| format_day(first)),
         last_day: raw.range.map(|(_, last)| format_day(last)),
         accounts: per_account,
@@ -204,8 +216,14 @@ fn format_report(report: &Report) -> String {
     out.push_str(&if report.dry_run {
         "Mode: dry-run. No flags are set on the server; the flag counts show what would be set.\n"
             .to_owned()
-    } else {
+    } else if report.live_accounts.len() == report.accounts.len() {
         "Mode: live. Flags are set on the server.\n".to_owned()
+    } else {
+        format!(
+            "Mode: live for {}: flags are set on the server there. The other accounts are in \
+             dry-run or classify-only; their flag counts show what would be set.\n",
+            report.live_accounts.join(", ")
+        )
     });
     out.push_str(&match (&report.first_day, &report.last_day) {
         (Some(first), Some(last)) => format!(
@@ -326,7 +344,7 @@ mod tests {
 
     #[test]
     fn report_sums_per_account_and_in_total() {
-        let report = build_report(7, true, &["work", "home"], raw());
+        let report = build_report(7, &[], &["work", "home"], raw());
         let work = &report.accounts[0];
         assert_eq!(work.messages, 4);
         assert_eq!(
@@ -363,7 +381,7 @@ mod tests {
 
     #[test]
     fn text_output_names_the_mode_and_every_section() {
-        let text = format_report(&build_report(7, true, &["work", "home"], raw()));
+        let text = format_report(&build_report(7, &[], &["work", "home"], raw()));
         assert!(text.contains("dry-run"), "{text}");
         assert!(text.contains("== work (4 messages) =="));
         assert!(text.contains("== total (8 messages) =="));
@@ -373,8 +391,18 @@ mod tests {
             "home has no senders in the sample"
         );
 
-        let live = format_report(&build_report(7, false, &["work", "home"], raw()));
-        assert!(live.contains("Mode: live"));
+        let live = format_report(&build_report(
+            7,
+            &["work", "home"],
+            &["work", "home"],
+            raw(),
+        ));
+        assert!(live.contains("Mode: live."));
+
+        // One live account among two: say which one.
+        let mixed = format_report(&build_report(7, &["work"], &["work", "home"], raw()));
+        assert!(mixed.contains("Mode: live for work"), "{mixed}");
+        assert!(mixed.contains("other accounts"), "{mixed}");
     }
 
     #[test]
@@ -387,14 +415,14 @@ mod tests {
             top_senders_total: vec![],
             top_senders: vec![vec![]],
         };
-        let text = format_report(&build_report(3, true, &["work"], empty));
+        let text = format_report(&build_report(3, &[], &["work"], empty));
         assert!(text.contains("No messages were logged"));
         assert!(text.contains("Categories: none"));
     }
 
     #[test]
     fn json_output_is_valid_and_has_the_counts() {
-        let report = build_report(7, false, &["work", "home"], raw());
+        let report = build_report(7, &["work", "home"], &["work", "home"], raw());
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&report).unwrap()).unwrap();
         assert_eq!(value["dry_run"], false);

@@ -36,7 +36,8 @@ const MAX_SUBJECT_CHARS: usize = 300;
 const MAX_REASON_CHARS: usize = 500;
 
 /// The schema, one script per version. Index 0 takes a database from version 0 to 1.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE mailbox_state (
         account     TEXT NOT NULL,
         mailbox     TEXT NOT NULL,
@@ -138,7 +139,23 @@ const MIGRATIONS: &[&str] = &["
         corrected_at    INTEGER,
         UNIQUE (account, mailbox, uidvalidity, uid)
     );
-    "];
+    ",
+    // Version 2 (phase 4): what the auto-clear pass needs to know about a flag we set.
+    "
+    -- Which flag it was (the colour alone is configurable, so it cannot tell \"Reply needed\"
+    -- from \"Deadline\"), and the date a Deadline flag expires on (ISO text).
+    ALTER TABLE flag_ownership ADD COLUMN flag TEXT;
+    ALTER TABLE flag_ownership ADD COLUMN deadline TEXT;
+
+    -- Message-IDs the user answered, read from the In-Reply-To and References headers of
+    -- the Sent folder. Ids only: no subject, no address, no body.
+    CREATE TABLE sent_replies (
+        account    TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        PRIMARY KEY (account, message_id)
+    ) WITHOUT ROWID;
+    ",
+];
 
 /// Everything that can go wrong in the store.
 ///
@@ -204,6 +221,11 @@ pub struct OwnedFlag {
     pub key: MessageKey,
     pub message_id: Option<String>,
     pub colour: FlagColour,
+    /// Which flag this was. `None` for a record that predates the column; such a flag is
+    /// watched for user changes but never auto-cleared.
+    pub flag: Option<TriageFlag>,
+    /// The date a "Deadline" flag expires on. `None` for every other flag.
+    pub deadline: Option<jiff::civil::Date>,
     pub reason: Option<String>,
     /// Unix seconds.
     pub set_at: i64,
@@ -390,7 +412,7 @@ impl Store {
                     .map(|s| truncate(s, MAX_SUBJECT_CHARS)),
                 v.map(|v| category_to_str(v.category)),
                 v.map(|v| v.needs_reply),
-                v.and_then(|v| v.deadline.as_deref()),
+                v.and_then(|v| v.deadline).map(|date| date.to_string()),
                 v.map(|v| payment_to_str(v.payment)),
                 v.map(|v| v.confidence),
                 record.flag.map(flag_to_str),
@@ -549,10 +571,12 @@ impl Store {
     pub fn record_flag(&self, flag: &OwnedFlag) -> Result<()> {
         self.conn.execute(
             "INSERT INTO flag_ownership
-               (account, mailbox, uidvalidity, uid, message_id, colour, reason, set_at, user_owned)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+               (account, mailbox, uidvalidity, uid, message_id, colour, flag, deadline,
+                reason, set_at, user_owned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
              ON CONFLICT (account, mailbox, uidvalidity, uid) DO UPDATE SET
                message_id = excluded.message_id, colour = excluded.colour,
+               flag = excluded.flag, deadline = excluded.deadline,
                reason = excluded.reason, set_at = excluded.set_at
              WHERE flag_ownership.user_owned = 0",
             params![
@@ -562,6 +586,8 @@ impl Store {
                 flag.key.uid,
                 flag.message_id,
                 colour_to_str(flag.colour),
+                flag.flag.map(flag_to_str),
+                flag.deadline.map(|date| date.to_string()),
                 flag.reason
                     .as_deref()
                     .map(|s| truncate(s, MAX_REASON_CHARS)),
@@ -575,7 +601,8 @@ impl Store {
     /// never returned, so callers cannot clear them by accident. Oldest first.
     pub fn owned_flags(&self, account: &str, mailbox: &str) -> Result<Vec<OwnedFlag>> {
         let mut stmt = self.conn.prepare(
-            "SELECT uidvalidity, uid, message_id, colour, reason, set_at FROM flag_ownership
+            "SELECT uidvalidity, uid, message_id, colour, reason, set_at, flag, deadline
+             FROM flag_ownership
              WHERE account = ?1 AND mailbox = ?2 AND user_owned = 0
              ORDER BY set_at, uid",
         )?;
@@ -587,11 +614,13 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut flags = Vec::new();
         for row in rows {
-            let (uidvalidity, uid, message_id, colour, reason, set_at) = row?;
+            let (uidvalidity, uid, message_id, colour, reason, set_at, flag, deadline) = row?;
             flags.push(OwnedFlag {
                 key: MessageKey {
                     account: account.to_owned(),
@@ -601,6 +630,10 @@ impl Store {
                 },
                 message_id,
                 colour: colour_from_str(&colour)?,
+                flag: flag.as_deref().map(flag_from_str).transpose()?,
+                // A date we cannot read back is treated as no date, which means "never
+                // auto-clear": the safe direction.
+                deadline: deadline.and_then(|text| text.parse().ok()),
                 reason,
                 set_at,
             });
@@ -642,6 +675,37 @@ impl Store {
             params![key.account, key.mailbox, key.uidvalidity, key.uid],
         )?;
         Ok(())
+    }
+
+    // ---- replies seen in Sent -------------------------------------------------------
+
+    /// Remembers Message-IDs that the user's own sent mail answered. The ids are stored as
+    /// given (the caller normalises them); nothing else about the sent mail is kept.
+    pub fn add_reply_ids(&mut self, account: &str, ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO sent_replies (account, message_id) VALUES (?1, ?2)",
+            )?;
+            for id in ids {
+                stmt.execute(params![account, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether a message with this (normalised) Message-ID has been answered from Sent.
+    pub fn has_reply_to(&self, account: &str, message_id: &str) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sent_replies WHERE account = ?1 AND message_id = ?2",
+                params![account, message_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     // ---- retry queue --------------------------------------------------------------
@@ -842,7 +906,7 @@ impl Store {
                 label.features,
                 category_to_str(v.category),
                 v.needs_reply,
-                v.deadline,
+                v.deadline.map(|date| date.to_string()),
                 payment_to_str(v.payment),
                 v.confidence,
                 label.flag.map(flag_to_str),
@@ -1020,6 +1084,17 @@ fn flag_to_str(flag: TriageFlag) -> &'static str {
     }
 }
 
+fn flag_from_str(value: &str) -> Result<TriageFlag> {
+    match value {
+        "reply_needed" => Ok(TriageFlag::ReplyNeeded),
+        "deadline" => Ok(TriageFlag::Deadline),
+        "to_pay" => Ok(TriageFlag::ToPay),
+        "bookkeeping" => Ok(TriageFlag::Bookkeeping),
+        "unsure" => Ok(TriageFlag::Unsure),
+        other => unknown("flag", other),
+    }
+}
+
 fn colour_to_str(colour: FlagColour) -> &'static str {
     match colour {
         FlagColour::Red => "red",
@@ -1073,7 +1148,7 @@ mod tests {
         Verdict {
             category: Category::Personal,
             needs_reply: true,
-            deadline: Some("2026-11-01".into()),
+            deadline: Some(jiff::civil::date(2026, 11, 1)),
             payment: Payment::NotApplicable,
             confidence: 0.9,
             reason: "asks a question".into(),
@@ -1085,6 +1160,8 @@ mod tests {
             key: key(uid),
             message_id: Some(format!("<{uid}@x>")),
             colour: FlagColour::Orange,
+            flag: Some(TriageFlag::ReplyNeeded),
+            deadline: None,
             reason: Some("reply".into()),
             set_at,
         }
@@ -1315,6 +1392,31 @@ mod tests {
         s.clear_flag_record(&key(2)).unwrap();
         assert!(s.owned_flags("a", "INBOX").unwrap().is_empty());
         assert!(!s.mark_user_owned(&key(99)).unwrap());
+    }
+
+    #[test]
+    fn the_flag_kind_and_deadline_survive_a_round_trip() {
+        let s = store();
+        let mut flag = owned(1, 100);
+        flag.colour = FlagColour::Yellow;
+        flag.flag = Some(TriageFlag::Deadline);
+        flag.deadline = Some(jiff::civil::date(2026, 11, 30));
+        s.record_flag(&flag).unwrap();
+        let back = s.owned_flags("a", "INBOX").unwrap();
+        assert_eq!(back, [flag]);
+    }
+
+    #[test]
+    fn replies_seen_in_sent_are_remembered_per_account() {
+        let mut s = store();
+        s.add_reply_ids("a", &["one@x".into(), "two@x".into()])
+            .unwrap();
+        // Adding the same id again is harmless.
+        s.add_reply_ids("a", &["one@x".into()]).unwrap();
+        assert!(s.has_reply_to("a", "one@x").unwrap());
+        assert!(s.has_reply_to("a", "two@x").unwrap());
+        assert!(!s.has_reply_to("a", "three@x").unwrap());
+        assert!(!s.has_reply_to("other", "one@x").unwrap());
     }
 
     #[test]
