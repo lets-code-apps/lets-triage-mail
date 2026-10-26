@@ -155,6 +155,28 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (account, message_id)
     ) WITHOUT ROWID;
     ",
+    // Version 3 (phase 5): the daily digest.
+    "
+    -- When the last digest was written (Unix seconds), so the next one starts exactly there.
+    -- `last_digest_date` alone cannot say that, and a catch-up digest is sent late.
+    ALTER TABLE digest_state ADD COLUMN last_digest_at INTEGER;
+
+    -- The digests we appended to the mailbox, so the worker never classifies its own output.
+    -- A sender can write any header, so the worker does not trust `X-Lets-Triage-Mail`: it
+    -- skips exactly these messages. The Message-ID is random and is written *before* the
+    -- APPEND, because the worker may see the new message before we learn its UID. The UID
+    -- (from APPENDUID) is filled in afterwards; it lets the worker skip before downloading.
+    CREATE TABLE own_digests (
+        account     TEXT NOT NULL,
+        message_id  TEXT NOT NULL,
+        mailbox     TEXT NOT NULL,
+        uidvalidity INTEGER,
+        uid         INTEGER,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (account, message_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX own_digests_uid ON own_digests (account, mailbox, uidvalidity, uid);
+    ",
 ];
 
 /// Everything that can go wrong in the store.
@@ -275,6 +297,21 @@ pub struct AccountCount {
 pub struct Counted {
     pub label: String,
     pub count: u64,
+}
+
+/// One message as the digest sees it: metadata and the model's verdict, no body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DigestRow {
+    pub sender: Option<String>,
+    pub subject: Option<String>,
+    /// The flag that was set, or in dry-run would have been set. `None` when no flag was
+    /// chosen, and always `None` for a classify-only account.
+    pub flag: Option<TriageFlag>,
+    /// What the model said, including its one-sentence reason (untrusted text). `None` when
+    /// the model was not asked (blocked sender) or failed.
+    pub verdict: Option<Verdict>,
+    /// When the message was processed (Unix seconds).
+    pub created_at: i64,
 }
 
 /// The state of one account's retry queue.
@@ -878,14 +915,169 @@ impl Store {
             .optional()?)
     }
 
-    /// Saves the date (`YYYY-MM-DD`) of the digest just written, so a day is never repeated.
-    pub fn set_last_digest_date(&self, account: &str, date: &str) -> Result<()> {
+    /// When the last digest was written (Unix seconds). `None` before the first digest, and
+    /// for a database that predates the column.
+    pub fn last_digest_at(&self, account: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_digest_at FROM digest_state WHERE account = ?1",
+                params![account],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Saves the date (`YYYY-MM-DD`) and the moment of the digest just written, so a day is
+    /// never repeated and the next digest starts where this one ended.
+    pub fn set_last_digest(&self, account: &str, date: &str, at: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO digest_state (account, last_digest_date) VALUES (?1, ?2)
-             ON CONFLICT (account) DO UPDATE SET last_digest_date = excluded.last_digest_date",
-            params![account, date],
+            "INSERT INTO digest_state (account, last_digest_date, last_digest_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (account) DO UPDATE SET
+               last_digest_date = excluded.last_digest_date,
+               last_digest_at = excluded.last_digest_at",
+            params![account, date, at],
         )?;
         Ok(())
+    }
+
+    /// The messages of one account processed in `since..=until` (Unix seconds), oldest
+    /// first. Messages the user could not have wanted summarised are not special here: the
+    /// digest code groups them.
+    pub fn digest_rows(&self, account: &str, since: i64, until: i64) -> Result<Vec<DigestRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender, subject, flag, created_at,
+                    category, needs_reply, deadline, payment, confidence, reason
+             FROM processed
+             WHERE account = ?1 AND created_at >= ?2 AND created_at <= ?3
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![account, since, until], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<bool>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<f32>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (
+                sender,
+                subject,
+                flag,
+                created_at,
+                category,
+                needs_reply,
+                deadline,
+                payment,
+                confidence,
+                reason,
+            ) = row?;
+            // The verdict columns are written together; without a category there is no verdict.
+            let verdict = match category {
+                Some(category) => Some(Verdict {
+                    category: category_from_str(&category)?,
+                    needs_reply: needs_reply.unwrap_or(false),
+                    // An unreadable date is shown as "no date" rather than failing the digest.
+                    deadline: deadline.and_then(|text| text.parse().ok()),
+                    payment: payment
+                        .as_deref()
+                        .map_or(Ok(Payment::NotApplicable), payment_from_str)?,
+                    confidence: confidence.unwrap_or(0.0),
+                    reason: reason.unwrap_or_default(),
+                }),
+                None => None,
+            };
+            items.push(DigestRow {
+                sender,
+                subject,
+                flag: flag.as_deref().map(flag_from_str).transpose()?,
+                verdict,
+                created_at,
+            });
+        }
+        Ok(items)
+    }
+
+    // ---- our own digests ----------------------------------------------------------
+
+    /// Records the Message-ID of a digest **before** it is appended, so the worker can
+    /// recognise it even if it sees the message before [`Store::set_digest_uid`] ran.
+    pub fn begin_digest_message(
+        &self,
+        account: &str,
+        message_id: &str,
+        mailbox: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO own_digests (account, message_id, mailbox, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![account, message_id, mailbox, now_unix()],
+        )?;
+        Ok(())
+    }
+
+    /// Records where the server put the digest (`APPENDUID`). Returns whether the
+    /// Message-ID was known.
+    pub fn set_digest_uid(
+        &self,
+        account: &str,
+        message_id: &str,
+        uidvalidity: u32,
+        uid: u32,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE own_digests SET uidvalidity = ?3, uid = ?4
+             WHERE account = ?1 AND message_id = ?2",
+            params![account, message_id, uidvalidity, uid],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Whether this exact message is a digest we appended (by the UID the server reported).
+    pub fn is_own_digest(&self, key: &MessageKey) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM own_digests
+                 WHERE account = ?1 AND mailbox = ?2 AND uidvalidity = ?3 AND uid = ?4",
+                params![key.account, key.mailbox, key.uidvalidity, key.uid],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether this Message-ID (without angle brackets) belongs to a digest we appended. The
+    /// fallback for a server that gave no `APPENDUID`, and for the moment before we knew it.
+    pub fn is_own_digest_message_id(&self, account: &str, message_id: &str) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM own_digests WHERE account = ?1 AND message_id = ?2",
+                params![account, message_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Forgets digest records older than `before` (Unix seconds). A digest is classified or
+    /// skipped within minutes of arriving, so old rows have no use.
+    pub fn prune_own_digests(&self, before: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM own_digests WHERE created_at < ?1",
+            params![before],
+        )?)
     }
 
     // ---- labels -------------------------------------------------------------------
@@ -1037,7 +1229,6 @@ fn category_to_str(category: Category) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn category_from_str(value: &str) -> Result<Category> {
     match value {
         "personal" => Ok(Category::Personal),
@@ -1071,6 +1262,15 @@ fn rule_from_str(value: &str) -> Result<Rule> {
         "allow" => Ok(Rule::Allow),
         "block" => Ok(Rule::Block),
         other => unknown("rule", other),
+    }
+}
+
+fn payment_from_str(value: &str) -> Result<Payment> {
+    match value {
+        "unpaid" => Ok(Payment::Unpaid),
+        "paid" => Ok(Payment::Paid),
+        "not_applicable" => Ok(Payment::NotApplicable),
+        other => unknown("payment", other),
     }
 }
 
@@ -1463,13 +1663,76 @@ mod tests {
     fn digest_date_roundtrip() {
         let s = store();
         assert_eq!(s.last_digest_date("a").unwrap(), None);
-        s.set_last_digest_date("a", "2026-10-25").unwrap();
-        s.set_last_digest_date("a", "2026-10-26").unwrap();
+        assert_eq!(s.last_digest_at("a").unwrap(), None);
+        s.set_last_digest("a", "2026-10-25", 100).unwrap();
+        s.set_last_digest("a", "2026-10-26", 200).unwrap();
         assert_eq!(
             s.last_digest_date("a").unwrap().as_deref(),
             Some("2026-10-26")
         );
+        assert_eq!(s.last_digest_at("a").unwrap(), Some(200));
         assert_eq!(s.last_digest_date("b").unwrap(), None);
+    }
+
+    #[test]
+    fn digest_rows_cover_one_account_and_one_window_oldest_first() {
+        let s = store();
+        let add = |account: &str, uid: u32, flag: Option<TriageFlag>, at: i64| {
+            let mut record = ProcessedRecord {
+                key: key(uid),
+                message_id: None,
+                sender: Some(format!("s{uid}@x.com")),
+                subject: Some(format!("subject {uid}")),
+                verdict: Some(verdict()),
+                flag,
+                source: "model".into(),
+            };
+            record.key.account = account.into();
+            s.record_processed(&record).unwrap();
+            s.conn
+                .execute(
+                    "UPDATE processed SET created_at = ?1 WHERE account = ?2 AND uid = ?3",
+                    params![at, account, uid],
+                )
+                .unwrap();
+        };
+        add("a", 1, Some(TriageFlag::Deadline), 300);
+        add("a", 2, None, 100);
+        add("a", 3, None, 900); // after the window
+        add("b", 4, None, 200); // another account
+        let rows = s.digest_rows("a", 100, 500).unwrap();
+        let subjects: Vec<_> = rows.iter().map(|r| r.subject.clone().unwrap()).collect();
+        assert_eq!(subjects, ["subject 2", "subject 1"]);
+        assert_eq!(rows[1].flag, Some(TriageFlag::Deadline));
+        assert_eq!(rows[1].verdict, Some(verdict()));
+    }
+
+    #[test]
+    fn own_digests_are_found_by_message_id_at_once_and_by_uid_later() {
+        let s = store();
+        s.begin_digest_message("a", "abc@lets.invalid", "INBOX")
+            .unwrap();
+        // Before the UID is known only the Message-ID matches.
+        assert!(s.is_own_digest_message_id("a", "abc@lets.invalid").unwrap());
+        assert!(!s.is_own_digest(&key(5)).unwrap());
+
+        assert!(s.set_digest_uid("a", "abc@lets.invalid", 1, 5).unwrap());
+        assert!(s.is_own_digest(&key(5)).unwrap());
+        // Same UID in another mailbox, another UIDVALIDITY or another account is not ours.
+        let mut other = key(5);
+        other.mailbox = "Other".into();
+        assert!(!s.is_own_digest(&other).unwrap());
+        other = key(5);
+        other.uidvalidity = 2;
+        assert!(!s.is_own_digest(&other).unwrap());
+        other = key(5);
+        other.account = "b".into();
+        assert!(!s.is_own_digest(&other).unwrap());
+        assert!(!s.is_own_digest_message_id("b", "abc@lets.invalid").unwrap());
+        assert!(!s.set_digest_uid("a", "unknown", 1, 6).unwrap());
+
+        assert_eq!(s.prune_own_digests(i64::MAX).unwrap(), 1);
+        assert!(!s.is_own_digest_message_id("a", "abc@lets.invalid").unwrap());
     }
 
     #[test]
