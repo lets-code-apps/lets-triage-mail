@@ -73,9 +73,11 @@ impl Payment {
 pub struct Verdict {
     pub category: Category,
     pub needs_reply: bool,
-    /// The date to act by, as `YYYY-MM-DD`. It becomes a real date type once we add the
-    /// scheduling code; choosing a flag only needs to know whether there is one.
-    pub deadline: Option<String>,
+    /// The date to act by. A calendar date without a time zone (`jiff::civil::Date`): the
+    /// model reads "by 30 November" from the mail, and "has it passed?" is answered against
+    /// the user's local today. Anything the model wrote that is not a real date is rejected
+    /// when the verdict is parsed, so a `Some` here is always valid.
+    pub deadline: Option<jiff::civil::Date>,
     pub payment: Payment,
     /// How sure the model is, from 0.0 to 1.0.
     pub confidence: f32,
