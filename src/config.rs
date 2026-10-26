@@ -178,16 +178,6 @@ pub struct PolicyConfig {
     /// Only trust `Authentication-Results` headers stamped by this server. Empty means
     /// the topmost header is used.
     pub authserv_id: String,
-    /// Read one provider's own DKIM and spam headers (`"wp"` for wp.pl). Off by default.
-    ///
-    /// **Opt-in because a sender can write these headers themselves.** A spammer can add
-    /// `X-WP-DKIM-Status: good` to a message, and it is only believable when your provider
-    /// strips or overwrites the header on arrival. Enable it only for a provider you know
-    /// does that. A standard `Authentication-Results` header, when present, still wins.
-    ///
-    /// The type is an enum, so `serde` rejects an unknown value with an error that lists the
-    /// known ones (`unknown variant ..., expected wp`).
-    pub provider_headers: Option<ProviderHeaders>,
 }
 
 impl Default for PolicyConfig {
@@ -197,7 +187,6 @@ impl Default for PolicyConfig {
             min_confidence: FlagPolicy::default().min_confidence,
             known_senders_from_sent: true,
             authserv_id: String::new(),
-            provider_headers: None,
         }
     }
 }
@@ -352,6 +341,19 @@ pub struct AccountConfig {
     /// the user's, so such an account must not be flagged at all.
     #[serde(default = "default_flagging")]
     pub flagging: bool,
+    /// Read this account's provider's own DKIM and spam headers (`"wp"` for wp.pl). Off by
+    /// default.
+    ///
+    /// **Opt-in because a sender can write these headers themselves.** A spammer can add
+    /// `X-WP-DKIM-Status: good` to a message, and it is only believable when the provider
+    /// strips or overwrites the header on arrival. That is why this is set per account and
+    /// not globally: the same fake header that wp.pl overwrites arrives untouched at Gmail.
+    /// A standard `Authentication-Results` header, when present, still wins.
+    ///
+    /// The type is an enum, so `serde` rejects an unknown value with an error that lists the
+    /// known ones (`unknown variant ..., expected wp`).
+    #[serde(default)]
+    pub provider_headers: Option<ProviderHeaders>,
 }
 
 fn default_flagging() -> bool {
@@ -866,17 +868,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_headers_are_off_by_default_and_accept_known_providers() {
-        assert_eq!(Config::parse("").unwrap().policy.provider_headers, None);
-        let config = Config::parse("[policy]\nprovider_headers = \"wp\"\n").unwrap();
-        assert_eq!(config.policy.provider_headers, Some(ProviderHeaders::Wp));
+    fn provider_headers_are_off_by_default_and_set_per_account() {
+        let config = Config::parse(ACCOUNT).unwrap();
+        assert_eq!(config.accounts[0].provider_headers, None);
+        let config = Config::parse(&format!("{ACCOUNT}provider_headers = \"wp\"\n")).unwrap();
+        assert_eq!(
+            config.accounts[0].provider_headers,
+            Some(ProviderHeaders::Wp)
+        );
     }
 
     #[test]
     fn an_unknown_provider_is_rejected_with_the_known_ones_listed() {
-        let message = error_of("[policy]\nprovider_headers = \"gmail\"\n");
+        let message = error_of(&format!("{ACCOUNT}provider_headers = \"gmail\"\n"));
         assert!(message.contains("gmail"), "{message}");
         assert!(message.contains("`wp`"), "{message}");
+    }
+
+    #[test]
+    fn provider_headers_are_no_longer_a_policy_setting() {
+        // It moved to `[[accounts]]`: one global switch would trust wp.pl headers on Gmail too.
+        let message = error_of("[policy]\nprovider_headers = \"wp\"\n");
+        assert!(message.contains("provider_headers"), "{message}");
     }
 
     #[test]

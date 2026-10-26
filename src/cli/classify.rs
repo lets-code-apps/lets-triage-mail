@@ -14,21 +14,29 @@ use lets_triage_mail::config::Config;
 use lets_triage_mail::decider::{Decider, Evidence, LlmDecider, LlmSettings};
 use lets_triage_mail::engine::{FlagPolicy, Trust, Verdict, choose_flag, screen_sender};
 use lets_triage_mail::message::{
-    HEADERS_ONLY_THRESHOLD, ParsedMessage, parse_headers_only, parse_message,
+    HEADERS_ONLY_THRESHOLD, ParsedMessage, ProviderHeaders, parse_headers_only, parse_message,
 };
 use lets_triage_mail::precheck::{SOURCE_MODEL, SOURCE_RULE, precheck};
 use serde_json::{Value, json};
 
 /// Classifies each file and prints the result. One bad file does not stop the others, but
 /// makes the whole command fail at the end (non-zero exit code).
-pub async fn run(config_path: &Path, files: &[PathBuf], json: bool) -> anyhow::Result<()> {
+///
+/// `account` names the account the files came from, so that its `provider_headers` apply.
+pub async fn run(
+    config_path: &Path,
+    files: &[PathBuf],
+    json: bool,
+    account: Option<&str>,
+) -> anyhow::Result<()> {
     let config = super::load_config(config_path)?;
+    let provider = provider_for(&config, account)?;
     let decider = LlmDecider::new(LlmSettings::from(&config.llm))
         .context("could not set up the model client")?;
 
     let mut failed = 0;
     for file in files {
-        match classify_file(&decider, &config, file).await {
+        match classify_file(&decider, &config, provider, file).await {
             Ok(outcome) if json => println!("{}", outcome.to_json()),
             Ok(outcome) => println!("{}", outcome.render()),
             Err(error) => {
@@ -74,14 +82,31 @@ struct ChosenFlag {
     colour: String,
 }
 
+/// The provider headers of the named account; none without a name.
+fn provider_for(config: &Config, account: Option<&str>) -> anyhow::Result<Option<ProviderHeaders>> {
+    let Some(name) = account else {
+        return Ok(None);
+    };
+    match config.account(name) {
+        Some(account) => Ok(account.provider_headers),
+        None => {
+            let known: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+            anyhow::bail!(
+                "no account named {name:?} in the config (accounts: {})",
+                known.join(", ")
+            )
+        }
+    }
+}
+
 async fn classify_file<D: Decider>(
     decider: &D,
     config: &Config,
+    provider: Option<ProviderHeaders>,
     file: &Path,
 ) -> anyhow::Result<Outcome> {
     let raw = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let authserv_id = Some(config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
-    let provider = config.policy.provider_headers;
     let message = if raw.len() > HEADERS_ONLY_THRESHOLD {
         // Big messages are mostly attachments; the headers are enough to judge them.
         parse_headers_only(&raw, authserv_id, provider)
@@ -253,7 +278,7 @@ mod tests {
     async fn personal_mail_that_needs_a_reply_gets_the_reply_flag() {
         let server = fake_model(REPLY).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+        let outcome = classify_file(&decider(&config), &config, None, &fixture("friend.eml"))
             .await
             .unwrap();
 
@@ -279,7 +304,7 @@ mod tests {
     async fn json_output_is_one_parseable_object() {
         let server = fake_model(REPLY).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+        let outcome = classify_file(&decider(&config), &config, None, &fixture("friend.eml"))
             .await
             .unwrap();
 
@@ -297,7 +322,7 @@ mod tests {
     async fn the_model_is_named_as_the_source_of_its_verdict() {
         let server = fake_model(REPLY).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+        let outcome = classify_file(&decider(&config), &config, None, &fixture("friend.eml"))
             .await
             .unwrap();
         assert!(outcome.render().contains("Decided by:  model"));
@@ -309,9 +334,14 @@ mod tests {
         // The fake model would answer "personal, reply needed"; any request would show.
         let server = fake_model(REPLY).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("casino_rotating.eml"))
-            .await
-            .unwrap();
+        let outcome = classify_file(
+            &decider(&config),
+            &config,
+            None,
+            &fixture("casino_rotating.eml"),
+        )
+        .await
+        .unwrap();
 
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(outcome.verdict.category, Category::Spam);
@@ -330,11 +360,16 @@ mod tests {
     async fn provider_headers_reach_the_parser_only_when_configured() {
         // Agency mail is not decided by a rule either way: the model is asked.
         let server = fake_model(REPLY).await;
-        let mut config = config_for(&server);
-        config.policy.provider_headers = Some(lets_triage_mail::message::ProviderHeaders::Wp);
-        let outcome = classify_file(&decider(&config), &config, &fixture("agency_marketing.eml"))
-            .await
-            .unwrap();
+        let config = config_for(&server);
+        let wp = Some(ProviderHeaders::Wp);
+        let outcome = classify_file(
+            &decider(&config),
+            &config,
+            wp,
+            &fixture("agency_marketing.eml"),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.source, "model");
         // The prompt carries the provider facts, so the model saw them.
         let requests = server.received_requests().await.unwrap();
@@ -351,7 +386,7 @@ mod tests {
         let verdict = r#"{"category":"newsletter","needs_reply":false,"deadline":null,"payment":"not_applicable","confidence":0.9,"reason":"A digest."}"#;
         let server = fake_model(verdict).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("newsletter.eml"))
+        let outcome = classify_file(&decider(&config), &config, None, &fixture("newsletter.eml"))
             .await
             .unwrap();
         assert!(outcome.flag.is_none());
@@ -364,7 +399,7 @@ mod tests {
         let verdict = r#"{"category":"personal","needs_reply":true,"deadline":null,"payment":"not_applicable","confidence":0.4,"reason":"Unclear."}"#;
         let server = fake_model(verdict).await;
         let config = config_for(&server);
-        let outcome = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+        let outcome = classify_file(&decider(&config), &config, None, &fixture("friend.eml"))
             .await
             .unwrap();
         assert_eq!(outcome.flag.unwrap().name, "Unsure");
@@ -399,10 +434,10 @@ mod tests {
         let config = config_for(&server);
         let decider = decider(&config);
 
-        let missing = classify_file(&decider, &config, Path::new("/nonexistent/x.eml")).await;
+        let missing = classify_file(&decider, &config, None, Path::new("/nonexistent/x.eml")).await;
         assert!(format!("{:#}", missing.unwrap_err()).contains("reading /nonexistent/x.eml"));
         assert!(
-            classify_file(&decider, &config, &fixture("friend.eml"))
+            classify_file(&decider, &config, None, &fixture("friend.eml"))
                 .await
                 .is_ok()
         );
@@ -420,15 +455,31 @@ mod tests {
         .unwrap();
 
         let files = [fixture("friend.eml"), PathBuf::from("/nonexistent/x.eml")];
-        let error = run(&config_path, &files, true).await.unwrap_err();
+        let error = run(&config_path, &files, true, None).await.unwrap_err();
         assert!(error.to_string().contains("1 of 2"), "{error}");
-        assert!(run(&config_path, &files[..1], false).await.is_ok());
+        assert!(run(&config_path, &files[..1], false, None).await.is_ok());
+    }
+
+    #[test]
+    fn provider_headers_come_from_the_named_account() {
+        let config = Config::parse(
+            "[[accounts]]\nname = \"wp\"\nhost = \"imap.wp.pl\"\nusername = \"me@wp.pl\"\n\
+             provider_headers = \"wp\"\n",
+        )
+        .unwrap();
+        assert_eq!(provider_for(&config, None).unwrap(), None);
+        assert_eq!(
+            provider_for(&config, Some("wp")).unwrap(),
+            Some(ProviderHeaders::Wp)
+        );
+        let error = provider_for(&config, Some("gmail")).unwrap_err();
+        assert!(error.to_string().contains("accounts: wp"), "{error}");
     }
 
     #[tokio::test]
     async fn a_missing_config_points_at_the_example() {
         let missing = Path::new("/nonexistent/config.toml");
-        let error = run(missing, &[fixture("friend.eml")], false)
+        let error = run(missing, &[fixture("friend.eml")], false, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("config.example.toml"), "{error}");
@@ -437,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_model_is_a_clean_error() {
         let config = Config::parse("[llm]\nbase_url = \"http://127.0.0.1:1/v1\"\n").unwrap();
-        let error = classify_file(&decider(&config), &config, &fixture("friend.eml"))
+        let error = classify_file(&decider(&config), &config, None, &fixture("friend.eml"))
             .await
             .unwrap_err();
         assert!(

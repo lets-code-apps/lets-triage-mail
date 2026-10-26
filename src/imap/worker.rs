@@ -574,7 +574,7 @@ impl<D: Decider> Ctx<'_, D> {
         };
 
         let authserv = Some(self.config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
-        let provider = self.config.policy.provider_headers;
+        let provider = self.account.provider_headers;
         let parsed = match plan {
             FetchPlan::Full => parse_message(&raw, authserv, provider),
             FetchPlan::HeadersOnly => parse_headers_only(&raw, authserv, provider),

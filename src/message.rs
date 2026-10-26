@@ -119,7 +119,7 @@ impl AuthResults {
 
 /// A mail provider whose own spam and DKIM headers we know how to read.
 ///
-/// This is opt-in (`[policy] provider_headers` in the config) because a *sender* can write
+/// This is opt-in (`provider_headers` on an `[[accounts]]` entry) because a *sender* can write
 /// any header they like, including a fake `X-WP-DKIM-Status: good`. Only a provider that
 /// strips or overwrites these headers on arrival makes them trustworthy, and only the user
 /// knows whether theirs does. To support another provider, add a variant here and a match arm

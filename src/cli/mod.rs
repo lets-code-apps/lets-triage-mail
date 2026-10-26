@@ -73,6 +73,10 @@ pub enum Command {
         /// Print one JSON object per file instead of readable text
         #[arg(long)]
         json: bool,
+        /// Judge the files as if they arrived in this account (by name), using its
+        /// `provider_headers`. Without it, provider headers are ignored.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Classify and flag existing inbox mail from the last few days
     Backfill {
@@ -115,7 +119,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Check { account, json } => {
             check::run(&config_path, account.as_deref(), json).await
         }
-        Command::Classify { files, json } => classify::run(&config_path, &files, json).await,
+        Command::Classify {
+            files,
+            json,
+            account,
+        } => classify::run(&config_path, &files, json, account.as_deref()).await,
         Command::Backfill { days, account } => {
             backfill::run(&config_path, days, account.as_deref()).await
         }
@@ -216,9 +224,14 @@ mod tests {
     fn parses_classify_with_several_files_and_json() {
         let cli = parse(&["classify", "a.eml", "b.eml", "--json"]).unwrap();
         match cli.command {
-            Command::Classify { files, json } => {
+            Command::Classify {
+                files,
+                json,
+                account,
+            } => {
                 assert_eq!(files, [PathBuf::from("a.eml"), PathBuf::from("b.eml")]);
                 assert!(json);
+                assert_eq!(account, None);
             }
             other => panic!("expected classify, got {other:?}"),
         }
