@@ -125,6 +125,83 @@ Planned after v1, roughly in this order:
    services. The API shape is not decided yet.
 5. **Folder moves** for non-spam categories (Promotions/Newsletters/Cold), as in the prototype.
 
-Other ideas: "Summarize selected message" for Apple Mail via AppleScript + Shortcuts calling
+Items 1 and 5 are reshaped by the proposal below: moving mail becomes one action that a user
+can choose per folder and category, instead of fixed behaviour.
+
+### Proposal (2026-10-28): folders, modes and actions
+
+**Principle.** The service offers capabilities and recommends a setup; the user chooses how to
+use it. Defaults stay conservative; nothing beyond them is forced or forbidden. See
+`DECISIONS.md` (2026-10-28).
+
+**One model for everything: folder → mode → actions.**
+
+- **Folder discovery.** The user enters only the connection details (host, port, username,
+  password). The service finds the folders itself: it lists every folder with its special-use
+  role (`\Inbox`, `\Sent`, `\Junk`, `\Trash`, ...) and stores the list per account (name,
+  delimiter, role; no mail). It refreshes the list on each connect, so new and renamed folders
+  show up, and `check` prints it. The user sets a mode per folder; a folder without one gets the
+  recommended default for its role, otherwise `off`.
+- **Modes.**
+  - `off`: never opened.
+  - `report`: read-only (`EXAMINE`, headers with `PEEK`), no model. The v1 Spam watch is this
+    mode with the "trusted sender, DKIM pass" rule.
+  - `classify`: the model judges each new message; results go to the digest and `stats`, nothing
+    is written to the server.
+  - `act`: classify, then carry out the actions configured for the folder.
+- **Actions** (for `act`): `flag` (today's flag colours), `move` (to a named folder), `digest`
+  (list it). Later actions such as unsubscribe or a drafted reply plug in here as new action
+  types, not new code paths.
+- **Recommended defaults.** INBOX in `act` with `flag` and `digest`; the Junk folder in `report`;
+  Sent read for known senders as today; everything else `off`.
+- **Model cost is the user's choice.** A folder in `classify` or `act` costs one model call per
+  new message; with a small decision model (Laya) that is cheap even for busy folders. Model
+  concurrency stays 1 by default.
+
+**Moving mail, with its safety kit.** A wrong flag costs a glance; a wrong move hides mail. So
+`move`:
+
+1. is opt-in per folder **and** per category (for example "newsletters → Newsletters"), with its
+   own confidence threshold;
+2. never moves mail from a trusted sender (allow rule or known sender), unless the user adds a
+   rule saying so;
+3. moves only, never deletes: `MOVE`, or `COPY` + `\Deleted` + `UID EXPUNGE` of that UID with
+   UIDPLUS; no plain `EXPUNGE`;
+4. logs every move (account, from, to, Message-ID, reason, time) and offers `undo` / `restore`;
+5. can run in dry-run first, which `check` and the docs recommend. **Dry-run is the user's
+   option, not a requirement:** a user who turns a move on explicitly gets it live at once.
+
+**Per-account flags and categories.** Flag profiles are agreed for v1.1; categories are parked
+(see below). Today `[flags.*]` is global and the model chooses
+from 7 fixed categories; the flag is derived from the verdict by code, and the model never sees
+flag names. Different accounts often mean different jobs (home: bills, invoices, quotes; work:
+one product's support, another's sales), so:
+
+- **Per-account flag profiles** (which flags are on, their colour and name) are cheap: an
+  optional `[accounts.flags.*]` override of the global table. Limit: Apple Mail names flag
+  colours app-wide in its sidebar, so "orange" can mean one thing per Mac, not per account. The
+  digest can still use the per-account name.
+- **User-defined categories** (name plus a one-line description the model sees, per account)
+  fit how people think about mail, but change the prompt per account and work against the Laya
+  plan, which needs a fixed label set to fine-tune and calibrate. **Parked (2026-10-28), to
+  discuss later:** free-text categories for the general LLM only, or a fixed core set plus
+  per-account sub-labels.
+
+**Order (baby steps).**
+
+1. Finish v1 as scoped and run milestone C (a live account in Apple Mail).
+2. **v1.1a:** folder discovery and the stored folder list, shown by `check`. No change in
+   behaviour.
+3. **v1.1b:** per-folder modes `off` / `report` / `classify` / `act` with the `flag` and `digest`
+   actions, together with per-account flag profiles. No moves.
+4. **v2:** the `move` action with its safety kit (absorbs items 1 and 5 above); per-account
+   categories once that decision is made.
+
+Open questions: whether per-folder choices live only in the TOML config or also in a UI (the
+design repo has screens for this app); how `undo` presents a batch of moves.
+
+### Other ideas
+
+"Summarize selected message" for Apple Mail via AppleScript + Shortcuts calling
 `lets-triage-mail summarize`; an optional Swift MailKit extension for background colours; OAuth2
 for Outlook.com/M365 and Gmail.
