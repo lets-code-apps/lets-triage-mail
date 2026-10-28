@@ -31,8 +31,16 @@
 | 2026-10-26 | The digest loop **polls the clock every minute** instead of sleeping until the time | A monotonic timer does not advance while the Mac sleeps, so a long sleep would end late. The poll costs one small read and gives catch-up after wake for free. |
 | 2026-10-26 | `APPEND` is written by hand in `ImapSession::append_message`, not with `async-imap`'s `append` | That one discards the server's final answer, which holds the `APPENDUID`. Checked against a scripted fake server because Dovecot runs in CI only. |
 | 2026-10-26 | `mail-builder` 2 for the message, `getrandom` for the Message-ID | The builder's own ids and boundaries are only pseudo-unique; the digest's Message-ID must be unguessable, since the worker trusts it. |
+| 2026-10-28 | The Spam folder is **watched read-only** (`EXAMINE`, headers with `PEEK`, no model) on the inbox worker's connection, every 15 min at most; trusted senders with a passing DKIM are listed in the digest as "Possibly misfiled in Spam" | A real DKIM-valid message from a known sender landed in wp.pl's `Spam` and was never seen. Running the model on a folder of hundreds of junk messages is not worth it for the question "do I know this sender?". No second connection: some providers limit them, and nothing here is urgent. |
+| 2026-10-28 | **The app offers capabilities and recommends a setup; the user chooses.** Post-v1 the design is folder → mode (`off` / `report` / `classify` / `act`) → actions (`flag`, `move`, `digest`), with discovered folders configured per account | Accounts and folders are used for different jobs, and model cost with a small decision model is low enough to leave to the user. One model keeps flags, moves and the Spam report on one code path. Proposal and order in SPEC.md §5. v1 scope is unchanged. |
+| 2026-10-28 | **Moving mail will be allowed (v2)**, opt-in per folder and category, never for trusted senders, move-only (no delete), logged, with `undo`. **Dry-run is optional**: recommended, not required | Ends the v1 "never move or hide mail" rule after v1, by Piotr's decision. A wrong move hides mail, so the safety kit is not optional; the waiting period is the user's call. |
+| 2026-10-28 | **Folders are discovered, not configured**: from the connection details alone the service lists every folder with its role and stores the list per account. Baby steps: v1.1a discovery, v1.1b folder modes together with per-account flag profiles | The user should not have to know IMAP folder names or delimiters. Discovery alone changes no behaviour, so it can ship and be checked first. |
 
 ## Rejected or parked options
+
+- **Per-account categories** (parked 2026-10-28, to discuss later): free-text categories per
+  account for the general LLM, or a fixed core set plus per-account sub-labels. The choice
+  depends on the Laya question, which needs a fixed label set. See SPEC.md §5.
 
 - **Names: MailGuard, Mailbird, Bunting, Pennon, Kittiwake, Let's Flag, Let's Guard Email**: crowded or taken (Mailbird is an existing mail client), or too narrow (flag only) or misleading ("guard" suggests a security filter).
 - **Spark / Canary / SaneBox**: their AI or filtering runs in their cloud.
