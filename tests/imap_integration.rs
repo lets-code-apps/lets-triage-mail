@@ -1161,7 +1161,7 @@ async fn a_digest_lands_unread_in_the_inbox_and_the_worker_does_not_classify_it(
     let message = mail_parser::MessageParser::default().parse(&raw).unwrap();
     assert!(message.subject().unwrap().starts_with("Daily triage"));
     let text = message.body_text(0).unwrap();
-    assert!(text.contains("Reply needed (1)"), "{text}");
+    assert!(text.contains("REPLY NEEDED (1)"), "{text}");
     assert!(text.contains("please-answer"), "{text}");
     assert!(message.body_html(0).unwrap().contains("<html"));
     assert!(String::from_utf8_lossy(&raw).contains("X-Lets-Triage-Mail: digest"));

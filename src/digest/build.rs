@@ -29,6 +29,7 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
 use crate::engine::{Category, FlagPolicy, TriageFlag, Trust, choose_flag};
+use crate::flags::FlagColour;
 use crate::store::{DigestRow, MisfiledRow};
 
 /// Flagged messages shown per flag. More than this is a flag problem, not a reading problem;
@@ -69,6 +70,8 @@ pub struct DigestInput<'a> {
     pub tz: &'a TimeZone,
     /// The configured display name of a flag (`Config::flag_name`).
     pub flag_name: &'a dyn Fn(TriageFlag) -> String,
+    /// The configured colour of a flag (`FlagPolicy::colour_for`), for the dot next to it.
+    pub flag_colour: &'a dyn Fn(TriageFlag) -> FlagColour,
     /// `Some` for a classify-only account: choose each message's would-be flag with this
     /// policy, because no flag was stored. `None` uses the stored flags.
     pub derive_flags: Option<&'a FlagPolicy>,
@@ -93,6 +96,7 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub flag: TriageFlag,
+    pub colour: FlagColour,
     /// The configured display name, for example "Reply needed".
     pub title: String,
     /// At most [`MAX_ITEMS_PER_SECTION`] items.
@@ -151,6 +155,8 @@ pub struct Digest {
     pub from: civil::DateTime,
     pub to: civil::DateTime,
     pub dry_run: bool,
+    /// A classify-only account: the flags shown were never set, by design.
+    pub classify_only: bool,
     /// Messages in the period, of every kind.
     pub total: usize,
     /// Only the flags that have messages, in [`SECTION_ORDER`].
@@ -250,6 +256,7 @@ pub fn build(input: &DigestInput<'_>) -> Digest {
             items.truncate(MAX_ITEMS_PER_SECTION);
             Section {
                 flag,
+                colour: (input.flag_colour)(flag),
                 title: clean_line(&(input.flag_name)(flag), MAX_SENDER_CHARS),
                 items,
                 hidden,
@@ -285,6 +292,7 @@ pub fn build(input: &DigestInput<'_>) -> Digest {
         from: local(input.period.0),
         to: local(input.period.1),
         dry_run: input.dry_run,
+        classify_only: input.derive_flags.is_some(),
         total: input.rows.len(),
         sections,
         noise,
@@ -392,6 +400,7 @@ mod tests {
             misfiled: &[],
             tz: &TimeZone::UTC,
             flag_name: &|flag| config.flag_name(flag).to_owned(),
+            flag_colour: &|flag| flag.colour(),
             derive_flags: derive,
             dry_run: false,
         })
@@ -534,6 +543,7 @@ mod tests {
             misfiled: &[],
             tz: &tz,
             flag_name: &|flag| config.flag_name(flag).to_owned(),
+            flag_colour: &|flag| flag.colour(),
             derive_flags: None,
             dry_run: false,
         });
@@ -571,6 +581,7 @@ mod tests {
             misfiled,
             tz: &TimeZone::UTC,
             flag_name: &|flag| config.flag_name(flag).to_owned(),
+            flag_colour: &|flag| flag.colour(),
             derive_flags: None,
             dry_run: false,
         })

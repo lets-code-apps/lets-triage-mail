@@ -330,6 +330,7 @@ pub async fn prepare_digest(
         misfiled: &misfiled,
         tz: now.time_zone(),
         flag_name: &|flag| config.flag_name(flag).to_owned(),
+        flag_colour: &|flag| policy.colour_for(flag),
         derive_flags,
         dry_run: account.dry_run(&config.policy),
     });
@@ -654,9 +655,12 @@ mod tests {
         let saved = std::fs::read(&path).unwrap();
         let message = mail_parser::MessageParser::default().parse(&saved).unwrap();
         let text = message.body_text(0).unwrap();
-        assert!(text.contains("Reply needed (1)"), "{text}");
+        assert!(text.contains("REPLY NEEDED (1)"), "{text}");
         assert!(text.contains("alice@example.org"), "{text}");
-        assert!(text.contains("Dry-run: nothing was flagged"), "{text}");
+        assert!(
+            text.contains("DRY RUN: Nothing was flagged in Mail"),
+            "{text}"
+        );
         let html = message.body_html(0).unwrap();
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
