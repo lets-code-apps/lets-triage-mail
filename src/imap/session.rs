@@ -487,7 +487,17 @@ impl ImapSession {
         Ok(info)
     }
 
-    /// List all folders and work out the inbox and Sent folder.
+    /// Open a folder read-only with `EXAMINE`. The server then refuses any change to it, which
+    /// makes this the safe way to look into a folder we must never modify (the Spam folder).
+    /// Fetches with `PEEK` work as after [`select`](Self::select).
+    pub async fn examine(&mut self, folder: &str) -> Result<MailboxInfo, ImapError> {
+        let mailbox = self.inner.examine(folder).await?;
+        let info = mailbox_info(&mailbox)?;
+        self.selected = Some(info.clone());
+        Ok(info)
+    }
+
+    /// List all folders and work out the inbox, Sent and Spam folders.
     pub async fn resolve_folders(&mut self) -> Result<ResolvedFolders, ImapError> {
         let names: Vec<_> = self
             .inner

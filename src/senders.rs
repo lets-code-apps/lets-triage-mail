@@ -266,7 +266,7 @@ pub async fn harvest_known_senders(
 /// callers clone names into it. A poisoned lock (another thread panicked while holding it) is
 /// recovered rather than propagated: SQLite rolls back a half-done transaction on its own, so
 /// the data is still consistent.
-async fn with_store<T, F>(store: &Arc<Mutex<Store>>, work: F) -> Result<T, HarvestError>
+pub(crate) async fn with_store<T, F>(store: &Arc<Mutex<Store>>, work: F) -> Result<T, HarvestError>
 where
     T: Send + 'static,
     F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,

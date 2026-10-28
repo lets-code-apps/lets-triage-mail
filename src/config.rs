@@ -366,6 +366,14 @@ pub struct AccountConfig {
     /// Leave empty to auto-detect the Sent folder from its special-use attribute.
     #[serde(default)]
     pub sent_folder: String,
+    /// The Spam folder to watch. Leave empty to detect it from its special-use attribute
+    /// (`\Junk`) or a common name such as `Spam`.
+    #[serde(default)]
+    pub junk_folder: String,
+    /// Look into the Spam folder, read-only, for mail from people the user knows. Nothing there
+    /// is moved or changed; such messages are only listed in the digest.
+    #[serde(default = "default_watch_junk")]
+    pub watch_junk: bool,
     /// Whether the service may set flags on this account. `false` means "classify for the
     /// digest only", for servers that cannot store flag colours (no custom keywords, as on
     /// wp.pl). A bare `\Flagged` without colour bits shows as red in Apple Mail, and red is
@@ -395,6 +403,10 @@ pub struct AccountConfig {
 }
 
 fn default_flagging() -> bool {
+    true
+}
+
+fn default_watch_junk() -> bool {
     true
 }
 
@@ -982,6 +994,20 @@ mod tests {
             config.accounts[0].provider_headers,
             Some(ProviderHeaders::Wp)
         );
+    }
+
+    #[test]
+    fn the_spam_watch_is_on_by_default_and_can_name_its_folder() {
+        let config = Config::parse(ACCOUNT).unwrap();
+        assert!(config.accounts[0].watch_junk);
+        assert_eq!(config.accounts[0].junk_folder, "");
+
+        let config = Config::parse(&format!(
+            "{ACCOUNT}junk_folder = \"Spam\"\nwatch_junk = false\n"
+        ))
+        .unwrap();
+        assert!(!config.accounts[0].watch_junk);
+        assert_eq!(config.accounts[0].junk_folder, "Spam");
     }
 
     #[test]

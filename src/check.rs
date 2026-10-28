@@ -543,8 +543,8 @@ impl DigestCheck {
     }
 }
 
-/// Runs all checks for one account: password, login, capabilities, inbox, Sent folder and the
-/// digest folder.
+/// Runs all checks for one account: password, login, capabilities, inbox, Sent and Spam folders
+/// and the digest folder.
 pub async fn probe_account(account: &AccountConfig, digest: &DigestCheck) -> Vec<CheckItem> {
     let area = account_area(&account.name);
 
@@ -570,6 +570,7 @@ pub async fn probe_account(account: &AccountConfig, digest: &DigestCheck) -> Vec
             &account.imap_settings(&password),
             &account.inbox,
             &account.sent_folder,
+            account.watch_junk.then_some(account.junk_folder.as_str()),
             account.flagging,
             digest,
         )
@@ -582,12 +583,14 @@ pub async fn probe_account(account: &AccountConfig, digest: &DigestCheck) -> Vec
 /// without a config file.
 ///
 /// `configured_sent` is the `sent_folder` setting; empty means "detect it". `flagging` is the
-/// account's `flagging` setting.
+/// account's `flagging` setting. `junk` is `None` when the Spam watch is off, otherwise the
+/// `junk_folder` setting (empty means "detect it").
 pub async fn probe_imap(
     area: &str,
     settings: &ImapSettings,
     inbox: &str,
     configured_sent: &str,
+    junk: Option<&str>,
     flagging: bool,
     digest: &DigestCheck,
 ) -> Vec<CheckItem> {
@@ -634,7 +637,10 @@ pub async fn probe_imap(
     }
 
     match step("listing folders", session.resolve_folders()).await {
-        Ok(folders) => items.push(sent_item(area, configured_sent, &folders)),
+        Ok(folders) => {
+            items.push(sent_item(area, configured_sent, &folders));
+            items.push(junk_item(area, junk, &folders));
+        }
         Err(message) => items.push(CheckItem::fail(area, message, RETRY_HINT)),
     }
 
@@ -653,6 +659,23 @@ pub async fn probe_imap(
                 area,
                 message,
                 "fix `sent_folder`, or leave it empty to detect the folder automatically",
+            )),
+        }
+    }
+
+    // The same for a configured Spam folder, opened read-only.
+    if let Some(configured) = junk.filter(|name| !name.is_empty()) {
+        let shown = decode_modified_utf7(configured);
+        let what = format!("opening the configured Spam folder {shown}");
+        match step(&what, session.examine(configured)).await {
+            Ok(_) => items.push(CheckItem::ok(
+                area,
+                format!("configured Spam folder {shown} can be opened"),
+            )),
+            Err(message) => items.push(CheckItem::fail(
+                area,
+                message,
+                "fix `junk_folder`, or leave it empty to detect the folder automatically",
             )),
         }
     }
@@ -849,6 +872,34 @@ pub fn sent_item(area: &str, configured: &str, resolved: &ResolvedFolders) -> Ch
             area,
             "no Sent folder found",
             "set `sent_folder` for this account; without it known senders are not learned and \"reply needed\" flags are not cleared after you answer",
+        ),
+    }
+}
+
+/// The Spam folder item. `junk` is `None` when `watch_junk` is off, otherwise the
+/// `junk_folder` setting (empty means "detect it").
+pub fn junk_item(area: &str, junk: Option<&str>, resolved: &ResolvedFolders) -> CheckItem {
+    let Some(configured) = junk else {
+        return CheckItem::ok(area, "Spam folder watch: off");
+    };
+    if !configured.is_empty() {
+        return CheckItem::ok(
+            area,
+            format!(
+                "Spam folder (configured): {}",
+                decode_modified_utf7(configured)
+            ),
+        );
+    }
+    match &resolved.junk {
+        Some(junk) => CheckItem::ok(
+            area,
+            format!("Spam folder (detected): {}", decode_modified_utf7(junk)),
+        ),
+        None => CheckItem::warn(
+            area,
+            "no Spam folder found",
+            "set `junk_folder` for this account, or `watch_junk = false`; without it, mail from people you know that lands in Spam is not listed in the digest",
         ),
     }
 }
@@ -1179,6 +1230,7 @@ mod tests {
         let mut folders = ResolvedFolders {
             inbox: String::from("INBOX"),
             sent: Some(String::from("Sent Items")),
+            junk: None,
             delimiter: None,
             prefix: String::new(),
         };
@@ -1199,6 +1251,36 @@ mod tests {
     }
 
     #[test]
+    fn junk_folder_is_off_configured_detected_or_a_warning() {
+        let mut folders = ResolvedFolders {
+            inbox: String::from("INBOX"),
+            sent: None,
+            junk: Some(String::from("Spam")),
+            delimiter: None,
+            prefix: String::new(),
+        };
+        assert!(
+            junk_item("a", None, &folders)
+                .message
+                .contains("watch: off")
+        );
+        assert!(
+            junk_item("a", Some(""), &folders)
+                .message
+                .contains("detected): Spam")
+        );
+        assert!(
+            junk_item("a", Some("Junk"), &folders)
+                .message
+                .contains("configured): Junk")
+        );
+        folders.junk = None;
+        let item = junk_item("a", Some(""), &folders);
+        assert_eq!(item.status, Status::Warn);
+        assert!(item.hint.unwrap().contains("junk_folder"));
+    }
+
+    #[test]
     fn every_connect_error_gets_a_specific_hint() {
         assert!(connect_hint(&ImapError::Timeout).contains("firewall"));
         assert!(connect_hint(&ImapError::Tls(String::from("x"))).contains("993"));
@@ -1216,6 +1298,7 @@ mod tests {
         let resolved = ResolvedFolders {
             inbox: "INBOX".into(),
             sent: Some("[Gmail]/Wys&AUI-ane".into()),
+            junk: None,
             delimiter: Some("/".into()),
             prefix: String::new(),
         };

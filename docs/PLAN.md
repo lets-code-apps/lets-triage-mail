@@ -35,7 +35,9 @@ Every agent reads `CLAUDE.md` first. In addition:
 3. **Tests come with the code.** Port the matching prototype tests (path in `CLAUDE.local.md`)
    as the behavioural spec. Drop tests for things that are not in v1 (moves, unsubscribe, web UI).
 4. **Before finishing:** `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` and
-   `cargo test` all pass.
+   `cargo test` all pass. If the task touches IMAP (worker, folders, flags, APPEND, Spam watch),
+   `cargo test --test imap_integration -- --ignored` passes too, against the Dovecot container
+   (`tests/common/mod.rs`).
 5. **Match the existing style:** doc comments on every public item, comments that explain *why*,
    readable code over clever code (Piotr is learning Rust from this codebase).
 6. **Check crate versions and APIs** on crates.io/docs.rs before using them; the candidate list in
@@ -327,7 +329,7 @@ Tasks 4.1–4.3 depend on phase 3. 4.2 and 4.3 can run in parallel after 4.1.
 - *Done.* The Dovecot tests were written but, as always, run in CI only; the APPEND itself is
   also tested locally against a scripted fake IMAP server (`imap/fake_server.rs`).
 
-### 5.3 Spam-folder watch, read-only (`imap/junk.rs`)
+### 5.3 Spam-folder watch, read-only (`imap/junk.rs`) (done)
 Found on 2026-10-25: wp.pl filed a DKIM-valid message from the user's own Gmail account into
 `Spam` (`X-WP-SPAM: YES (CB)`). The inbox worker never saw it, because it only watches INBOX.
 - Watch the folder with the `\Junk` special-use attribute (`Spam` on wp.pl), or the configured

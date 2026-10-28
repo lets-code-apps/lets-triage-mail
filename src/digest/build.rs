@@ -29,7 +29,7 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
 use crate::engine::{Category, FlagPolicy, TriageFlag, Trust, choose_flag};
-use crate::store::DigestRow;
+use crate::store::{DigestRow, MisfiledRow};
 
 /// Flagged messages shown per flag. More than this is a flag problem, not a reading problem;
 /// the rest is reported as a count.
@@ -63,6 +63,8 @@ pub struct DigestInput<'a> {
     pub period: (i64, i64),
     /// The messages processed in that period, oldest first.
     pub rows: &'a [DigestRow],
+    /// Trusted mail found in the Spam folder in that period, oldest first.
+    pub misfiled: &'a [MisfiledRow],
     /// The user's time zone, for the times shown next to each message.
     pub tz: &'a TimeZone,
     /// The configured display name of a flag (`Config::flag_name`).
@@ -154,6 +156,11 @@ pub struct Digest {
     /// Only the flags that have messages, in [`SECTION_ORDER`].
     pub sections: Vec<Section>,
     pub noise: Noise,
+    /// Trusted mail found in the Spam folder, at most [`MAX_ITEMS_PER_SECTION`]. The `reason`
+    /// is empty and `received` is the message's own date when it had one.
+    pub misfiled: Vec<Item>,
+    /// How many more misfiled messages there were.
+    pub misfiled_hidden: usize,
 }
 
 impl Digest {
@@ -250,6 +257,28 @@ pub fn build(input: &DigestInput<'_>) -> Digest {
         })
         .collect();
 
+    let mut misfiled: Vec<Item> = input
+        .misfiled
+        .iter()
+        .map(|row| Item {
+            sender: clean_line(&row.sender, MAX_SENDER_CHARS),
+            subject: clean_line(&row.subject, MAX_SUBJECT_CHARS),
+            reason: String::new(),
+            deadline: None,
+            // The message's own date when it parses, otherwise when we found it.
+            received: row
+                .date
+                .as_deref()
+                .and_then(|date| date.parse::<Timestamp>().ok())
+                .map_or_else(
+                    || local(row.created_at),
+                    |at| at.to_zoned(input.tz.clone()).datetime(),
+                ),
+        })
+        .collect();
+    let misfiled_hidden = misfiled.len().saturating_sub(MAX_ITEMS_PER_SECTION);
+    misfiled.truncate(MAX_ITEMS_PER_SECTION);
+
     Digest {
         account: clean_line(input.account, MAX_SENDER_CHARS),
         date: input.date,
@@ -259,6 +288,8 @@ pub fn build(input: &DigestInput<'_>) -> Digest {
         total: input.rows.len(),
         sections,
         noise,
+        misfiled,
+        misfiled_hidden,
     }
 }
 
@@ -358,6 +389,7 @@ mod tests {
             // 2026-10-25 07:00 to 2026-10-26 07:00 UTC.
             period: (1_792_911_600, 1_792_998_000),
             rows,
+            misfiled: &[],
             tz: &TimeZone::UTC,
             flag_name: &|flag| config.flag_name(flag).to_owned(),
             derive_flags: derive,
@@ -499,6 +531,7 @@ mod tests {
             date: civil::date(2026, 10, 25),
             period: (1_792_911_600, 1_792_998_000),
             rows: &rows,
+            misfiled: &[],
             tz: &tz,
             flag_name: &|flag| config.flag_name(flag).to_owned(),
             derive_flags: None,
@@ -517,5 +550,73 @@ mod tests {
         assert_eq!(clean_line("   ", 5), "");
         // Characters, not bytes: never splits a multi-byte character.
         assert_eq!(clean_line("ééééé", 3), "éé…");
+    }
+
+    fn misfiled_row(sender: &str, date: Option<&str>, created_at: i64) -> MisfiledRow {
+        MisfiledRow {
+            sender: sender.into(),
+            subject: "Lunch?".into(),
+            date: date.map(String::from),
+            created_at,
+        }
+    }
+
+    fn build_with_misfiled(misfiled: &[MisfiledRow]) -> Digest {
+        let config = Config::default();
+        build(&DigestInput {
+            account: "work",
+            date: civil::date(2026, 10, 26),
+            period: (1_792_911_600, 1_792_998_000),
+            rows: &[],
+            misfiled,
+            tz: &TimeZone::UTC,
+            flag_name: &|flag| config.flag_name(flag).to_owned(),
+            derive_flags: None,
+            dry_run: false,
+        })
+    }
+
+    #[test]
+    fn misfiled_mail_uses_the_message_date_when_it_has_one() {
+        let rows = [
+            misfiled_row(
+                "anna@friend.example",
+                Some("2026-10-25T09:30:00Z"),
+                1_792_911_600,
+            ),
+            // No date: the time we found it, 2026-10-25 07:01 UTC.
+            misfiled_row("bob@friend.example", None, 1_792_911_660),
+        ];
+        let digest = build_with_misfiled(&rows);
+        assert_eq!(digest.misfiled.len(), 2);
+        assert_eq!(digest.misfiled_hidden, 0);
+        assert_eq!(digest.misfiled[0].sender, "anna@friend.example");
+        assert_eq!(
+            digest.misfiled[0].received,
+            civil::date(2026, 10, 25).at(9, 30, 0, 0)
+        );
+        assert_eq!(
+            digest.misfiled[1].received,
+            civil::date(2026, 10, 25).at(7, 1, 0, 0)
+        );
+        assert!(digest.misfiled[0].reason.is_empty());
+        // Misfiled mail is not counted as classified mail.
+        assert_eq!(digest.total, 0);
+    }
+
+    #[test]
+    fn misfiled_text_is_cleaned_and_the_list_is_capped() {
+        let mut rows = vec![misfiled_row("evil\r\nname@x.example", None, 1_792_911_600)];
+        for i in 0..30 {
+            rows.push(misfiled_row(
+                &format!("p{i}@x.example"),
+                None,
+                1_792_911_600,
+            ));
+        }
+        let digest = build_with_misfiled(&rows);
+        assert_eq!(digest.misfiled[0].sender, "evil name@x.example");
+        assert_eq!(digest.misfiled.len(), MAX_ITEMS_PER_SECTION);
+        assert_eq!(digest.misfiled_hidden, 31 - MAX_ITEMS_PER_SECTION);
     }
 }

@@ -37,6 +37,7 @@
 #[cfg(test)]
 pub(crate) mod fake_server;
 pub mod folders;
+pub mod junk;
 pub mod session;
 pub mod utf7;
 pub mod worker;

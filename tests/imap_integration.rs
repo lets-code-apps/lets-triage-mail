@@ -313,6 +313,7 @@ async fn check_probe_passes_against_dovecot() {
         &settings,
         "INBOX",
         "",
+        Some(""),
         true,
         &digest_check(),
     )
@@ -335,6 +336,7 @@ async fn check_probe_reports_a_wrong_password_with_a_hint() {
         &settings,
         "INBOX",
         "",
+        Some(""),
         true,
         &digest_check(),
     )
@@ -1280,8 +1282,107 @@ async fn check_reports_a_missing_digest_folder() {
         folder: "No/Such/Folder".into(),
         ..digest_check()
     };
-    let items = probe_imap("Account test", &settings, "INBOX", "", true, &digest).await;
+    let items = probe_imap(
+        "Account test",
+        &settings,
+        "INBOX",
+        "",
+        Some(""),
+        true,
+        &digest,
+    )
+    .await;
     let failed: Vec<_> = items.iter().filter(|i| i.status == Status::Fail).collect();
     assert_eq!(failed.len(), 1, "{items:#?}");
     assert!(failed[0].message.contains("digest folder"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Spam-folder watch (task 5.3)
+// ---------------------------------------------------------------------------------------------
+
+/// A message for the Spam folder with a passing DKIM result from the receiving server.
+fn spam_message(from: &str, subject: &str) -> Vec<u8> {
+    format!(
+        "Authentication-Results: mx.test; dkim=pass header.d=example.org\r\n\
+         From: {from}\r\nTo: me@example.org\r\nSubject: {subject}\r\n\
+         Message-ID: <{subject}@tests.example.org>\r\n\
+         Date: Mon, 26 Oct 2026 09:00:00 +0000\r\n\r\nHello.\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+#[ignore = "needs the Dovecot test container"]
+async fn junk_watch_reports_a_known_sender_and_changes_nothing() {
+    use lets_triage_mail::imap::junk::scan_junk;
+
+    let settings = fresh_account();
+    let account = account_config(&settings);
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    store
+        .lock()
+        .unwrap()
+        .add_known_sender("test", "anna@example.org")
+        .unwrap();
+
+    let mut session = ImapSession::connect(&settings).await.unwrap();
+    assert_eq!(
+        session.resolve_folders().await.unwrap().junk.as_deref(),
+        Some("Junk")
+    );
+
+    // First run: only the position is recorded.
+    let first = scan_junk(&mut session, &store, &account, None)
+        .await
+        .unwrap();
+    assert_eq!(first.folder.as_deref(), Some("Junk"));
+    assert_eq!(first.scanned, 0);
+
+    append_raw(
+        &settings,
+        "Junk",
+        None,
+        spam_message("anna@example.org", "known"),
+    )
+    .await;
+    append_raw(
+        &settings,
+        "Junk",
+        None,
+        spam_message("stranger@example.org", "stranger"),
+    )
+    .await;
+
+    let second = scan_junk(&mut session, &store, &account, None)
+        .await
+        .unwrap();
+    assert_eq!(second.scanned, 2);
+    assert_eq!(second.misfiled, 1);
+    let rows = store
+        .lock()
+        .unwrap()
+        .misfiled_rows("test", 0, i64::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sender, "anna@example.org");
+    assert_eq!(rows[0].subject, "known");
+
+    // Nothing moved, nothing marked as read.
+    let info = session.examine("Junk").await.unwrap();
+    assert_eq!(info.exists, 2);
+    for meta in session.fetch_meta_range(1, 10).await.unwrap() {
+        assert!(
+            !meta.flags.iter().any(|f| f == "\\Seen"),
+            "{:?}",
+            meta.flags
+        );
+    }
+
+    // A third run finds nothing new.
+    let third = scan_junk(&mut session, &store, &account, None)
+        .await
+        .unwrap();
+    assert_eq!(third.scanned, 0);
+    session.logout().await.unwrap();
 }

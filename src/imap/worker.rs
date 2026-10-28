@@ -2,6 +2,8 @@
 //!
 //! [`run_account`] runs until its [`CancellationToken`] fires. Its loop, per connection:
 //!
+//! 0. Now and then (every [`WorkerTiming::junk_interval`]) look into the Spam folder,
+//!    read-only, for trusted mail filed there by mistake ([`super::junk`]).
 //! 1. `SELECT` the inbox. Compare UIDVALIDITY and the saved position ([`plan_cursor`]).
 //! 2. Fetch size and flags of every UID above the saved one, then process each message
 //!    ([`Ctx::process_message`]).
@@ -68,6 +70,7 @@ use jiff::civil::Date;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::junk::scan_junk;
 use super::{IdleEnd, ImapError, ImapSession, ImapSettings, MessageMeta};
 use crate::config::{AccountConfig, Config, ConfigError, FlagMode};
 use crate::decider::{Decider, Evidence};
@@ -110,6 +113,9 @@ pub struct WorkerTiming {
     /// How often the auto-clear pass looks at the flags we set. It runs at a wake-up, so the
     /// real gap is "at least this, at most one more IDLE renewal".
     pub clear_interval: Duration,
+    /// How often the Spam folder is looked at (see [`super::junk`]). Like the clear pass, it
+    /// runs at a wake-up, so the real gap is "at least this, at most one more IDLE renewal".
+    pub junk_interval: Duration,
 }
 
 impl Default for WorkerTiming {
@@ -122,6 +128,7 @@ impl Default for WorkerTiming {
             retry_initial: Duration::from_secs(60),
             retry_max: Duration::from_secs(60 * 60),
             clear_interval: Duration::from_secs(15 * 60),
+            junk_interval: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -579,8 +586,17 @@ impl<D: Decider> Ctx<'_, D> {
 
         // When the clear pass last ran on this connection; `None` means "run it right away".
         let mut last_clear: Option<Instant> = None;
+        // The same for the Spam-folder watch.
+        let mut last_junk: Option<Instant> = None;
 
         loop {
+            // First, so the inbox is selected again right after it and the IDLE below still
+            // watches the inbox.
+            if last_junk.is_none_or(|at| at.elapsed() >= self.timing.junk_interval) {
+                self.junk_pass(&mut session).await?;
+                last_junk = Some(Instant::now());
+            }
+
             let info = session.select(inbox).await?;
             ensure_keywords(&self.account.name, self.mode(), info.keywords_allowed)?;
 
@@ -641,6 +657,34 @@ impl<D: Decider> Ctx<'_, D> {
             {
                 return finish(session).await;
             }
+        }
+    }
+
+    /// Look into the Spam folder for trusted mail (see [`super::junk`]).
+    ///
+    /// A folder the server refuses to open (`NO`, for example a wrong `junk_folder`) is logged
+    /// and skipped, so it can never stop the inbox from being watched. Every other error is
+    /// handled like any worker error.
+    async fn junk_pass(&self, session: &mut ImapSession) -> Result<(), WorkerError> {
+        let authserv = Some(self.config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
+        match scan_junk(session, self.store, self.account, authserv).await {
+            Ok(report) => {
+                if report.scanned > 0 {
+                    tracing::info!(
+                        account = %self.account.name, scanned = report.scanned,
+                        misfiled = report.misfiled, "looked into the Spam folder"
+                    );
+                }
+                Ok(())
+            }
+            Err(WorkerError::Imap(ImapError::Imap(async_imap::error::Error::No(message)))) => {
+                tracing::warn!(
+                    account = %self.account.name, %message,
+                    "cannot open the Spam folder; check `junk_folder` (the inbox is still watched)"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2470,5 +2514,11 @@ mod tests {
             1,
             "the record must survive a failed STORE"
         );
+    }
+
+    #[test]
+    fn the_spam_watch_runs_every_quarter_hour_by_default() {
+        let timing = WorkerTiming::default();
+        assert_eq!(timing.junk_interval, Duration::from_secs(15 * 60));
     }
 }
