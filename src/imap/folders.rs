@@ -36,6 +36,8 @@ pub struct ResolvedFolders {
     pub inbox: String,
     /// The Sent folder, or `None` if the server has none we can recognise.
     pub sent: Option<String>,
+    /// The Spam folder, or `None` if the server has none we can recognise.
+    pub junk: Option<String>,
     /// The hierarchy delimiter, if the server has one.
     pub delimiter: Option<String>,
     /// The personal namespace prefix, such as `INBOX.`; empty when folders live at top level.
@@ -51,10 +53,13 @@ const SENT_NAMES: [&str; 5] = [
     "Gesendet",
 ];
 
-/// Find the inbox and the Sent folder.
+/// Plain names used for the Spam folder, most common first. `Spam` is what wp.pl uses.
+const JUNK_NAMES: [&str; 4] = ["Junk", "Spam", "Junk E-mail", "Junk Email"];
+
+/// Find the inbox, the Sent folder and the Spam folder.
 ///
-/// Order for Sent: a folder with the special-use attribute `\Sent` (RFC 6154), then the common
-/// names, both below the personal namespace prefix and at top level.
+/// Order for Sent and Spam: a folder with the special-use attribute (`\Sent` or `\Junk`,
+/// RFC 6154), then the common names, both below the personal namespace prefix and at top level.
 pub fn resolve_folders(listed: &[ListedFolder]) -> ResolvedFolders {
     let delimiter = listed
         .iter()
@@ -64,16 +69,33 @@ pub fn resolve_folders(listed: &[ListedFolder]) -> ResolvedFolders {
 
     let prefix = namespace_prefix(listed, delimiter.as_deref());
 
+    ResolvedFolders {
+        inbox: "INBOX".to_string(),
+        sent: find_folder(listed, &prefix, "\\Sent", &SENT_NAMES),
+        junk: find_folder(listed, &prefix, "\\Junk", &JUNK_NAMES),
+        delimiter,
+        prefix,
+    }
+}
+
+/// The selectable folder with the special-use `attribute`, or else the first of `names` that
+/// exists, tried with the namespace `prefix` first and then bare.
+fn find_folder(
+    listed: &[ListedFolder],
+    prefix: &str,
+    attribute: &str,
+    names: &[&str],
+) -> Option<String> {
     let selectable = |f: &&ListedFolder| !f.has_attribute("\\Noselect");
 
     let by_special_use = listed
         .iter()
         .filter(selectable)
-        .find(|f| f.has_attribute("\\Sent"))
+        .find(|f| f.has_attribute(attribute))
         .map(|f| f.name.clone());
 
-    let sent = by_special_use.or_else(|| {
-        SENT_NAMES.iter().find_map(|plain| {
+    by_special_use.or_else(|| {
+        names.iter().find_map(|plain| {
             let prefixed = format!("{prefix}{plain}");
             // Try the prefixed spelling first, then the bare one.
             [prefixed.as_str(), plain].iter().find_map(|candidate| {
@@ -84,14 +106,7 @@ pub fn resolve_folders(listed: &[ListedFolder]) -> ResolvedFolders {
                     .map(|f| f.name.clone())
             })
         })
-    });
-
-    ResolvedFolders {
-        inbox: "INBOX".to_string(),
-        sent,
-        delimiter,
-        prefix,
-    }
+    })
 }
 
 /// `INBOX.` when folders exist below `INBOX` + delimiter, otherwise empty.
@@ -188,5 +203,33 @@ mod tests {
     #[test]
     fn inbox_is_always_inbox() {
         assert_eq!(resolve_folders(&[]).inbox, "INBOX");
+    }
+
+    #[test]
+    fn junk_is_found_by_special_use() {
+        let listed = [
+            folder("INBOX", "/", &[]),
+            folder("Junk", "/", &[]),
+            folder("Unwanted", "/", &["\\Junk"]),
+        ];
+        assert_eq!(resolve_folders(&listed).junk.as_deref(), Some("Unwanted"));
+    }
+
+    #[test]
+    fn junk_falls_back_to_the_spam_name() {
+        let listed = [folder("INBOX", "/", &[]), folder("Spam", "/", &[])];
+        assert_eq!(resolve_folders(&listed).junk.as_deref(), Some("Spam"));
+    }
+
+    #[test]
+    fn junk_respects_the_inbox_prefix() {
+        let listed = [folder("INBOX", ".", &[]), folder("INBOX.Junk", ".", &[])];
+        assert_eq!(resolve_folders(&listed).junk.as_deref(), Some("INBOX.Junk"));
+    }
+
+    #[test]
+    fn no_junk_folder_means_none() {
+        let listed = [folder("INBOX", "/", &[]), folder("Sent", "/", &["\\Sent"])];
+        assert_eq!(resolve_folders(&listed).junk, None);
     }
 }

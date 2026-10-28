@@ -1,7 +1,7 @@
 //! Helpers shared by the integration tests that need a real IMAP server.
 //!
-//! The server is a Dovecot container (see `tests/dovecot/dovecot.conf`). Locally nothing runs
-//! it, so every test that uses it is `#[ignore]`d. To run them:
+//! The server is a Dovecot container (see `tests/dovecot/dovecot.conf`). Plain `cargo test`
+//! does not start it, so every test that uses it is `#[ignore]`d. To run them:
 //!
 //! ```text
 //! docker run -d --name ltm-dovecot -p 1143:143 \
@@ -9,6 +9,9 @@
 //!   dovecot/dovecot:2.3.21.1
 //! cargo test --test imap_integration -- --ignored
 //! ```
+//!
+//! On Apple Silicon, turn off Docker Desktop's Rosetta emulation first: the image is amd64-only
+//! and Dovecot crashes under Rosetta (see `docs/ARCHITECTURE.md`, Testing).
 //!
 //! `LTM_IMAP_TEST_HOST` and `LTM_IMAP_TEST_PORT` override the default `127.0.0.1:1143`.
 

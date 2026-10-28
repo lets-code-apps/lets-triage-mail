@@ -310,10 +310,11 @@ pub async fn prepare_digest(
 ) -> Result<Prepared, DigestError> {
     let name = account.name.clone();
     let now_seconds = now.timestamp().as_second();
-    let (period, rows) = with_store(store, move |s| {
+    let (period, rows, misfiled) = with_store(store, move |s| {
         let period = digest_period(now_seconds, s.last_digest_at(&name)?);
         let rows = s.digest_rows(&name, period.0, period.1)?;
-        Ok((period, rows))
+        let misfiled = s.misfiled_rows(&name, period.0, period.1)?;
+        Ok((period, rows, misfiled))
     })
     .await?;
 
@@ -326,6 +327,7 @@ pub async fn prepare_digest(
         date: now.date(),
         period,
         rows: &rows,
+        misfiled: &misfiled,
         tz: now.time_zone(),
         flag_name: &|flag| config.flag_name(flag).to_owned(),
         derive_flags,

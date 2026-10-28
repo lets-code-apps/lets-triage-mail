@@ -79,7 +79,7 @@ gets moved.
 Sections: `[llm]` (base_url, model, timeout, max_body_chars, max_concurrent=1), `[policy]`
 (dry_run, min_confidence, known_senders_from_sent, authserv_id), `[flags.*]` (enabled, colour,
 name), `[digest]` (time, folder, from, language), `[[accounts]]` (name, host, port, tls, username,
-password_command, inbox, sent_folder, flagging, dry_run, provider_headers).
+password_command, inbox, sent_folder, junk_folder, watch_junk, flagging, dry_run, provider_headers).
 
 - Passwords: `password_command` (macOS: `security find-generic-password -s lets-triage-mail -a <acct> -w`)
   or env var `<NAME>_PASSWORD_<ACCOUNT>`. Never store passwords in the config or the DB.

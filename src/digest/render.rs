@@ -148,6 +148,9 @@ fn hidden_line(section: &Section) -> Option<String> {
 
 const FOOTER: &str = "Written by Let's Triage Mail on your own machine. Nothing left it.";
 
+const MISFILED_TITLE: &str = "Possibly misfiled in Spam";
+const MISFILED_NOTE: &str = "People you know, with a valid signature, whose mail is in your Spam folder. Nothing was moved.";
+
 // ---------------------------------------------------------------------------------------------
 // Plain text
 // ---------------------------------------------------------------------------------------------
@@ -187,6 +190,26 @@ fn render_text(digest: &Digest) -> String {
         }
         if let Some(more) = hidden_line(section) {
             line(&format!("  ... {more}"));
+        }
+    }
+
+    if !digest.misfiled.is_empty() {
+        line("");
+        line(&format!(
+            "{MISFILED_TITLE} ({})",
+            digest.misfiled.len() + digest.misfiled_hidden
+        ));
+        line(MISFILED_NOTE);
+        for item in &digest.misfiled {
+            line(&format!(
+                "- {}: {} [{}]",
+                item.sender,
+                item.subject,
+                short_time(item.received)
+            ));
+        }
+        if digest.misfiled_hidden > 0 {
+            line(&format!("  ... and {} more", digest.misfiled_hidden));
         }
     }
 
@@ -312,6 +335,30 @@ fn render_html(digest: &Digest) -> String {
             out.push_str(&format!(
                 "<li class=\"muted\">{}</li>\n",
                 escape_html(&more)
+            ));
+        }
+        out.push_str("</ul>\n");
+    }
+
+    if !digest.misfiled.is_empty() {
+        out.push_str(&format!(
+            "<h2>{} ({})</h2>\n<p class=\"muted\">{}</p>\n<ul>\n",
+            escape_html(MISFILED_TITLE),
+            digest.misfiled.len() + digest.misfiled_hidden,
+            escape_html(MISFILED_NOTE)
+        ));
+        for item in &digest.misfiled {
+            out.push_str(&format!(
+                "<li><strong>{}</strong>: {} <span class=\"muted\">[{}]</span></li>\n",
+                escape_html(&item.sender),
+                escape_html(&item.subject),
+                escape_html(&short_time(item.received))
+            ));
+        }
+        if digest.misfiled_hidden > 0 {
+            out.push_str(&format!(
+                "<li class=\"muted\">{}</li>\n",
+                escape_html(&format!("and {} more", digest.misfiled_hidden))
             ));
         }
         out.push_str("</ul>\n");
@@ -456,6 +503,8 @@ mod tests {
                     },
                 ],
             },
+            misfiled: vec![],
+            misfiled_hidden: 0,
         }
     }
 
@@ -648,5 +697,50 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
         let bytes = compose(&rendered, &env).unwrap();
         let message = mail_parser::MessageParser::default().parse(&bytes).unwrap();
         assert!(header_values(&message, "Bcc").is_empty());
+    }
+
+    #[test]
+    fn misfiled_mail_gets_its_own_section_before_the_rest() {
+        let digest = Digest {
+            misfiled: vec![item("anna@friend.example", "Lunch?", "")],
+            misfiled_hidden: 2,
+            ..full_digest()
+        };
+        let text = render(&digest).text;
+        let expected = "\n\
+Possibly misfiled in Spam (3)
+People you know, with a valid signature, whose mail is in your Spam folder. Nothing was moved.
+- anna@friend.example: Lunch? [25 Oct 14:02]
+  ... and 2 more
+";
+        assert!(text.contains(expected), "{text}");
+        let section = text.find("Possibly misfiled").unwrap();
+        assert!(section > text.find("Deadline (4)").unwrap(), "{text}");
+        assert!(section < text.find("The rest").unwrap(), "{text}");
+    }
+
+    #[test]
+    fn no_misfiled_section_without_misfiled_mail() {
+        let rendered = render(&full_digest());
+        assert!(!rendered.text.contains("misfiled"));
+        assert!(!rendered.html.contains("misfiled"));
+    }
+
+    #[test]
+    fn misfiled_html_is_escaped() {
+        let digest = Digest {
+            misfiled: vec![item(
+                "<b>x</b>@evil.example",
+                "<script>alert(1)</script>",
+                "",
+            )],
+            ..full_digest()
+        };
+        let html = render(&digest).html;
+        assert!(html.contains("Possibly misfiled in Spam (1)"), "{html}");
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;@evil.example"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<b>x</b>"), "{html}");
     }
 }

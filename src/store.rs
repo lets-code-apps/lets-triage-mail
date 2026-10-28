@@ -177,6 +177,23 @@ const MIGRATIONS: &[&str] = &[
     ) WITHOUT ROWID;
     CREATE INDEX own_digests_uid ON own_digests (account, mailbox, uidvalidity, uid);
     ",
+    // Version 4 (phase 5.3): trusted mail found in the Spam folder.
+    "
+    -- Messages in the Spam folder from a trusted sender whose DKIM signature passed, for the
+    -- digest. Metadata only, like `processed`: no body column, on purpose.
+    CREATE TABLE misfiled (
+        account     TEXT NOT NULL,
+        mailbox     TEXT NOT NULL,
+        uidvalidity INTEGER NOT NULL,
+        uid         INTEGER NOT NULL,
+        sender      TEXT NOT NULL,
+        subject     TEXT NOT NULL,
+        date        TEXT,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (account, mailbox, uidvalidity, uid)
+    ) WITHOUT ROWID;
+    CREATE INDEX misfiled_created ON misfiled (account, created_at);
+    ",
 ];
 
 /// Everything that can go wrong in the store.
@@ -311,6 +328,27 @@ pub struct DigestRow {
     /// the model was not asked (blocked sender) or failed.
     pub verdict: Option<Verdict>,
     /// When the message was processed (Unix seconds).
+    pub created_at: i64,
+}
+
+/// A message in the Spam folder that may have been filed there by mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisfiledRecord {
+    pub key: MessageKey,
+    pub sender: String,
+    pub subject: String,
+    /// The message's `Date` header as RFC 3339, when it parsed.
+    pub date: Option<String>,
+}
+
+/// One possibly misfiled message, as the digest reads it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisfiledRow {
+    pub sender: String,
+    pub subject: String,
+    /// The message's `Date` header as RFC 3339, when it parsed.
+    pub date: Option<String>,
+    /// When it was found (Unix seconds).
     pub created_at: i64,
 }
 
@@ -1080,6 +1118,49 @@ impl Store {
         )?)
     }
 
+    // ---- possibly misfiled in Spam ------------------------------------------------
+
+    /// Records a possibly misfiled message. Recording the same message again changes nothing,
+    /// so it keeps the time it was first found and appears in one digest only.
+    pub fn record_misfiled(&self, record: &MisfiledRecord) -> Result<()> {
+        let key = &record.key;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO misfiled
+               (account, mailbox, uidvalidity, uid, sender, subject, date, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                key.account,
+                key.mailbox,
+                key.uidvalidity,
+                key.uid,
+                record.sender,
+                truncate(&record.subject, MAX_SUBJECT_CHARS),
+                record.date,
+                now_unix(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The possibly misfiled messages of one account found in `since..=until` (Unix seconds),
+    /// oldest first.
+    pub fn misfiled_rows(&self, account: &str, since: i64, until: i64) -> Result<Vec<MisfiledRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender, subject, date, created_at FROM misfiled
+             WHERE account = ?1 AND created_at >= ?2 AND created_at <= ?3
+             ORDER BY created_at, uid",
+        )?;
+        let rows = stmt.query_map(params![account, since, until], |row| {
+            Ok(MisfiledRow {
+                sender: row.get(0)?,
+                subject: row.get(1)?,
+                date: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- labels -------------------------------------------------------------------
 
     /// Adds a row to the labelled dataset, replacing an earlier one for the same message.
@@ -1390,6 +1471,7 @@ mod tests {
             "retry_queue",
             "digest_state",
             "labels",
+            "misfiled",
         ] {
             assert_eq!(count(&s, table), 0, "{table} should exist and be empty");
         }
@@ -1932,5 +2014,49 @@ mod tests {
                 due: 1
             }]
         );
+    }
+
+    fn misfiled(account: &str, uid: u32, subject: &str) -> MisfiledRecord {
+        MisfiledRecord {
+            key: MessageKey {
+                account: account.into(),
+                mailbox: "Junk".into(),
+                uidvalidity: 7,
+                uid,
+            },
+            sender: "anna@friend.example".into(),
+            subject: subject.into(),
+            date: Some("2026-10-26T09:00:00Z".into()),
+        }
+    }
+
+    #[test]
+    fn misfiled_mail_is_recorded_once_and_read_back_per_account() {
+        let s = store();
+        s.record_misfiled(&misfiled("a", 5, "Lunch?")).unwrap();
+        // The same message again: still one row.
+        s.record_misfiled(&misfiled("a", 5, "Lunch?")).unwrap();
+        s.record_misfiled(&misfiled("b", 6, "Other account"))
+            .unwrap();
+        assert_eq!(count(&s, "misfiled"), 2);
+
+        let rows = s.misfiled_rows("a", 0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender, "anna@friend.example");
+        assert_eq!(rows[0].subject, "Lunch?");
+        assert_eq!(rows[0].date.as_deref(), Some("2026-10-26T09:00:00Z"));
+        assert!(rows[0].created_at > 0);
+
+        // Outside the period: nothing.
+        assert!(s.misfiled_rows("a", 0, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn misfiled_subjects_are_truncated() {
+        let s = store();
+        s.record_misfiled(&misfiled("a", 1, &"x".repeat(1000)))
+            .unwrap();
+        let rows = s.misfiled_rows("a", 0, i64::MAX).unwrap();
+        assert_eq!(rows[0].subject.chars().count(), MAX_SUBJECT_CHARS);
     }
 }
