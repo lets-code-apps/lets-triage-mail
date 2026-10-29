@@ -14,9 +14,9 @@
 //! variables reliably.
 //!
 //! The only image is the header (`assets/digest-header.jpg`), sent **inside the message** as
-//! an inline part (`cid:digest-header`), not as a link: the digest loads nothing from the
-//! network, so opening it tells nobody anything. A CSS gradient under it shows when a client
-//! blocks images anyway.
+//! an inline part and shown with `<img src="cid:digest-header">`, not as a link: the digest
+//! loads nothing from the network, so opening it tells nobody anything. A CSS gradient under it
+//! shows when a client blocks images anyway.
 //!
 //! **Everything that came from email is escaped** by [`escape_html`]: senders, subjects and the
 //! model's reasons. The model's reasons are themselves derived from hostile input.
@@ -41,7 +41,7 @@ pub const DIGEST_HEADER_VALUE: &str = "digest";
 /// The longest subject we write.
 const MAX_SUBJECT_CHARS: usize = 150;
 
-/// The header image, from the design repo (`render-header.html`): the grain with the emblem.
+/// The header image: the grain, the emblem and the title (a draft; the design repo has no titled one yet).
 const HEADER_IMAGE: &[u8] = include_bytes!("../../assets/digest-header.jpg");
 /// Its `Content-ID`; the HTML refers to it as `cid:digest-header`.
 const HEADER_CID: &str = "digest-header";
@@ -375,16 +375,18 @@ fn pill(text: &str, colour: Option<FlagColour>) -> String {
     )
 }
 
-/// The header: the grain image with the emblem, the lockup as live text over a scrim, and an
-/// ember gradient under the image for clients that block it.
+/// The header: one picture with the grain, the emblem and the title drawn in, as an `<img>`,
+/// with an ember gradient behind it for clients that block images.
+///
+/// Drawn in, not live text over the picture: Gmail on iOS drops negative margins (the text fell
+/// under the picture), drops CSS background images (the picture vanished), and recolours text
+/// in dark mode but never images. An `<img>` also survives forwarding. The picture is 1200×400
+/// and scales whole: the 30 px title is about 17 px on a phone.
 fn header_html() -> String {
     format!(
-        "<tr><td height=\"152\" style=\"border-radius:24px;background-color:#24150F;background-image:linear-gradient(90deg,rgba(0,0,0,0.55) 0,rgba(0,0,0,0.55) 130px,rgba(0,0,0,0) 210px),url(cid:{HEADER_CID}),radial-gradient(120% 140% at 100% 0%,#D98A45 0%,#B8612E 22%,rgba(107,58,34,0) 60%),linear-gradient(110deg,#24150F 0%,#24150F 40%,#6B3A22 100%);background-size:auto,cover,auto,auto;background-position:0 0,right center,0 0,0 0;background-repeat:no-repeat;padding:24px;color:#FFFFFF;vertical-align:top\">
-<div style=\"font:400 17px/1.05 {FONT};color:#FFFFFF\">let&rsquo;s</div>
-<div style=\"font:600 17px/1.15 {FONT};letter-spacing:-0.01em;color:#FFFFFF\">triage mail</div>
-<div style=\"height:84px;line-height:84px;font-size:1px\">&nbsp;</div>
-<div style=\"font:600 26px/1.15 {FONT};letter-spacing:-0.01em;color:#FFFFFF\">daily triage</div>
-</td></tr>"
+        "<tr><td style=\"padding:0;vertical-align:top\"><div style=\"border-radius:24px;overflow:hidden;background-color:#24150F;background-image:linear-gradient(110deg,#24150F 0%,#24150F 40%,#6B3A22 100%)\">
+<img src=\"cid:{HEADER_CID}\" width=\"600\" height=\"200\" alt=\"let&rsquo;s triage mail: daily triage\" style=\"display:block;width:100%;height:auto;border:0;color:#FFFFFF;font:600 26px/1.15 {FONT}\">
+</div></td></tr>"
     )
 }
 
@@ -929,7 +931,7 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
     fn the_html_follows_the_design() {
         let html = render(&full_digest()).html;
         // The lockup, the headline, a tile per flag with its colour, the period, lowercase.
-        assert!(html.contains("triage mail</div>"));
+        assert!(html.contains("alt=\"let&rsquo;s triage mail: daily triage\""));
         assert!(html.contains("5 messages need you"));
         assert!(html.contains("work &middot; mon 26 oct 2026"));
         assert!(html.contains("25 oct 07:00 – 26 oct 07:00 · 57 messages"));
@@ -945,14 +947,22 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
     #[test]
     fn the_html_has_no_remote_content_and_supports_dark_mode() {
         let html = render(&full_digest()).html;
-        for remote in ["http://", "https://", "<img", "<link", "<script", "@import"] {
+        for remote in ["http://", "https://", "<link", "<script", "@import", "url("] {
             assert!(!html.contains(remote), "found {remote} in the HTML");
         }
         // The one image is the header, carried inside the message.
-        assert_eq!(html.matches("url(").count(), 1);
-        assert!(html.contains("url(cid:digest-header)"));
+        assert_eq!(html.matches("<img").count(), 1);
+        assert!(html.contains("<img src=\"cid:digest-header\""));
         assert!(html.contains("prefers-color-scheme: dark"));
         assert!(html.contains("color-scheme"));
+    }
+
+    #[test]
+    fn the_header_is_one_picture_with_the_title_in_its_alt() {
+        let html = render(&full_digest()).html;
+        // No text laid over the picture: Gmail drops the negative margin and recolours it.
+        assert!(!html.contains("margin-top:-"));
+        assert!(html.contains("alt=\"let&rsquo;s triage mail: daily triage\""));
     }
 
     #[test]
@@ -972,7 +982,7 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
 
         let html = render(&digest).html;
         assert!(!html.contains("<script"), "{html}");
-        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("<img src=x"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
         assert!(
             html.contains("&lt;script&gt;alert(&#39;subject&#39;)&lt;/script&gt; &amp; more"),
@@ -1053,7 +1063,7 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
             message
                 .body_html(0)
                 .unwrap()
-                .contains("url(cid:digest-header)")
+                .contains("<img src=\"cid:digest-header\"")
         );
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("multipart/alternative"), "{raw}");
