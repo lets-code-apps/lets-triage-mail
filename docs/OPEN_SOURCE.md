@@ -12,12 +12,12 @@
       "any IMAP provider".
 - [ ] Install: `cargo install`, a Homebrew tap, prebuilt macOS (arm64) and Linux binaries via
       GitHub Releases (cargo-dist is worth a look).
-- [ ] `check` command that diagnoses setup (model reachable, IMAP caps, keyword support, folders).
-- [ ] CI: fmt, clippy, tests on macOS and Linux.
-- [ ] CONTRIBUTING.md, issue templates (bug / provider compatibility report), a SECURITY.md with
+- [x] `check` command that diagnoses setup (model reachable, IMAP caps, keyword support, folders).
+- [x] CI: fmt, clippy, tests on macOS and Linux.
+- [x] CONTRIBUTING.md, issue templates (bug / provider compatibility report), a SECURITY.md with
       the threat model (hostile email, prompt injection, SSRF).
-- [ ] Provider compatibility table in the README (iCloud, Fastmail, Dovecot, Proton Bridge,
-      Gmail app password, …), filled in by contributors.
+- [x] Provider compatibility table in the README (iCloud, Fastmail, Dovecot, Proton Bridge,
+      Gmail app password, …), filled in by contributors. (Started; reports via the provider template.)
 
 ## Launch channels
 
