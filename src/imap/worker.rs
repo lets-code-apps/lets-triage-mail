@@ -662,9 +662,9 @@ impl<D: Decider> Ctx<'_, D> {
 
     /// Look into the Spam folder for trusted mail (see [`super::junk`]).
     ///
-    /// A folder the server refuses to open (`NO`, for example a wrong `junk_folder`) is logged
-    /// and skipped, so it can never stop the inbox from being watched. Every other error is
-    /// handled like any worker error.
+    /// Any command the server refuses during the scan (`NO`: most often a wrong `junk_folder`,
+    /// but it can also be a FETCH) is logged with the server's text and skipped, so it can never
+    /// stop the inbox from being watched. Every other error is handled like any worker error.
     async fn junk_pass(&self, session: &mut ImapSession) -> Result<(), WorkerError> {
         let authserv = Some(self.config.policy.authserv_id.as_str()).filter(|id| !id.is_empty());
         match scan_junk(session, self.store, self.account, authserv).await {
@@ -680,7 +680,7 @@ impl<D: Decider> Ctx<'_, D> {
             Err(WorkerError::Imap(ImapError::Imap(async_imap::error::Error::No(message)))) => {
                 tracing::warn!(
                     account = %self.account.name, %message,
-                    "cannot open the Spam folder; check `junk_folder` (the inbox is still watched)"
+                    "the server refused a command in the Spam folder; check `junk_folder` (the inbox is still watched)"
                 );
                 Ok(())
             }
