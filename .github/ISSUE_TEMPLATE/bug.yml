@@ -1,0 +1,40 @@
+name: Bug
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problem? Don't file it here; see SECURITY.md.
+        Never attach real email (.eml). Remove addresses and subjects you don't want public.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      placeholder: The command you ran, the relevant part of your config (no passwords).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: Run with -v for more detail.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version and OS
+      placeholder: "lets-triage-mail 0.1.0, macOS 27"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model server and model
+      placeholder: "Ollama, qwen3:14b"

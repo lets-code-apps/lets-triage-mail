@@ -1,0 +1,47 @@
+name: Provider report
+description: How Let's Triage Mail works with your mail provider.
+title: "Provider: "
+labels: [provider]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! These reports fill the provider table in the README.
+        The `check` output has no passwords, but it shows your server and folder names.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider
+      placeholder: "Fastmail"
+    validations:
+      required: true
+  - type: dropdown
+    id: login
+    attributes:
+      label: Login
+      options:
+        - Normal password
+        - App-specific password
+        - Could not log in
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `lets-triage-mail check --account NAME`
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: What you tried
+      options:
+        - label: Flag colours show up in Apple Mail (live, not dry-run)
+        - label: The digest arrives
+        - label: Flags clear after replying
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      placeholder: Provider headers, folder quirks, rate limits...
