@@ -15,8 +15,8 @@
 //! # Hard rule
 //!
 //! `check` must never change anything on a mail server. The probes only log in, ask for
-//! capabilities, `LIST` and `SELECT`. There is no `STORE`, no append (not even a test digest)
-//! and no folder creation here.
+//! capabilities, `LIST`, `SELECT` and `EXAMINE` (the Spam folder, read-only). There is no
+//! `STORE`, no append (not even a test digest) and no folder creation here.
 //! The only thing `check` writes is the local state database, which it creates if it is missing
 //! (the normal `run` would do the same).
 
