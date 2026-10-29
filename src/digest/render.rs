@@ -1,26 +1,36 @@
 //! From the digest model to text: a plain-text part, an HTML part and the finished message.
 //!
 //! [`render`] is a pure function from a [`Digest`] to two strings, so tests compare whole
-//! strings. [`compose`] wraps them into a `multipart/alternative` message with the headers;
-//! it is pure too (the time and the Message-ID are passed in), but its output contains a MIME
-//! boundary chosen by the library, so tests read it back instead of comparing it.
+//! strings. [`compose`] wraps them into a message with the headers; it is pure too (the time
+//! and the Message-ID are passed in), but its output contains a MIME boundary chosen by the
+//! library, so tests read it back instead of comparing it.
 //!
 //! # The HTML
 //!
-//! One small document with an inline `<style>` block: system fonts, `color-scheme: light dark`
-//! and a dark-mode media query, so it reads well in both. It loads nothing from the network
-//! (no images, fonts or external CSS), so opening the digest tells nobody anything.
+//! The design is the "let's code" digest email (`design/email/triage-mail/` in the design
+//! language repo, written by its `build.py`). It is email-safe HTML: tables for layout, inline
+//! styles in the light theme, one `<style>` block with the dark theme, the system font stack.
+//! Colours are the design tokens written out, because mail clients don't support CSS
+//! variables reliably.
+//!
+//! The only image is the header (`assets/digest-header.jpg`), sent **inside the message** as
+//! an inline part and shown with `<img src="cid:digest-header">`, not as a link: the digest
+//! loads nothing from the network, so opening it tells nobody anything. A CSS gradient under it
+//! shows when a client blocks images anyway.
 //!
 //! **Everything that came from email is escaped** by [`escape_html`]: senders, subjects and the
 //! model's reasons. The model's reasons are themselves derived from hostile input.
 
+use std::borrow::Cow;
 use std::io;
 
 use jiff::civil;
 use mail_builder::MessageBuilder;
 use mail_builder::headers::raw::Raw;
+use mail_builder::mime::{BodyPart, MimePart};
 
 use super::build::{Digest, Item, Section, clean_line};
+use crate::flags::FlagColour;
 
 /// The `X-Lets-Triage-Mail` header value that marks a digest, for people and mail filters.
 ///
@@ -30,6 +40,11 @@ pub const DIGEST_HEADER_VALUE: &str = "digest";
 
 /// The longest subject we write.
 const MAX_SUBJECT_CHARS: usize = 150;
+
+/// The header image: the grain, the emblem and the title (a draft; the design repo has no titled one yet).
+const HEADER_IMAGE: &[u8] = include_bytes!("../../assets/digest-header.jpg");
+/// Its `Content-ID`; the HTML refers to it as `cid:digest-header`.
+const HEADER_CID: &str = "digest-header";
 
 /// A rendered digest, before it is wrapped into a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,97 +78,144 @@ fn subject(digest: &Digest) -> String {
 // Shared wording
 // ---------------------------------------------------------------------------------------------
 
-/// "Monday 26 October 2026".
+/// "Tue 27 Oct 2026".
 fn long_date(date: civil::Date) -> String {
-    date.strftime("%A %-d %B %Y").to_string()
+    date.strftime("%a %-d %b %Y").to_string()
 }
 
-/// "25 Oct 07:00".
+/// "26 Oct 07:00".
 fn short_time(time: civil::DateTime) -> String {
     time.strftime("%-d %b %H:%M").to_string()
 }
 
-fn period_line(digest: &Digest) -> String {
-    format!(
-        "Covers {} to {}, {} {}.",
-        short_time(digest.from),
-        short_time(digest.to),
-        digest.total,
-        plural(digest.total, "message", "messages"),
-    )
-}
-
-fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
-    if count == 1 { one } else { many }
-}
-
-const DRY_RUN_NOTE: &str = "Dry-run: nothing was flagged on the server. Any flags below are the ones that would have been set.";
-
-/// The one-line headline: how many messages need the user.
-fn headline(digest: &Digest) -> String {
-    match digest.needs_you() {
-        0 if digest.total == 0 => "No new mail was classified in this period.".to_owned(),
-        0 => "Nothing needed your attention.".to_owned(),
-        n => format!("{n} {} you.", plural(n, "message needs", "messages need")),
+/// When a message came, relative to the digest's date: "06:12", "yesterday 21:03", "sat 11:20".
+/// A digest covers at most 48 hours, so a weekday is never ambiguous.
+fn when(time: civil::DateTime, today: civil::Date) -> String {
+    let clock = time.strftime("%H:%M");
+    if time.date() == today {
+        clock.to_string()
+    } else if today.yesterday().ok() == Some(time.date()) {
+        format!("yesterday {clock}")
+    } else {
+        time.strftime("%a %H:%M").to_string().to_lowercase()
     }
 }
 
-/// "7 newsletters, 3 marketing, 2 cold outreach", without the zero parts.
-fn bulk_breakdown(digest: &Digest) -> String {
-    let noise = &digest.noise;
-    let parts = [
-        (noise.newsletters, "newsletters"),
-        (noise.marketing, "marketing"),
-        (noise.cold_outreach, "cold outreach"),
-    ];
-    join_counts(&parts)
+fn count_of(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
-fn junk_breakdown(digest: &Digest) -> String {
-    let parts = [
-        (digest.noise.spam, "spam"),
-        (digest.noise.phishing, "phishing"),
-    ];
-    join_counts(&parts)
+/// "26 Oct 07:00", "27 Oct 07:00", "57 messages".
+fn period_parts(digest: &Digest) -> (String, String, String) {
+    (
+        short_time(digest.from),
+        short_time(digest.to),
+        count_of(digest.total, "message", "messages"),
+    )
 }
 
-fn join_counts(parts: &[(usize, &str)]) -> String {
-    parts
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, name)| format!("{count} {name}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The headline, lowercase as a heading: "5 messages need you", "nothing needs you".
+fn headline(digest: &Digest) -> String {
+    match digest.needs_you() {
+        0 if digest.total == 0 => "no new mail".to_owned(),
+        0 => "nothing needs you".to_owned(),
+        n if digest.dry_run => count_of(
+            n,
+            "message would have been flagged",
+            "messages would have been flagged",
+        ),
+        n => count_of(n, "message needs you", "messages need you"),
+    }
 }
 
-/// "alice@example.org (5), promo@shop.com (3)".
-fn noisy_senders(digest: &Digest) -> String {
-    digest
-        .noise
-        .top_senders
-        .iter()
-        .map(|s| format!("{} ({})", s.sender, s.count))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The hidden line under the subject in the inbox list: what is in the digest.
+fn preheader(digest: &Digest) -> String {
+    match digest.needs_you() {
+        0 if digest.total == 0 => "No new mail.".to_owned(),
+        0 => format!(
+            "Nothing needs you. {} sorted.",
+            count_of(digest.total, "message", "messages")
+        ),
+        n if digest.dry_run => format!(
+            "Dry run: {}",
+            count_of(
+                n,
+                "message would have been flagged",
+                "messages would have been flagged"
+            )
+        ),
+        _ => digest
+            .sections
+            .iter()
+            .map(|s| format!("{} {}", s.total(), s.title.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
-/// "due 2026-11-30", or nothing.
+/// The note under the header, as (pill, text), when the flags in the digest were not set.
+fn note(digest: &Digest) -> Option<(&'static str, &'static str)> {
+    if digest.dry_run {
+        Some((
+            "dry run",
+            "Nothing was flagged in Mail. This digest shows what would have happened and was saved as a .eml file, not sent.",
+        ))
+    } else if digest.classify_only {
+        Some((
+            "flags off",
+            "This account is sorted but never flagged, so this digest is the only place these messages show up.",
+        ))
+    } else {
+        None
+    }
+}
+
+/// "due Fri 30 Oct", or nothing.
 fn due(item: &Item) -> Option<String> {
-    item.deadline.map(|date| format!("due {date}"))
+    item.deadline
+        .map(|date| format!("due {}", date.strftime("%a %-d %b")))
 }
 
-fn hidden_line(section: &Section) -> Option<String> {
-    (section.hidden > 0).then(|| format!("and {} more", section.hidden))
+/// "and 31 more, flagged in Mail": the flags were set, so Mail's Flagged mailbox has them all.
+fn more_line(digest: &Digest, hidden: usize) -> String {
+    if digest.dry_run || digest.classify_only {
+        format!("and {hidden} more")
+    } else {
+        format!("and {hidden} more, flagged in Mail")
+    }
 }
 
+const EMPTY_DAY: &str = "Nothing came in during this period, so there was nothing to sort.";
 const FOOTER: &str = "Written by Let's Triage Mail on your own machine. Nothing left it.";
 
-const MISFILED_TITLE: &str = "Possibly misfiled in Spam";
+const MISFILED_TITLE: &str = "possibly misfiled in spam";
 const MISFILED_NOTE: &str = "People you know, with a valid signature, whose mail is in your Spam folder. Nothing was moved.";
+
+/// The rows of "the rest": label, what it holds, count.
+fn rest_rows(digest: &Digest) -> [(&'static str, &'static str, usize); 3] {
+    let noise = &digest.noise;
+    [
+        (
+            "bulk mail",
+            "newsletters, marketing, cold outreach",
+            noise.bulk(),
+        ),
+        ("junk", "spam and phishing", noise.junk()),
+        ("other mail", "nothing to do", noise.other),
+    ]
+}
 
 // ---------------------------------------------------------------------------------------------
 // Plain text
 // ---------------------------------------------------------------------------------------------
+
+/// Capitalises the first letter, for a heading used as a sentence.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
 
 fn render_text(digest: &Digest) -> String {
     let mut out = String::new();
@@ -162,76 +224,82 @@ fn render_text(digest: &Digest) -> String {
         out.push('\n');
     };
 
-    line(&format!("Daily triage: {}", digest.account));
+    let (from, to, messages) = period_parts(digest);
+    line(&format!("DAILY TRIAGE: {}", digest.account));
     line(&long_date(digest.date));
-    line(&period_line(digest));
-    if digest.dry_run {
+    line(&format!("{from} to {to}, {messages}"));
+    if let Some((pill, text)) = note(digest) {
         line("");
-        line(DRY_RUN_NOTE);
+        line(&format!("{}: {text}", pill.to_uppercase()));
     }
     line("");
-    line(&headline(digest));
+    line(&format!("{}.", sentence(&headline(digest))));
+
+    let item_lines = |line: &mut dyn FnMut(&str), item: &Item| {
+        let mut head = format!("- {}, {}", item.sender, when(item.received, digest.date));
+        if let Some(due) = due(item) {
+            head.push_str(&format!(", {due}"));
+        }
+        line(&head);
+        line(&format!("  {}", item.subject));
+        if !item.reason.is_empty() {
+            line(&format!("  {}", item.reason));
+        }
+    };
 
     for section in &digest.sections {
         line("");
-        line(&format!("{} ({})", section.title, section.total()));
+        line(&format!(
+            "{} ({})",
+            section.title.to_uppercase(),
+            section.total()
+        ));
         for item in &section.items {
-            let mut head = format!("- {}: {}", item.sender, item.subject);
-            if let Some(due) = due(item) {
-                head.push_str(&format!(" ({due})"));
-            }
-            line(&head);
-            let mut detail = item.reason.clone();
-            if !detail.is_empty() {
-                detail.push(' ');
-            }
-            detail.push_str(&format!("[{}]", short_time(item.received)));
-            line(&format!("  {detail}"));
+            item_lines(&mut line, item);
         }
-        if let Some(more) = hidden_line(section) {
-            line(&format!("  ... {more}"));
+        if section.hidden > 0 {
+            line(&format!("  {}", more_line(digest, section.hidden)));
         }
     }
 
     if !digest.misfiled.is_empty() {
         line("");
         line(&format!(
-            "{MISFILED_TITLE} ({})",
+            "{} ({})",
+            MISFILED_TITLE.to_uppercase(),
             digest.misfiled.len() + digest.misfiled_hidden
         ));
         line(MISFILED_NOTE);
         for item in &digest.misfiled {
-            line(&format!(
-                "- {}: {} [{}]",
-                item.sender,
-                item.subject,
-                short_time(item.received)
-            ));
+            item_lines(&mut line, item);
         }
         if digest.misfiled_hidden > 0 {
-            line(&format!("  ... and {} more", digest.misfiled_hidden));
-        }
-    }
-
-    let noise = &digest.noise;
-    if noise.bulk() + noise.junk() + noise.other > 0 {
-        line("");
-        line("The rest");
-        if noise.bulk() > 0 {
-            line(&format!("- Bulk mail: {}", bulk_breakdown(digest)));
-        }
-        if !noise.top_senders.is_empty() {
-            line(&format!("- Noisiest senders: {}", noisy_senders(digest)));
-        }
-        if noise.junk() > 0 {
-            line(&format!("- Junk: {}", junk_breakdown(digest)));
-        }
-        if noise.other > 0 {
-            line(&format!("- Other mail: {} (nothing to do)", noise.other));
+            line(&format!("  and {} more", digest.misfiled_hidden));
         }
     }
 
     line("");
+    if digest.total == 0 {
+        line(EMPTY_DAY);
+    } else {
+        line("THE REST");
+        for (label, holds, count) in rest_rows(digest) {
+            line(&format!("{}: {count} ({holds})", sentence(label)));
+        }
+        if !digest.noise.top_senders.is_empty() {
+            let senders = digest
+                .noise
+                .top_senders
+                .iter()
+                .map(|s| format!("{} {}", s.sender, s.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            line(&format!("Noisiest senders: {senders}"));
+        }
+    }
+
+    line("");
+    line("--");
     line(FOOTER);
     out
 }
@@ -260,136 +328,317 @@ pub fn escape_html(text: &str) -> String {
     out
 }
 
-const HTML_STYLE: &str = "\
-body { font: 15px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; \
-color: #1d1d1f; background: #ffffff; margin: 0; padding: 16px; }
-.wrap { max-width: 640px; margin: 0 auto; }
-h1 { font-size: 20px; margin: 0 0 2px; }
-h2 { font-size: 16px; margin: 22px 0 6px; }
-.muted { color: #6e6e73; }
-.note { padding: 8px 10px; border-radius: 6px; background: #fff4d6; color: #5c4400; }
-ul { margin: 0; padding-left: 20px; }
-li { margin: 0 0 8px; }
-@media (prefers-color-scheme: dark) {
-  body { color: #f5f5f7; background: #1c1c1e; }
-  .muted { color: #a1a1a6; }
-  .note { background: #3d3216; color: #f2d98a; }
-}";
+// Token values from the design repo's `tokens/tokens.json`, written out. Light ones go inline;
+// the dark ones are in `DARK_CSS`, by class.
+const FONT: &str =
+    "Poppins,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const BG: &str = "#F5F5F7";
+const SURFACE: &str = "#FFFFFF";
+const RAISED: &str = "#EDEDF1";
+const LINE: &str = "#DEDEE4";
+const FG: &str = "#0B0B0E";
+const MUTED: &str = "#5C5C66";
+
+const DARK_CSS: &str = "\
+body{background:#0B0B0E !important}
+.c-bg{background:#0B0B0E !important}.c-surface{background:#141418 !important}.c-raised{background:#1C1C22 !important}
+.c-line{border-color:#2A2A31 !important}.c-fg{color:#F4F4F6 !important}.c-muted{color:#A0A0AA !important}
+.d-orange{background:#FF9F0A !important}.d-yellow{background:#FFD60A !important}.d-green{background:#30D158 !important}
+.d-purple{background:#BF5AF2 !important}.d-gray{background:#8E8E93 !important}.d-neutral{background:#A0A0AA !important}";
+
+/// The dot's tone and its light colour. Apple Mail's flag colours (`color.palette.flag`);
+/// "neutral" is for notes that aren't a flag. Blue has no token yet, so it gets the neutral
+/// dot; red is never set by the service.
+fn tone(colour: Option<FlagColour>) -> (&'static str, &'static str) {
+    match colour {
+        Some(FlagColour::Orange) => ("orange", "#FF9500"),
+        Some(FlagColour::Yellow) => ("yellow", "#FFCC00"),
+        Some(FlagColour::Green) => ("green", "#34C759"),
+        Some(FlagColour::Purple) => ("purple", "#AF52DE"),
+        Some(FlagColour::Gray) => ("gray", "#8E8E93"),
+        _ => ("neutral", MUTED),
+    }
+}
+
+fn dot(colour: Option<FlagColour>) -> String {
+    let (name, value) = tone(colour);
+    format!(
+        "<span class=\"d-{name}\" aria-hidden=\"true\" style=\"display:inline-block;width:7px;height:7px;border-radius:50%;background:{value};vertical-align:middle\"></span>"
+    )
+}
+
+/// A pill; `text` must already be escaped.
+fn pill(text: &str, colour: Option<FlagColour>) -> String {
+    format!(
+        "<span class=\"c-raised c-fg\" style=\"display:inline-block;padding:4px 10px;border-radius:999px;background:{RAISED};color:{FG};font:500 12px/16px {FONT};white-space:nowrap\">{}&nbsp; {text}</span>",
+        dot(colour)
+    )
+}
+
+/// The header: one picture with the grain, the emblem and the title drawn in, as an `<img>`,
+/// with an ember gradient behind it for clients that block images.
+///
+/// Drawn in, not live text over the picture: Gmail on iOS drops negative margins (the text fell
+/// under the picture), drops CSS background images (the picture vanished), and recolours text
+/// in dark mode but never images. An `<img>` also survives forwarding. The picture is 1200×400
+/// and scales whole: the 30 px title is about 17 px on a phone.
+fn header_html() -> String {
+    format!(
+        "<tr><td style=\"padding:0;vertical-align:top\"><div style=\"border-radius:24px;overflow:hidden;background-color:#24150F;background-image:linear-gradient(110deg,#24150F 0%,#24150F 40%,#6B3A22 100%)\">
+<img src=\"cid:{HEADER_CID}\" width=\"600\" height=\"200\" alt=\"let&rsquo;s triage mail: daily triage\" style=\"display:block;width:100%;height:auto;border:0;color:#FFFFFF;font:600 26px/1.15 {FONT}\">
+</div></td></tr>"
+    )
+}
+
+fn note_html(pill_text: &str, text: &str) -> String {
+    format!(
+        "<tr><td style=\"padding:24px 0 0\"><div class=\"c-raised\" style=\"border-radius:14px;background:{RAISED};padding:14px 16px\">
+{}
+<div class=\"c-fg\" style=\"font:400 15px/1.5 {FONT};color:{FG};padding-top:8px\">{}</div></div></td></tr>",
+        pill(&escape_html(pill_text), None),
+        escape_html(text)
+    )
+}
+
+fn headline_html(digest: &Digest) -> String {
+    let (from, to, messages) = period_parts(digest);
+    format!(
+        "<tr><td style=\"padding:32px 4px 0\">
+<div dir=\"auto\" class=\"c-muted\" style=\"font:500 13px/1.4 {FONT};color:{MUTED};padding-bottom:6px;word-break:break-word\">{} &middot; {}</div>
+<div class=\"c-fg\" style=\"font:600 26px/1.15 {FONT};letter-spacing:-0.01em;color:{FG}\">{}</div>
+<div class=\"c-muted\" style=\"font:400 13px/1.4 {FONT};color:{MUTED};padding-top:6px;font-variant-numeric:tabular-nums\">{}</div>
+</td></tr>",
+        escape_html(&digest.account),
+        escape_html(&long_date(digest.date).to_lowercase()),
+        escape_html(&headline(digest)),
+        escape_html(&format!("{from} – {to} · {messages}").to_lowercase()),
+    )
+}
+
+/// The row of count tiles, one per flag.
+fn strip_html(sections: &[Section]) -> String {
+    let tiles: String = sections
+        .iter()
+        .map(|s| {
+            format!(
+                "<div class=\"c-surface c-line\" style=\"display:inline-block;vertical-align:top;min-width:96px;margin:0 8px 8px 0;padding:12px 16px;border-radius:14px;border:1px solid {LINE};background:{SURFACE}\">
+<div class=\"c-fg\" style=\"font:600 26px/1.15 {FONT};color:{FG};font-variant-numeric:tabular-nums\">{}</div>
+<div class=\"c-fg\" style=\"font:500 12px/16px {FONT};color:{FG};padding-top:4px;white-space:nowrap\">{}&nbsp; {}</div></div>",
+                s.total(),
+                dot(Some(s.colour)),
+                escape_html(&s.title.to_lowercase()),
+            )
+        })
+        .collect();
+    format!("<tr><td style=\"padding:24px 0 0;font-size:0\">{tiles}</td></tr>")
+}
+
+/// One or two letters for the avatar: the initials of a name, or the first letter of an address.
+fn initials(sender: &str) -> String {
+    let letters: String = sender
+        .split_whitespace()
+        .filter_map(|word| word.trim_start_matches('"').chars().next())
+        .filter(|c| c.is_alphabetic())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    if letters.is_empty() {
+        "?".to_owned()
+    } else {
+        letters
+    }
+}
+
+fn row_html(digest: &Digest, item: &Item, colour: Option<FlagColour>, last: bool) -> String {
+    let border = if last {
+        String::new()
+    } else {
+        format!("border-bottom:1px solid {LINE};")
+    };
+    let reason = if item.reason.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"c-muted\" dir=\"auto\" style=\"font:400 13px/1.4 {FONT};color:{MUTED};padding-top:4px\">{}</div>",
+            escape_html(&item.reason)
+        )
+    };
+    let due = due(item).map_or_else(String::new, |due| {
+        format!(
+            "<div style=\"padding-top:8px\">{}</div>",
+            pill(&escape_html(&due.to_lowercase()), colour)
+        )
+    });
+    format!(
+        "<tr><td class=\"c-line\" style=\"{border}padding:14px 16px\">
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>
+<td width=\"36\" valign=\"top\" style=\"padding-right:14px\"><div class=\"c-raised c-fg\" style=\"width:36px;height:36px;border-radius:50%;background:{RAISED};color:{FG};font:500 13px/36px {FONT};text-align:center\">{}</div></td>
+<td valign=\"top\" style=\"word-break:break-word\">
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>
+<td dir=\"auto\" class=\"c-fg\" style=\"font:600 15px/1.35 {FONT};color:{FG};word-break:break-word\">{}</td>
+<td align=\"right\" valign=\"top\" class=\"c-muted\" style=\"font:400 13px/20px {FONT};color:{MUTED};white-space:nowrap;padding-left:12px;font-variant-numeric:tabular-nums\">{}</td></tr></table>
+<div dir=\"auto\" class=\"c-fg\" style=\"font:400 15px/1.4 {FONT};color:{FG};padding-top:2px\">{}</div>
+{reason}{due}</td></tr></table></td></tr>",
+        escape_html(&initials(&item.sender)),
+        escape_html(&item.sender),
+        escape_html(&when(item.received, digest.date)),
+        escape_html(&item.subject),
+    )
+}
+
+/// A titled card of messages. `intro` is a muted line under the title; `more` a last row.
+fn section_html(
+    digest: &Digest,
+    title: &str,
+    colour: Option<FlagColour>,
+    total: usize,
+    intro: Option<&str>,
+    items: &[Item],
+    more: Option<String>,
+) -> String {
+    let mut rows: String = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| row_html(digest, item, colour, i + 1 == items.len() && more.is_none()))
+        .collect();
+    if let Some(more) = more {
+        rows.push_str(&format!(
+            "<tr><td class=\"c-muted\" style=\"padding:14px 16px;font:400 13px/1.4 {FONT};color:{MUTED}\">{}</td></tr>",
+            escape_html(&more)
+        ));
+    }
+    let intro = intro.map_or_else(String::new, |text| {
+        format!(
+            "<div class=\"c-muted\" style=\"font:400 13px/1.4 {FONT};color:{MUTED};padding-top:4px\">{}</div>",
+            escape_html(text)
+        )
+    });
+    format!(
+        "<tr><td style=\"padding:40px 4px 12px\"><span class=\"c-fg\" style=\"font:600 20px/1.25 {FONT};letter-spacing:-0.01em;color:{FG}\">{}&nbsp; {}</span>
+<span class=\"c-muted\" style=\"font:400 15px {FONT};color:{MUTED};font-variant-numeric:tabular-nums\">&nbsp;{total}</span>{intro}</td></tr>
+<tr><td><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"c-surface c-line\" style=\"border-collapse:separate;border-radius:14px;border:1px solid {LINE};background:{SURFACE}\">{rows}</table></td></tr>",
+        dot(colour),
+        escape_html(&title.to_lowercase()),
+    )
+}
+
+fn rest_html(digest: &Digest) -> String {
+    let senders = &digest.noise.top_senders;
+    let rows = rest_rows(digest);
+    let mut out: String = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (label, holds, count))| {
+            let border = if i + 1 == rows.len() && senders.is_empty() {
+                String::new()
+            } else {
+                format!("border-bottom:1px solid {LINE};")
+            };
+            format!(
+                "<tr><td class=\"c-line\" style=\"{border}padding:12px 16px\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>
+<td><div class=\"c-fg\" style=\"font:500 15px/1.35 {FONT};color:{FG}\">{label}</div><div class=\"c-muted\" style=\"font:400 13px/1.4 {FONT};color:{MUTED}\">{holds}</div></td>
+<td align=\"right\" class=\"c-fg\" style=\"font:600 15px {FONT};color:{FG};font-variant-numeric:tabular-nums;padding-left:12px\">{count}</td></tr></table></td></tr>"
+            )
+        })
+        .collect();
+    if !senders.is_empty() {
+        let list: String = senders
+            .iter()
+            .map(|s| {
+                format!(
+                    "<tr><td dir=\"auto\" class=\"c-muted\" style=\"font:400 13px/1.6 {FONT};color:{MUTED};word-break:break-word\">{}</td>
+<td align=\"right\" class=\"c-muted\" style=\"font:400 13px/1.6 {FONT};color:{MUTED};font-variant-numeric:tabular-nums;padding-left:12px\">{}</td></tr>",
+                    escape_html(&s.sender),
+                    s.count
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "<tr><td style=\"padding:12px 16px\"><div class=\"c-fg\" style=\"font:500 15px/1.35 {FONT};color:{FG};padding-bottom:4px\">noisiest senders</div>
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">{list}</table></td></tr>"
+        ));
+    }
+    format!(
+        "<tr><td style=\"padding:40px 4px 12px\"><span class=\"c-fg\" style=\"font:600 20px/1.25 {FONT};letter-spacing:-0.01em;color:{FG}\">the rest</span></td></tr>
+<tr><td><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"c-surface c-line\" style=\"border-collapse:separate;border-radius:14px;border:1px solid {LINE};background:{SURFACE}\">{out}</table></td></tr>"
+    )
+}
 
 fn render_html(digest: &Digest) -> String {
-    let mut out = String::new();
-    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    out.push_str("<meta name=\"color-scheme\" content=\"light dark\">\n");
-    out.push_str("<meta name=\"supported-color-schemes\" content=\"light dark\">\n");
-    out.push_str(&format!(
-        "<title>{}</title>\n",
-        escape_html(&subject(digest))
-    ));
-    out.push_str(&format!(
-        "<style>\n{HTML_STYLE}\n</style>\n</head>\n<body>\n<div class=\"wrap\">\n"
-    ));
-
-    out.push_str(&format!(
-        "<h1>Daily triage: {}</h1>\n<div class=\"muted\">{}<br>{}</div>\n",
-        escape_html(&digest.account),
-        escape_html(&long_date(digest.date)),
-        escape_html(&period_line(digest)),
-    ));
-    if digest.dry_run {
-        out.push_str(&format!(
-            "<p class=\"note\">{}</p>\n",
-            escape_html(DRY_RUN_NOTE)
-        ));
+    let mut parts = vec![header_html()];
+    if let Some((pill_text, text)) = note(digest) {
+        parts.push(note_html(pill_text, text));
     }
-    out.push_str(&format!(
-        "<p><strong>{}</strong></p>\n",
-        escape_html(&headline(digest))
-    ));
-
+    parts.push(headline_html(digest));
+    if !digest.sections.is_empty() {
+        parts.push(strip_html(&digest.sections));
+    }
     for section in &digest.sections {
-        out.push_str(&format!(
-            "<h2>{} ({})</h2>\n<ul>\n",
-            escape_html(&section.title),
-            section.total()
+        let more = (section.hidden > 0).then(|| more_line(digest, section.hidden));
+        parts.push(section_html(
+            digest,
+            &section.title,
+            Some(section.colour),
+            section.total(),
+            None,
+            &section.items,
+            more,
         ));
-        for item in &section.items {
-            let mut head = format!(
-                "<strong>{}</strong>: {}",
-                escape_html(&item.sender),
-                escape_html(&item.subject)
-            );
-            if let Some(due) = due(item) {
-                head.push_str(&format!(" ({})", escape_html(&due)));
-            }
-            let mut detail = escape_html(&item.reason);
-            if !detail.is_empty() {
-                detail.push(' ');
-            }
-            detail.push_str(&format!("[{}]", escape_html(&short_time(item.received))));
-            out.push_str(&format!(
-                "<li>{head}<br><span class=\"muted\">{detail}</span></li>\n"
-            ));
-        }
-        if let Some(more) = hidden_line(section) {
-            out.push_str(&format!(
-                "<li class=\"muted\">{}</li>\n",
-                escape_html(&more)
-            ));
-        }
-        out.push_str("</ul>\n");
     }
-
     if !digest.misfiled.is_empty() {
-        out.push_str(&format!(
-            "<h2>{} ({})</h2>\n<p class=\"muted\">{}</p>\n<ul>\n",
-            escape_html(MISFILED_TITLE),
+        let more = (digest.misfiled_hidden > 0)
+            .then(|| format!("and {} more, still in Spam", digest.misfiled_hidden));
+        parts.push(section_html(
+            digest,
+            MISFILED_TITLE,
+            None,
             digest.misfiled.len() + digest.misfiled_hidden,
-            escape_html(MISFILED_NOTE)
+            Some(MISFILED_NOTE),
+            &digest.misfiled,
+            more,
         ));
-        for item in &digest.misfiled {
-            out.push_str(&format!(
-                "<li><strong>{}</strong>: {} <span class=\"muted\">[{}]</span></li>\n",
-                escape_html(&item.sender),
-                escape_html(&item.subject),
-                escape_html(&short_time(item.received))
-            ));
-        }
-        if digest.misfiled_hidden > 0 {
-            out.push_str(&format!(
-                "<li class=\"muted\">{}</li>\n",
-                escape_html(&format!("and {} more", digest.misfiled_hidden))
-            ));
-        }
-        out.push_str("</ul>\n");
     }
-
-    let noise = &digest.noise;
-    if noise.bulk() + noise.junk() + noise.other > 0 {
-        out.push_str("<h2>The rest</h2>\n<ul>\n");
-        let mut row = |text: String| {
-            out.push_str(&format!("<li>{}</li>\n", escape_html(&text)));
-        };
-        if noise.bulk() > 0 {
-            row(format!("Bulk mail: {}", bulk_breakdown(digest)));
-        }
-        if !noise.top_senders.is_empty() {
-            row(format!("Noisiest senders: {}", noisy_senders(digest)));
-        }
-        if noise.junk() > 0 {
-            row(format!("Junk: {}", junk_breakdown(digest)));
-        }
-        if noise.other > 0 {
-            row(format!("Other mail: {} (nothing to do)", noise.other));
-        }
-        out.push_str("</ul>\n");
+    if digest.total == 0 {
+        parts.push(format!(
+            "<tr><td class=\"c-fg\" style=\"padding:16px 4px 0;font:400 16px/1.55 {FONT};color:{FG};max-width:62ch\">{EMPTY_DAY}</td></tr>"
+        ));
+    } else {
+        parts.push(rest_html(digest));
     }
-
-    out.push_str(&format!(
-        "<p class=\"muted\">{}</p>\n</div>\n</body>\n</html>\n",
-        escape_html(FOOTER)
+    parts.push(format!(
+        "<tr><td class=\"c-line c-muted\" style=\"padding:40px 4px 8px;font:400 13px/1.4 {FONT};color:{MUTED}\">Written by let&rsquo;s triage mail on your own machine. Nothing left it.</td></tr>"
     ));
-    out
+
+    format!(
+        "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<meta name=\"color-scheme\" content=\"light dark\">
+<meta name=\"supported-color-schemes\" content=\"light dark\">
+<title>{title}</title>
+<style>
+:root{{color-scheme:light dark;supported-color-schemes:light dark}}
+body{{margin:0;padding:0;background:{BG}}}
+@media (prefers-color-scheme: dark){{
+{DARK_CSS}
+}}
+</style>
+</head>
+<body class=\"c-bg\">
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"c-bg\" style=\"background:{BG}\"><tr><td align=\"center\" style=\"padding:24px 16px\">
+<div style=\"display:none;max-height:0;overflow:hidden\">{preheader}</div>
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;text-align:left\">
+{parts}
+</table></td></tr></table>
+</body>
+</html>
+",
+        title = escape_html(&subject(digest)),
+        preheader = escape_html(&preheader(digest)),
+        parts = parts.join("\n"),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -410,12 +659,38 @@ pub struct Envelope<'a> {
     pub date: i64,
 }
 
-/// Builds the `multipart/alternative` message (plain text first, HTML second, so clients show
-/// the richer part), as bytes with CRLF line endings, ready for `APPEND`.
+/// Builds the message as bytes with CRLF line endings, ready for `APPEND`:
+///
+/// ```text
+/// multipart/alternative
+///   text/plain
+///   multipart/related
+///     text/html
+///     image/jpeg  (inline, Content-ID <digest-header>)
+/// ```
+///
+/// Plain text first and HTML second, so clients show the richer part; the image sits next to
+/// the HTML that uses it, so clients don't list it as an attachment.
 ///
 /// Header values that come from the user's config or from email pass through
 /// [`clean_line`], so none of them can contain a line break and start a new header.
 pub fn compose(rendered: &Rendered, envelope: &Envelope<'_>) -> io::Result<Vec<u8>> {
+    let text = MimePart::new(
+        "text/plain",
+        BodyPart::Text(Cow::from(rendered.text.as_str())),
+    );
+    let html = MimePart::new(
+        "text/html",
+        BodyPart::Text(Cow::from(rendered.html.as_str())),
+    );
+    let image = MimePart::new("image/jpeg", BodyPart::Binary(Cow::Borrowed(HEADER_IMAGE)))
+        .inline()
+        .cid(HEADER_CID);
+    let body = MimePart::new(
+        "multipart/alternative",
+        vec![text, MimePart::new("multipart/related", vec![html, image])],
+    );
+
     MessageBuilder::new()
         .from((
             clean_line(envelope.from_name, 100),
@@ -429,8 +704,7 @@ pub fn compose(rendered: &Rendered, envelope: &Envelope<'_>) -> io::Result<Vec<u
         .header("X-Lets-Triage-Mail", Raw::new(DIGEST_HEADER_VALUE))
         // RFC 3834: tells autoresponders and mailing-list software not to answer it.
         .header("Auto-Submitted", Raw::new("auto-generated"))
-        .text_body(rendered.text.clone())
-        .html_body(rendered.html.clone())
+        .body(body)
         .write_to_vec()
 }
 
@@ -453,6 +727,7 @@ mod tests {
     fn section(flag: TriageFlag, title: &str, items: Vec<Item>) -> Section {
         Section {
             flag,
+            colour: flag.colour(),
             title: title.into(),
             items,
             hidden: 0,
@@ -463,19 +738,21 @@ mod tests {
     fn full_digest() -> Digest {
         let mut due_item = item("billing@power.example", "Invoice 77", "An unpaid invoice.");
         due_item.deadline = Some(civil::date(2026, 11, 30));
+        due_item.received = civil::date(2026, 10, 26).at(6, 12, 0, 0);
         Digest {
             account: "work".into(),
             date: civil::date(2026, 10, 26),
             from: civil::date(2026, 10, 25).at(7, 0, 0, 0),
             to: civil::date(2026, 10, 26).at(7, 0, 0, 0),
             dry_run: false,
+            classify_only: false,
             total: 57,
             sections: vec![
                 section(
                     TriageFlag::ReplyNeeded,
                     "Reply needed",
                     vec![item(
-                        "alice@example.org",
+                        "Alice Example",
                         "Contract draft",
                         "Asks you to confirm the date.",
                     )],
@@ -511,30 +788,59 @@ mod tests {
     #[test]
     fn the_text_part_of_a_full_digest() {
         let expected = "\
-Daily triage: work
-Monday 26 October 2026
-Covers 25 Oct 07:00 to 26 Oct 07:00, 57 messages.
+DAILY TRIAGE: work
+Mon 26 Oct 2026
+25 Oct 07:00 to 26 Oct 07:00, 57 messages
 
 5 messages need you.
 
-Reply needed (1)
-- alice@example.org: Contract draft
-  Asks you to confirm the date. [25 Oct 14:02]
+REPLY NEEDED (1)
+- Alice Example, yesterday 14:02
+  Contract draft
+  Asks you to confirm the date.
 
-Deadline (4)
-- billing@power.example: Invoice 77 (due 2026-11-30)
-  An unpaid invoice. [25 Oct 14:02]
-  ... and 3 more
+DEADLINE (4)
+- billing@power.example, 06:12, due Mon 30 Nov
+  Invoice 77
+  An unpaid invoice.
+  and 3 more, flagged in Mail
 
-The rest
-- Bulk mail: 7 newsletters, 3 marketing, 2 cold outreach
-- Noisiest senders: promo@shop.example (5), news@paper.example (3)
-- Junk: 4 spam, 1 phishing
-- Other mail: 5 (nothing to do)
+THE REST
+Bulk mail: 12 (newsletters, marketing, cold outreach)
+Junk: 5 (spam and phishing)
+Other mail: 5 (nothing to do)
+Noisiest senders: promo@shop.example 5, news@paper.example 3
 
+--
 Written by Let's Triage Mail on your own machine. Nothing left it.
 ";
         assert_eq!(render(&full_digest()).text, expected);
+    }
+
+    #[test]
+    fn times_are_relative_to_the_digest_date() {
+        let today = civil::date(2026, 10, 27);
+        assert_eq!(
+            when(civil::date(2026, 10, 27).at(6, 12, 0, 0), today),
+            "06:12"
+        );
+        assert_eq!(
+            when(civil::date(2026, 10, 26).at(21, 3, 0, 0), today),
+            "yesterday 21:03"
+        );
+        assert_eq!(
+            when(civil::date(2026, 10, 24).at(11, 20, 0, 0), today),
+            "sat 11:20"
+        );
+    }
+
+    #[test]
+    fn initials_come_from_a_name_or_the_address() {
+        assert_eq!(initials("Anna Kowalska"), "AK");
+        assert_eq!(initials("\"Дмитрий Смирнов\""), "ДС");
+        assert_eq!(initials("billing@power.example"), "B");
+        assert_eq!(initials(""), "?");
+        assert_eq!(initials("123 456"), "?");
     }
 
     #[test]
@@ -554,15 +860,31 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
             ..Noise::default()
         };
         digest.total = 2;
-        let text = render(&digest).text;
-        assert!(text.contains("Nothing needed your attention."), "{text}");
-        assert!(text.contains("- Bulk mail: 2 newsletters"), "{text}");
+        let rendered = render(&digest);
+        assert!(
+            rendered.text.contains("Nothing needs you."),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("Bulk mail: 2 ("),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.html.contains("nothing needs you"));
+        assert!(
+            rendered
+                .html
+                .contains("Nothing needs you. 2 messages sorted.")
+        );
 
         digest.noise = Noise::default();
         digest.total = 0;
-        let text = render(&digest).text;
-        assert!(text.contains("No new mail was classified"), "{text}");
-        assert!(!text.contains("The rest"), "{text}");
+        let rendered = render(&digest);
+        assert!(rendered.text.contains("No new mail."), "{}", rendered.text);
+        assert!(rendered.text.contains(EMPTY_DAY));
+        assert!(!rendered.text.contains("THE REST"), "{}", rendered.text);
+        assert!(!rendered.html.contains("the rest"));
     }
 
     #[test]
@@ -570,20 +892,77 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
         let mut digest = full_digest();
         digest.dry_run = true;
         let rendered = render(&digest);
-        assert!(rendered.text.contains("Dry-run: nothing was flagged"));
-        assert!(rendered.html.contains("Dry-run: nothing was flagged"));
+        assert!(
+            rendered
+                .text
+                .contains("DRY RUN: Nothing was flagged in Mail.")
+        );
+        assert!(
+            rendered
+                .text
+                .contains("5 messages would have been flagged.")
+        );
+        assert!(rendered.html.contains("Nothing was flagged in Mail."));
+        // The rest is not in Mail's Flagged mailbox, so the hidden line must not say so.
+        assert!(
+            rendered.text.contains("  and 3 more\n"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_classify_only_digest_says_it_is_the_only_output() {
+        let digest = Digest {
+            classify_only: true,
+            ..full_digest()
+        };
+        let rendered = render(&digest);
+        assert!(
+            rendered
+                .text
+                .contains("FLAGS OFF: This account is sorted but never flagged")
+        );
+        assert!(rendered.html.contains("flags off"));
+        assert!(!rendered.text.contains("flagged in Mail"));
+    }
+
+    #[test]
+    fn the_html_follows_the_design() {
+        let html = render(&full_digest()).html;
+        // The lockup, the headline, a tile per flag with its colour, the period, lowercase.
+        assert!(html.contains("alt=\"let&rsquo;s triage mail: daily triage\""));
+        assert!(html.contains("5 messages need you"));
+        assert!(html.contains("work &middot; mon 26 oct 2026"));
+        assert!(html.contains("25 oct 07:00 – 26 oct 07:00 · 57 messages"));
+        assert!(html.contains("class=\"d-orange\""));
+        assert!(html.contains("class=\"d-yellow\""));
+        assert!(html.contains("due mon 30 nov"));
+        assert!(html.contains("and 3 more, flagged in Mail"));
+        assert!(html.contains(">AE</div>"));
+        // The preheader lists the flags.
+        assert!(html.contains("1 reply needed, 4 deadline"));
     }
 
     #[test]
     fn the_html_has_no_remote_content_and_supports_dark_mode() {
         let html = render(&full_digest()).html;
-        for remote in [
-            "http://", "https://", "<img", "<link", "<script", "@import", "url(",
-        ] {
+        for remote in ["http://", "https://", "<link", "<script", "@import", "url("] {
             assert!(!html.contains(remote), "found {remote} in the HTML");
         }
+        // The one image is the header, carried inside the message.
+        assert_eq!(html.matches("<img").count(), 1);
+        assert!(html.contains("<img src=\"cid:digest-header\""));
         assert!(html.contains("prefers-color-scheme: dark"));
         assert!(html.contains("color-scheme"));
+    }
+
+    #[test]
+    fn the_header_is_one_picture_with_the_title_in_its_alt() {
+        let html = render(&full_digest()).html;
+        // No text laid over the picture: Gmail drops the negative margin and recolours it.
+        assert!(!html.contains("margin-top:-"));
+        assert!(html.contains("alt=\"let&rsquo;s triage mail: daily triage\""));
     }
 
     #[test]
@@ -603,7 +982,7 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
 
         let html = render(&digest).html;
         assert!(!html.contains("<script"), "{html}");
-        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("<img src=x"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
         assert!(
             html.contains("&lt;script&gt;alert(&#39;subject&#39;)&lt;/script&gt; &amp; more"),
@@ -680,8 +1059,31 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
             message.body_text(0).map(|t| t.replace("\r\n", "\n")),
             Some(rendered.text)
         );
+        assert!(
+            message
+                .body_html(0)
+                .unwrap()
+                .contains("<img src=\"cid:digest-header\"")
+        );
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("multipart/alternative"), "{raw}");
+        assert!(raw.contains("multipart/related"), "{raw}");
+    }
+
+    #[test]
+    fn the_header_image_travels_inside_the_message() {
+        let bytes = compose(&render(&full_digest()), &envelope()).unwrap();
+        let message = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+        let image = message
+            .parts()
+            .find(|part| part.content_id() == Some(HEADER_CID))
+            .expect("an inline part with the header's Content-ID");
+        assert!(image.is_content_type("image", "jpeg"));
+        assert!(image.is_inline());
+        assert!(
+            HEADER_IMAGE.len() < 200 * 1024,
+            "the design caps it at 200 KB"
+        );
     }
 
     #[test]
@@ -708,21 +1110,22 @@ Written by Let's Triage Mail on your own machine. Nothing left it.
         };
         let text = render(&digest).text;
         let expected = "\n\
-Possibly misfiled in Spam (3)
+POSSIBLY MISFILED IN SPAM (3)
 People you know, with a valid signature, whose mail is in your Spam folder. Nothing was moved.
-- anna@friend.example: Lunch? [25 Oct 14:02]
-  ... and 2 more
+- anna@friend.example, yesterday 14:02
+  Lunch?
+  and 2 more
 ";
         assert!(text.contains(expected), "{text}");
-        let section = text.find("Possibly misfiled").unwrap();
-        assert!(section > text.find("Deadline (4)").unwrap(), "{text}");
-        assert!(section < text.find("The rest").unwrap(), "{text}");
+        let section = text.find("POSSIBLY MISFILED").unwrap();
+        assert!(section > text.find("DEADLINE (4)").unwrap(), "{text}");
+        assert!(section < text.find("THE REST").unwrap(), "{text}");
     }
 
     #[test]
     fn no_misfiled_section_without_misfiled_mail() {
         let rendered = render(&full_digest());
-        assert!(!rendered.text.contains("misfiled"));
+        assert!(!rendered.text.to_lowercase().contains("misfiled"));
         assert!(!rendered.html.contains("misfiled"));
     }
 
@@ -737,7 +1140,7 @@ People you know, with a valid signature, whose mail is in your Spam folder. Noth
             ..full_digest()
         };
         let html = render(&digest).html;
-        assert!(html.contains("Possibly misfiled in Spam (1)"), "{html}");
+        assert!(html.contains("possibly misfiled in spam</span>"), "{html}");
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;@evil.example"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(!html.contains("<script>"), "{html}");

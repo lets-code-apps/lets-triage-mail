@@ -4,7 +4,7 @@
 //!
 //! - [`build`]: stored rows in, a [`build::Digest`] model out. Pure.
 //! - [`render`]: the model to a plain-text part and an HTML part, and the finished
-//!   `multipart/alternative` message. Pure.
+//!   message with the header image inside it. Pure.
 //! - [`schedule`]: when a digest is due ([`schedule::next_step`], pure) and the loop that
 //!   sends it every day, with catch-up after the Mac sleeps.
 //! - [`deliver`]: reads the store, `APPEND`s the message (or saves a preview file for a
@@ -19,7 +19,7 @@
 //! - **A dry-run account is never appended to.** Its digest is a file under the data
 //!   directory instead, so the owner can preview it.
 //! - **The worker skips our digests by record, not by header.** See [`deliver`].
-//! - **A quiet day still gets a digest.** "Nothing needed your attention" tells the owner
+//! - **A quiet day still gets a digest.** "Nothing needs you" tells the owner
 //!   the service is alive; a missing digest would be ambiguous.
 
 pub mod build;

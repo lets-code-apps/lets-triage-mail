@@ -43,8 +43,9 @@ gets moved.
 - Catch-up: if the Mac was asleep at digest time, send it on the next wake. Store
   `last_digest_date` per account so a day is never duplicated.
 - Message: `From: Let's Triage Mail <lets-triage-mail@localhost>` (configurable), `To:` the account address,
-  a proper `Date`, a unique `Message-ID`, and `multipart/alternative` (plain text plus simple HTML
-  that works in light and dark mode). Appended **without** `\Seen` so it notifies. Subject:
+  a proper `Date`, a unique `Message-ID`, and `multipart/alternative`: plain text, plus HTML in the
+  let's code email design (`design/email/triage-mail/` in the design repo) for light and dark
+  mode, with its header image carried inside the message (`multipart/related`, `cid:`). Appended **without** `\Seen` so it notifies. Subject:
   `Daily triage — <account> — <YYYY-MM-DD>`.
 - Period: from the previous digest to now (the last 24 h for the first one), never more than
   48 h, so a week away does not produce a wall of text.
