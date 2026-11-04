@@ -1146,4 +1146,61 @@ mod tests {
             );
         }
     }
+
+    /// Hard rules 3 and 7: v1 never destroys mail and never marks it read. The two checks above
+    /// read this file and `worker.rs` only; this one closes the gap by checking that no *other*
+    /// module reaches for the IMAP library at all. Everything else goes through
+    /// [`ImapSession`], where the fetch constants and `store_flags` are the only doors.
+    ///
+    /// The forbidden words are assembled at runtime so this test does not contain them.
+    #[test]
+    fn only_session_rs_speaks_imap() {
+        let forbidden = [
+            [".uid", "_store("].concat(),
+            [".uid", "_fetch("].concat(),
+            [".", "expunge("].concat(),
+            [".uid", "_expunge("].concat(),
+            [".uid", "_mv("].concat(),
+            [".uid", "_copy("].concat(),
+            [".uid", "_search("].concat(),
+            ["\\Del", "eted"].concat(),
+        ];
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        scan_for_imap_calls(&src, &forbidden, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "only imap/session.rs may speak IMAP directly:\n{}",
+            violations.join("\n"),
+        );
+    }
+
+    /// Walks `src`, skipping this module and the test-only fake server (both speak IMAP on
+    /// purpose), and checks the production half of every other file.
+    fn scan_for_imap_calls(dir: &Path, forbidden: &[String], violations: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                scan_for_imap_calls(&path, forbidden, violations);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let shown = path.display().to_string();
+            if shown.ends_with("imap/session.rs") || shown.ends_with("imap/fake_server.rs") {
+                continue;
+            }
+            let whole = fs::read_to_string(&path).unwrap();
+            let production = whole.split("#[cfg(test)]").next().unwrap();
+            for (number, line) in production.lines().enumerate() {
+                for word in forbidden {
+                    if line.contains(word) {
+                        violations.push(format!("{}:{}: {}", shown, number + 1, line.trim_end(),));
+                    }
+                }
+            }
+        }
+    }
 }
