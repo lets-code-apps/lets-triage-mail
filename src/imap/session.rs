@@ -1176,8 +1176,11 @@ mod tests {
         );
     }
 
-    /// Walks `src`, skipping this module and the test-only fake server (both speak IMAP on
-    /// purpose), and checks the production half of every other file.
+    /// Walks `src` and checks the whole text of every file, with two skips: this module (the one
+    /// module allowed to speak IMAP) and `imap/fake_server.rs` (a `#[cfg(test)]` module that
+    /// implements the IMAP protocol by definition). Every other file is scanned in full: cutting at
+    /// the first `#[cfg(test)]` would be wrong, because `imap/mod.rs` puts that attribute on the
+    /// `fake_server` declaration at the top of the file, in the middle of its production code.
     fn scan_for_imap_calls(dir: &Path, forbidden: &[String], violations: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -1193,8 +1196,7 @@ mod tests {
                 continue;
             }
             let whole = fs::read_to_string(&path).unwrap();
-            let production = whole.split("#[cfg(test)]").next().unwrap();
-            for (number, line) in production.lines().enumerate() {
+            for (number, line) in whole.lines().enumerate() {
                 for word in forbidden {
                     if line.contains(word) {
                         violations.push(format!("{}:{}: {}", shown, number + 1, line.trim_end(),));
