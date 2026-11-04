@@ -1612,6 +1612,40 @@ mod tests {
         }
     }
 
+    /// Hard rule: only metadata is stored. The `labels.features` column holds this JSON, so
+    /// nothing the sender wrote may be in it: header facts and counts only.
+    #[test]
+    fn features_json_holds_no_message_text() {
+        let evidence = Evidence {
+            from_address: "secret@x.example".into(),
+            from_name: "SECRETNAME".into(),
+            reply_to: Some("secret@x.example".into()),
+            subject: "SECRETSUBJECT".into(),
+            date: Some("SECRETDATE".into()),
+            body_text: "SECRETBODY".into(),
+            headers_only: false,
+            attachment_names: vec!["SECRETFILE.pdf".into()],
+            spf: crate::decider::AuthResult::Pass,
+            dkim: crate::decider::AuthResult::Fail,
+            dmarc: crate::decider::AuthResult::Unknown,
+            provider_spam: Some(true),
+            bulk_headers: true,
+            auto_submitted: false,
+            known_domain: true,
+            reply_to_mismatch: true,
+            display_name_spoof: false,
+            malformed_sender: true,
+            impersonates_recipient: false,
+            link_count: 3,
+        };
+        let stored = features_json(&evidence, Trust::Unknown, "x.example");
+        // The features are there; none of the message's own words are.
+        assert!(stored.contains("\"bulk_headers\":true"), "{stored}");
+        assert!(stored.contains("\"attachments\":1"), "{stored}");
+        assert!(!stored.contains("SECRET"), "{stored}");
+        assert!(!stored.contains("secret@"), "{stored}");
+    }
+
     #[test]
     fn flags_for_an_older_uidvalidity_are_set_apart() {
         let flag = |uidvalidity| OwnedFlag {
