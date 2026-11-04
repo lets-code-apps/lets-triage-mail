@@ -5,8 +5,9 @@ Local-first email triage for **any IMAP account**, written in Rust. New mail is 
 Mail sets **Apple Mail flag colours** on the server and writes a **daily digest email** into your
 mailbox.
 
-> **Status: v1 works, not released yet.** It runs every day on its author's own accounts. There
-> are no prebuilt binaries or Homebrew formula yet, so you build it from source (below).
+> **Status: v1 works, not released yet.** It runs every day on its author's own accounts. Prebuilt
+> binaries and a Homebrew tap arrive with the first tagged release; until then, build from source
+> (below).
 
 ## What it does
 
@@ -24,10 +25,38 @@ client that shows flags, with nothing to install in the mail client.
 
 ## Quickstart
 
-You need macOS or Linux, Rust 1.85 or newer ([rustup.rs](https://rustup.rs)), a local model
-server, and an IMAP account that allows app passwords.
+You need macOS or Linux, a local model server, and an IMAP account that allows app passwords.
+Rust 1.85 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
+route below.
 
 ### 1. Install
+
+Homebrew (Apple silicon macOS, x86_64 Linux), once the first release is published:
+
+```sh
+brew install lets-code-apps/tap/lets-triage-mail
+```
+
+Prebuilt binary for the same two platforms: download `lets-triage-mail-aarch64-apple-darwin.tar.xz`
+or `lets-triage-mail-x86_64-unknown-linux-gnu.tar.xz` from the [releases page](https://github.com/lets-code-apps/lets-triage-mail/releases), unpack it, and put the `lets-triage-mail` binary from the unpacked `lets-triage-mail-<platform>` folder on your `PATH`:
+
+```sh
+tar -xJf lets-triage-mail-aarch64-apple-darwin.tar.xz
+mv lets-triage-mail-aarch64-apple-darwin/lets-triage-mail ~/.local/bin
+```
+
+Only these two platforms are built: an Intel Mac has no binary, so use `cargo install`. The Linux
+binary links the system glibc, so it needs glibc 2.35 or newer (it is built on Ubuntu 22.04). The
+binary is unsigned, so a binary you downloaded with a browser may need
+`xattr -d com.apple.quarantine lets-triage-mail` before it runs; a `curl` download is not quarantined.
+
+From source (works anywhere, including an Intel Mac):
+
+```sh
+cargo install --git https://github.com/lets-code-apps/lets-triage-mail
+```
+
+To work on the code, clone it and install from the checkout instead:
 
 ```sh
 git clone https://github.com/lets-code-apps/lets-triage-mail
@@ -35,7 +64,7 @@ cd lets-triage-mail
 cargo install --path .
 ```
 
-This puts `lets-triage-mail` in `~/.cargo/bin`.
+Either way this puts `lets-triage-mail` in `~/.cargo/bin`.
 
 ### 2. Start a model
 
@@ -132,7 +161,9 @@ In Mail on the Mac you can rename the flags in the sidebar (expand Flagged), so 
 
 A LaunchAgent starts the service at login and restarts it after a crash. It runs as you, so the
 login Keychain works for `password_command`. It assumes the binary is in `~/.cargo/bin`;
-otherwise edit the path in the plist.
+otherwise edit the path in the plist. Installed with Homebrew the binary is
+`/opt/homebrew/bin/lets-triage-mail` (check with `which lets-triage-mail`), which is the path to
+edit in that case.
 
 ```sh
 L=io.github.lets-code-apps.lets-triage-mail
