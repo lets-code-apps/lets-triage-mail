@@ -39,18 +39,23 @@ brew install lets-code-apps/tap/lets-triage-mail
 
 Prebuilt binary for the same two platforms: download `lets-triage-mail-aarch64-apple-darwin.tar.xz`
 or `lets-triage-mail-x86_64-unknown-linux-gnu.tar.xz` from the [releases page](https://github.com/lets-code-apps/lets-triage-mail/releases). Each one unpacks into a folder named after the
-platform; move the `lets-triage-mail` binary out of it onto your `PATH` (`~/.local/bin` is a
-common choice, `chmod +x` it if it is not executable already):
+platform; the snippet below installs the binary into `~/.local/bin` (which may not exist yet, so
+it creates it) and puts that directory on your `PATH` — copy the `export` line into `~/.zshrc`
+(or the startup file of your shell) as well, so new terminals find it too; `chmod +x` the
+binary if it is not executable already:
 
 ```sh
 tar -xJf lets-triage-mail-aarch64-apple-darwin.tar.xz
-mv lets-triage-mail-aarch64-apple-darwin/lets-triage-mail ~/.local/bin
+mkdir -p ~/.local/bin
+mv lets-triage-mail-aarch64-apple-darwin/lets-triage-mail ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"   # also add this line to ~/.zshrc
 ```
 
 Only these two platforms are built: an Intel Mac has no binary, so use `cargo install`. The Linux
 binary links the system glibc, so it needs glibc 2.35 or newer (it is built on Ubuntu 22.04). The
 binary is unsigned, so a binary you downloaded with a browser may need
-`xattr -d com.apple.quarantine lets-triage-mail` before it runs; a `curl` download is not quarantined.
+`xattr -d com.apple.quarantine ~/.local/bin/lets-triage-mail` (run it on the moved path, not
+the downloaded folder) before it runs; a `curl` download is not quarantined.
 
 From source (works anywhere, including an Intel Mac):
 
