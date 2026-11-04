@@ -1130,6 +1130,10 @@ mod tests {
             .mount(&elsewhere)
             .await;
 
+        // `fetch_models` is usually reached through `probe_model`, which installs the TLS
+        // provider first. Called directly, a test has to do the same: reqwest panics otherwise.
+        install_tls_provider();
+
         let url = format!("{}/v1/models", configured.uri());
         let (status, _) = fetch_models(&llm_config(&configured), &url).await.unwrap();
         assert_eq!(status, 302);
