@@ -38,7 +38,9 @@ brew install lets-code-apps/tap/lets-triage-mail
 ```
 
 Prebuilt binary for the same two platforms: download `lets-triage-mail-aarch64-apple-darwin.tar.xz`
-or `lets-triage-mail-x86_64-unknown-linux-gnu.tar.xz` from the [releases page](https://github.com/lets-code-apps/lets-triage-mail/releases), unpack it, and put the `lets-triage-mail` binary from the unpacked `lets-triage-mail-<platform>` folder on your `PATH`:
+or `lets-triage-mail-x86_64-unknown-linux-gnu.tar.xz` from the [releases page](https://github.com/lets-code-apps/lets-triage-mail/releases). Each one unpacks into a folder named after the
+platform; move the `lets-triage-mail` binary out of it onto your `PATH` (`~/.local/bin` is a
+common choice, `chmod +x` it if it is not executable already):
 
 ```sh
 tar -xJf lets-triage-mail-aarch64-apple-darwin.tar.xz
