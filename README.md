@@ -22,6 +22,13 @@ mailbox.
 Flags are stored on the server, so they show in Apple Mail on the Mac and the iPhone, and in any
 client that shows flags, with nothing to install in the mail client.
 
+**Desktop app (in development).** A macOS menu-bar companion lives in `desktop/`. It is a second
+front end onto the same engine — it starts/stops the engine and shows its `check` results; it does
+not read mail or re-implement triage. It is not released, promises no dates, and the **CLI remains the
+supported way** to run the engine. Closing its window leaves triage running. See
+[docs/DESKTOP.md](docs/DESKTOP.md). Until the engine gains a single-instance lock, pick one way to run
+it (the LaunchAgent, a terminal `run`, or the desktop) so two engines never watch the same mailbox.
+
 ## Quickstart
 
 You need macOS or Linux, Rust 1.85 or newer ([rustup.rs](https://rustup.rs)), a local model
@@ -196,7 +203,8 @@ with the output of `lets-triage-mail check --account NAME`.
 ## Docs
 
 [docs/SPEC.md](docs/SPEC.md) has the full spec. The design notes are in [docs/](docs/): flags,
-classifier, architecture and the decision log.
+classifier, architecture and the decision log. [docs/DESKTOP.md](docs/DESKTOP.md) covers the
+in-development desktop app and its boundary with the engine.
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,
 unsubscribe queue, review UI). This repository is the Rust rewrite.
