@@ -104,6 +104,21 @@ test('an unexpected exit code moves the engine to failed, with no restart', () =
 	assert.equal(s.state.long.length, 1);
 });
 
+test('failed carries the last stderr lines; a fresh start clears the tail', () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	e.start();
+	s.state.long[0].child.emit('spawn');
+	assert.deepEqual(e.getState().failureTail, []); // running has no failure tail
+	for (let i = 0; i < 12; i += 1) s.state.long[0].stderr.write(`boom ${i}\n`);
+	s.state.long[0].child.emit('exit', 1, null);
+	const tail = e.getState().failureTail;
+	assert.equal(tail.length, 8); // bounded to MAX_STDERR_LINES
+	assert.equal(tail[7], 'boom 11'); // the most recent line is kept
+	e.start();
+	assert.deepEqual(e.getState().failureTail, []); // a fresh attempt starts with an empty tail
+});
+
 test('stop sends exactly one SIGTERM and lands on stopped on a clean exit', async () => {
 	const s = makeSpawn();
 	const e = controller(s);
@@ -111,6 +126,23 @@ test('stop sends exactly one SIGTERM and lands on stopped on a clean exit', asyn
 	s.state.long[0].child.emit('spawn');
 	await e.stop();
 	assert.deepEqual(s.state.long[0].signals, ['SIGTERM']);
+	assert.equal(e.getState().state, 'stopped');
+});
+
+test('a second stop while stopping reuses the in-flight stop and sends one SIGTERM', async () => {
+	// Stop-then-Quit: two stop() calls arrive while the first is still waiting on a slow engine.
+	// A second SIGTERM would make the Rust engine exit 130 and skip cleanup, so it must not happen.
+	const s = makeSpawn();
+	s.state.runKind = 'ignore'; // engine ignores SIGTERM, so the first stop is genuinely in flight
+	const e = controller(s);
+	e.start();
+	s.state.long[0].child.emit('spawn');
+	const first = e.stop();
+	const second = e.stop();
+	assert.equal(first, second); // same in-flight promise, not a new signal
+	await Promise.all([first, second]);
+	assert.deepEqual(s.state.long[0].signals, ['SIGTERM', 'SIGKILL']);
+	assert.equal(s.state.long[0].signals.filter((x) => x === 'SIGTERM').length, 1);
 	assert.equal(e.getState().state, 'stopped');
 });
 

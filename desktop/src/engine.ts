@@ -19,9 +19,9 @@ import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { parseCheckReport, type CheckReport } from './check-report.ts';
+import { parseCheckReport } from './check-report.ts';
 import { resolveEngine } from './engine-path.ts';
-import type { EngineState, EngineView } from './ipc.ts';
+import type { CheckResult, EngineState, EngineView } from './ipc.ts';
 
 // The slice of a child process this controller relies on. A real `ChildProcess` satisfies it;
 // so does the fake used by the tests.
@@ -30,9 +30,6 @@ export interface EngineProcess extends EventEmitter {
 	stderr: NodeJS.ReadableStream | null;
 	kill(signal?: NodeJS.Signals | number): void;
 }
-
-// Result of `check`: either a parsed report (render as data) or a clean error string.
-export type CheckResult = { kind: 'report'; report: CheckReport } | { kind: 'error'; message: string };
 
 const MAX_LOG_LINES = 500;
 const MAX_STDERR_LINES = 8;
@@ -57,6 +54,9 @@ export class EngineController {
 	private readonly stderrLines: string[] = [];
 	private exitResolve: (() => void) | null = null;
 	private exitPromise: Promise<void> = Promise.resolve();
+	// The single in-flight stop. Shared so a second Stop (or Stop-then-Quit) reuses it and never
+	// sends a second SIGTERM (which the Rust engine reads as exit 130 + skipped cleanup).
+	private stopPromise: Promise<void> | null = null;
 
 	private readonly listeners = new Set<(view: EngineView) => void>();
 
@@ -83,6 +83,7 @@ export class EngineController {
 			version: this.version ?? '',
 			exitCode: failed ? this.exitCode : null,
 			signal: failed ? this.signal : null,
+			failureTail: failed ? [...this.stderrLines] : [],
 		};
 	}
 
@@ -113,6 +114,9 @@ export class EngineController {
 		this.exitCode = null;
 		this.signal = null;
 		this.pendingLine = '';
+		// A fresh attempt starts with an empty failure tail and no in-flight stop.
+		this.stderrLines.length = 0;
+		this.stopPromise = null;
 
 		let resolveExit: () => void = () => {};
 		this.exitPromise = new Promise<void>((resolve) => {
@@ -182,6 +186,9 @@ export class EngineController {
 	// --- explicit stop ---------------------------------------------------------------
 
 	stop(): Promise<void> {
+		// Idempotent while stopping: a second Stop, or Quit right after Stop, reuses the in-flight
+		// stop instead of sending a second SIGTERM.
+		if (this.current === 'stopping' && this.stopPromise) return this.stopPromise;
 		if (this.current === 'stopped' || this.current === 'failed' || this.child === null) {
 			this.setState('stopped');
 			return Promise.resolve();
@@ -192,7 +199,9 @@ export class EngineController {
 		child.kill('SIGTERM');
 
 		// Race a clean exit against the stop deadline. `stop()` is really async: it awaits that race.
-		return this.awaitStop(child);
+		const promise = this.awaitStop(child);
+		this.stopPromise = promise;
+		return promise;
 	}
 
 	private async awaitStop(child: EngineProcess): Promise<void> {
