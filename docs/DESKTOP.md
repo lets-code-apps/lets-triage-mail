@@ -84,7 +84,8 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
 
 ## Window and tray security stance
 
-- Tray: title-only placeholder (`setTitle("LTM")`, an empty generated image). The real template icon is
+- Tray: placeholder title and icon (`setTitle("LTM")` plus a minimal 1x1 transparent PNG; Electron's
+  `Tray` rejects an empty image, so the placeholder must be a real loadable one). The real template icon is
   a private design asset and is **not** copied. The native menu is a stand-in for the mockup popover in
   the private `TriageMailTray` design, which is a later increment.
 - Window: one `BrowserWindow`, default native title bar (the `hiddenInset` treatment comes with the
@@ -95,8 +96,9 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
 - Security defaults, all required: `contextIsolation: true`, `sandbox: true`,
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is our own
-  file, and the preload exposes three functions only (`getState`, `onState`,
-  `command(start|stop|check)`). The renderer writes engine text with `textContent`, never `innerHTML`
+  file, and the preload (see `desktop/src/preload.cjs`) exposes four functions only (`getState`,
+  `onState`, `onCheckResult`, `command(start|stop|check)`). The renderer writes engine text with
+  `textContent`, never `innerHTML`
   (check messages contain server and folder names).
 
 ## Developer guide
