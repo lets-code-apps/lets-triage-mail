@@ -22,3 +22,8 @@ CLAUDE.local.md
 *.eml
 !tests/fixtures/*.eml
 /.vscode/
+
+# Desktop app (Electron): dependencies, build output, packaged artifacts.
+desktop/node_modules/
+desktop/dist/
+desktop/out/
