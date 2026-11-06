@@ -1,0 +1,263 @@
+// The engine lifecycle: a small state machine around one spawned child process.
+//
+// This is the whole "desktop owns the process, engine owns the triage" contract in code:
+// the controller spawns `lets-triage-mail`, watches its stdio and exit, and never reads the
+// mail, the model, the database or the config file. `spawn`, the stop timeout and the resolver
+// are injected so the tests drive it with a fake child and a short timeout (no real signals,
+// no real timing).
+//
+// Lifecycle (docs/DESKTOP.md):
+//   stopped -> starting -> running            (the `spawn` event moves starting -> running)
+//   running --stop--> stopping -> stopped     (one SIGTERM, then SIGKILL after the deadline)
+//   running/starting --unexpected exit--> failed (exit code + signal + last stderr, no restart)
+//
+// Why exactly one SIGTERM: `src/cli/run.rs::watch_for_signals` treats the FIRST SIGTERM as
+// "cancel, let workers finish" and the SECOND as "exit now with 130, skip cleanup". A second
+// SIGTERM would skip the engine's cleanup, so we send it once and escalate to SIGKILL instead.
+
+import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+
+import { parseCheckReport, type CheckReport } from './check-report.ts';
+import { resolveEngine } from './engine-path.ts';
+import type { EngineState, EngineView } from './ipc.ts';
+
+// The slice of a child process this controller relies on. A real `ChildProcess` satisfies it;
+// so does the fake used by the tests.
+export interface EngineProcess extends EventEmitter {
+	stdout: NodeJS.ReadableStream | null;
+	stderr: NodeJS.ReadableStream | null;
+	kill(signal?: NodeJS.Signals | number): void;
+}
+
+// Result of `check`: either a parsed report (render as data) or a clean error string.
+export type CheckResult = { kind: 'report'; report: CheckReport } | { kind: 'error'; message: string };
+
+const MAX_LOG_LINES = 500;
+const MAX_STDERR_LINES = 8;
+const DEFAULT_STOP_TIMEOUT_MS = 30_000;
+
+export class EngineController {
+	private readonly env: NodeJS.ProcessEnv;
+	private readonly repoRoot: string;
+	private readonly spawn: SpawnLike;
+	private readonly stopTimeoutMs: number;
+	private readonly resourcesPath: string | undefined;
+
+	private current: EngineState = 'stopped';
+	private child: EngineProcess | null = null;
+	private exitCode: number | null = null;
+	private signal: string | null = null;
+	private version: string | null = null;
+
+	// Long-lived `run` child plumbing.
+	private pendingLine = '';
+	private readonly logs: string[] = [];
+	private readonly stderrLines: string[] = [];
+	private exitResolve: (() => void) | null = null;
+	private exitPromise: Promise<void> = Promise.resolve();
+
+	private readonly listeners = new Set<(view: EngineView) => void>();
+
+	constructor(
+		env: NodeJS.ProcessEnv,
+		repoRoot: string,
+		spawn: SpawnLike,
+		// Stop deadline in ms; docs/DESKTOP.md derives 30 s from `ExitTimeOut`. Tests inject a tiny value.
+		stopTimeoutMs: number = DEFAULT_STOP_TIMEOUT_MS,
+		// Electron sets `process.resourcesPath`; undefined when running outside a packaged build.
+		resourcesPath: string | undefined = undefined,
+	) {
+		this.env = env;
+		this.repoRoot = repoRoot;
+		this.spawn = spawn;
+		this.stopTimeoutMs = stopTimeoutMs;
+		this.resourcesPath = resourcesPath;
+	}
+
+	getState(): EngineView {
+		const failed = this.current === 'failed';
+		return {
+			state: this.current,
+			version: this.version ?? '',
+			exitCode: failed ? this.exitCode : null,
+			signal: failed ? this.signal : null,
+		};
+	}
+
+	onState(listener: (view: EngineView) => void): void {
+		this.listeners.add(listener);
+	}
+
+	private setState(state: EngineState): void {
+		this.current = state;
+		const view = this.getState();
+		for (const listener of this.listeners) listener(view);
+	}
+
+	private resolve(): EnginePathRef {
+		return resolveEngine(this.env, this.resourcesPath, this.repoRoot);
+	}
+
+	// --- long-lived `run` child -------------------------------------------------------
+
+	start(): void {
+		// start while running/starting/stopping is a no-op; from stopped/failed spawn afresh.
+		if (this.current === 'running' || this.current === 'starting' || this.current === 'stopping') {
+			return;
+		}
+		const { file, baseArgs } = this.resolve();
+		const child = this.spawn(file, [...baseArgs, 'run'], { stdio: ['ignore', 'pipe', 'pipe'] });
+		this.child = child;
+		this.exitCode = null;
+		this.signal = null;
+		this.pendingLine = '';
+
+		let resolveExit: () => void = () => {};
+		this.exitPromise = new Promise<void>((resolve) => {
+			resolveExit = resolve;
+		});
+		this.exitResolve = () => resolveExit();
+
+		child.once('spawn', () => {
+			if (this.current === 'starting') this.setState('running');
+		});
+		child.once('error', () => {
+			// Spawn failed (e.g. binary vanished): a failure, not a crash.
+			this.child = null;
+			if (this.current !== 'stopping') this.setState('failed');
+			this.exitResolve?.();
+		});
+		child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+			this.flushPending();
+			this.child = null;
+			if (this.current === 'stopping') {
+				this.setState('stopped');
+			} else {
+				this.exitCode = code;
+				this.signal = signal ?? null;
+				this.setState('failed');
+			}
+			this.exitResolve?.();
+		});
+
+		const stdout = child.stdout;
+		const stderr = child.stderr;
+		if (stdout) stdout.on('data', (chunk: unknown) => this.record(String(chunk), false));
+		if (stderr) stderr.on('data', (chunk: unknown) => this.record(String(chunk), true));
+
+		this.setState('starting');
+	}
+
+	// The last `MAX_LOG_LINES` engine lines, in memory only (never written to disk this increment).
+	logCount(): number {
+		return this.logs.length;
+	}
+
+	private record(text: string, isErr: boolean): void {
+		this.pendingLine += text;
+		const parts = this.pendingLine.split('\n');
+		this.pendingLine = parts.pop() ?? '';
+		for (const line of parts) this.pushLine(line, isErr);
+	}
+
+	private flushPending(): void {
+		if (this.pendingLine !== '') {
+			this.pushLine(this.pendingLine, true);
+			this.pendingLine = '';
+		}
+	}
+
+	private pushLine(line: string, isErr: boolean): void {
+		const trimmed = line.replace(/\s+$/, '');
+		this.logs.push(trimmed);
+		if (this.logs.length > MAX_LOG_LINES) this.logs.shift();
+		if (isErr) {
+			this.stderrLines.push(trimmed);
+			if (this.stderrLines.length > MAX_STDERR_LINES) this.stderrLines.shift();
+		}
+	}
+
+	// --- explicit stop ---------------------------------------------------------------
+
+	stop(): Promise<void> {
+		if (this.current === 'stopped' || this.current === 'failed' || this.child === null) {
+			this.setState('stopped');
+			return Promise.resolve();
+		}
+		const child = this.child;
+		this.setState('stopping');
+		// One SIGTERM. A second would make the engine exit 130 and skip cleanup (see run.rs).
+		child.kill('SIGTERM');
+
+		// Race a clean exit against the stop deadline. `stop()` is really async: it awaits that race.
+		return this.awaitStop(child);
+	}
+
+	private async awaitStop(child: EngineProcess): Promise<void> {
+		const exited = this.exitPromise.then(() => 'exit' as const);
+		const timedOut = delay(this.stopTimeoutMs).then(() => 'timeout' as const);
+		const outcome = await Promise.race([exited, timedOut]);
+		if (outcome === 'timeout' && this.child === child) {
+			child.kill('SIGKILL');
+			await this.exitPromise;
+		}
+		this.setState('stopped');
+	}
+
+	// --- one-shot commands ---------------------------------------------------------
+
+	async runCheck(): Promise<CheckResult> {
+		const collected = await this.collect(['check', '--json']);
+		const parsed = parseCheckReport(collected.stdout);
+		if ('error' in parsed) {
+			const tail = collected.stderrTail.join('\n');
+			const message = tail === '' ? parsed.error : `${parsed.error}\nstderr: ${tail}`;
+			return { kind: 'error', message };
+		}
+		return { kind: 'report', report: parsed.report };
+	}
+
+	// `--version` prints `lets-triage-mail X.Y.Z`; the tray shows just the version token.
+	async readVersion(): Promise<string> {
+		const collected = await this.collect(['--version']);
+		const raw = (collected.stdout.split('\n')[0] ?? '').trim();
+		const match = /^lets-triage-mail\s+(.+)$/.exec(raw);
+		this.version = match ? match[1] : raw;
+		return this.version;
+	}
+
+	// Runs one short-lived engine call and gathers its streams. Exit code is ignored: for
+	// `check --json` the report is on stdout even when the process exits non-zero.
+	private async collect(subArgs: string[]): Promise<{ stdout: string; stderrTail: string[] }> {
+		const { file, baseArgs } = this.resolve();
+		const child = this.spawn(file, [...baseArgs, ...subArgs], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+		let stdout = '';
+		const stderrTail: string[] = [];
+		if (child.stdout) child.stdout.on('data', (chunk: unknown) => (stdout += String(chunk)));
+		if (child.stderr) {
+			child.stderr.on('data', (chunk: unknown) => {
+				for (const line of String(chunk).split('\n')) {
+					if (line !== '') stderrTail.push(line);
+					if (stderrTail.length > MAX_STDERR_LINES) stderrTail.shift();
+				}
+			});
+		}
+
+		await new Promise<void>((resolve) => {
+			child.once('close', () => resolve());
+			child.once('error', () => resolve());
+		});
+		return { stdout, stderrTail };
+	}
+}
+
+type EnginePathRef = { file: string; baseArgs: string[] };
+type SpawnLike = (file: string, args: readonly string[], options?: { stdio?: unknown }) => EngineProcess;
+
+// The real spawner, used by the main process. `stdio: ['ignore','pipe','pipe']` keeps stdin closed
+// (the engine will exit on stdin-close in increment 2) and pipes stdout/stderr into the ring buffer.
+export const defaultSpawn: SpawnLike = (file, args, options) =>
+	nodeSpawn(file, [...args], (options as SpawnOptions) ?? { stdio: ['ignore', 'pipe', 'pipe'] }) as unknown as EngineProcess;

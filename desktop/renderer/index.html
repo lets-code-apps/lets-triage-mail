@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<!-- Lock the page down: nothing loads, nothing is fetched, only local script and style. -->
+		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'" />
+		<title>Let's Triage Mail</title>
+		<link rel="stylesheet" href="renderer.css" />
+	</head>
+	<body>
+		<main id="app">
+			<h1>Let's Triage Mail</h1>
+			<p id="state" class="state"></p>
+			<p id="hint" class="hint">Press Check to validate your setup. The engine owns triage; this window only shows what it reports.</p>
+			<div id="check" class="check"></div>
+			<div id="buttons">
+				<button id="start" type="button">Start triage</button>
+				<button id="stop" type="button">Stop triage</button>
+				<button id="checkbtn" type="button">Check setup</button>
+			</div>
+		</main>
+		<script src="renderer.js"></script>
+	</body>
+</html>
