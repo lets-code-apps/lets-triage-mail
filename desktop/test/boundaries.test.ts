@@ -81,9 +81,34 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
 test('the preload bridge exposes exactly the channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
-	for (const channel of [CHANNEL.getState, CHANNEL.state, CHANNEL.command]) {
+	for (const channel of [CHANNEL.getState, CHANNEL.state, CHANNEL.command, CHANNEL.checkResult]) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// It exposes only getState / onState / command; nothing that reaches Node or the network.
+	// It exposes only getState / onState / onCheckResult / command; nothing that reaches Node or the
+	// network.
 	assert.equal(preload.includes('require('), true);
+});
+
+// The tray advertises "Check setup" as an implemented action, so its click must (a) open a window
+// (somewhere to show the result) and (b) push the finished check to the renderer. Both main.ts call
+// sites build their payload through the one electron-free checkPayload helper, so the report and the
+// error can never be silently dropped.
+test('the tray Check result is opened, built and pushed to the renderer', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.ok(main.includes('function deliverCheck'), 'the tray must have a check path');
+	assert.ok(/function deliverCheck[^]*?ctl\.open\(\)/.test(main), 'deliverCheck must open the window');
+	assert.ok(main.includes('checkPayload('), 'the check result must be built by checkPayload');
+	assert.ok(main.includes(`send(CHANNEL.checkResult`), 'the result must be pushed to the renderer');
+});
+
+// A window opened while the engine is already running must show the real state and enable the right
+// controls at once: the renderer reads getState() on load before subscribing to future transitions.
+test('the renderer bootstraps the current state and subscribes to check results', () => {
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	assert.ok(renderer.includes('api.getState()'), 'the renderer must read the current state on load');
+	assert.ok(renderer.indexOf('api.getState()') < renderer.indexOf('api.onState('), 'read before subscribe');
+	assert.ok(renderer.includes('api.onCheckResult('), 'the renderer must show tray check results');
+	// Engine output stays hostile data: state is written with textContent, never an innerHTML assignment.
+	assert.ok(renderer.includes('stateEl.textContent'), 'state must render with textContent');
+	assert.equal(/\.innerHTML\s*=/.test(renderer), false); // no markup sink, even though the word may appear in prose
 });

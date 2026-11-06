@@ -5,7 +5,7 @@
 // The whole app ends only through an explicit quit (tray "Quit", Cmd+Q, or SIGTERM to the app);
 // closing the window just hides it (docs/DESKTOP.md).
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { writeFileSync } from 'node:fs';
@@ -13,12 +13,19 @@ import { writeFileSync } from 'node:fs';
 import { EngineController, defaultSpawn } from './engine.ts';
 import { WindowController } from './window.ts';
 import { buildTrayMenu } from './menu.ts';
-import { CHANNEL, type CommandResult } from './ipc.ts';
+import { CHANNEL, checkPayload, type CommandResult } from './ipc.ts';
 
 // ESM has no __dirname; derive the directory this module lives in once.
 const HERE = import.meta.dirname;
 const RENDERER = join(HERE, '..', 'renderer', 'index.html');
 const RENDERER_URL = pathToFileURL(RENDERER).href;
+// A valid 1x1 transparent PNG (RGBA). Electron's Tray cannot load an empty image, so the placeholder
+// icon must be real bytes or boot crashes; the real template icon is a private design asset we never
+// copy. Hardcoded (no new dependency, no runtime PNG encoder).
+const TRAY_PLACEHOLDER_PNG = Buffer.from(
+	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=',
+	'base64',
+);
 const engine = new EngineController(process.env, join(HERE, '..', '..'), defaultSpawn);
 
 let currentWindow: BrowserWindow | null = null;
@@ -61,9 +68,11 @@ function refreshTrayMenu(): void {
 }
 
 function makeTray(): Tray {
-	// Placeholder only: an empty image plus a title. The real template icon is a private design asset.
+	// Placeholder only: a known-good 1x1 transparent PNG. The real template icon is a private design
+	// asset we never copy. An *empty* image is rejected by Electron's Tray (it cannot load it), which
+	// crashes boot and fails the smoke test, so the placeholder must be a valid PNG.
 	const png = join(app.getPath('temp'), 'ltm-tray-placeholder.png');
-	writeFileSync(png, nativeImage.createEmpty().toPNG());
+	writeFileSync(png, TRAY_PLACEHOLDER_PNG);
 	const created = new Tray(png);
 	created.setTitle('LTM');
 	return created;
@@ -78,7 +87,7 @@ function runAction(action: 'start' | 'stop' | 'check' | 'openWindow' | 'quit'): 
 			void engine.stop();
 			break;
 		case 'check':
-			void engine.runCheck();
+			deliverCheck();
 			break;
 		case 'openWindow':
 			ctl.open();
@@ -87,6 +96,21 @@ function runAction(action: 'start' | 'stop' | 'check' | 'openWindow' | 'quit'): 
 			app.quit();
 			break;
 	}
+}
+
+// The tray "Check setup" opens the window (so there is somewhere to show the result) and then
+// pushes the finished check to the renderer as data. It waits for the page to finish loading before
+// sending, otherwise the message races the renderer and is dropped.
+function deliverCheck(): void {
+	ctl.open();
+	const browser = currentWindow;
+	if (browser === null) return;
+	void engine.runCheck().then((result) => {
+		const payload = checkPayload('check', engine.getState(), result);
+		const send = (): void => browser.webContents.send(CHANNEL.checkResult, payload);
+		if (browser.webContents.isLoading()) browser.webContents.once('did-finish-load', send);
+		else send();
+	});
 }
 
 app.on('before-quit', (event) => {
@@ -129,12 +153,7 @@ function boot(): void {
 		else if (command === 'stop') await engine.stop();
 		else {
 			const result = await engine.runCheck();
-			return {
-				command,
-				view: engine.getState(),
-				report: result.kind === 'report' ? result.report : null,
-				error: result.kind === 'error' ? result.message : null,
-			} satisfies CommandResult;
+			return checkPayload(command, engine.getState(), result) satisfies CommandResult;
 		}
 		return { command, view: engine.getState() } satisfies CommandResult;
 	});
