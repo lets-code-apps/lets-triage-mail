@@ -1,6 +1,6 @@
 // The renderer process. It has no Node and no Electron (contextIsolation + sandbox); the only
-// bridge is the four functions the preload exposed as `window.triageMail`: getState, onState,
-// onCheckResult and command.
+// bridge is the five functions the preload exposed as `window.triageMail`: getState, onState,
+// onCheckResult, command and getStatus (the popup's poll, which this page does not use).
 //
 // Everything the engine reports is hostile data (server and folder names from a mailbox we do
 // not own), so it is always written with textContent, never innerHTML. This page is a static

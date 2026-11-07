@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!-- Lock the page down: nothing loads, nothing is fetched, only local script and style.
+		     Identical to index.html on purpose: the popup is untrusted data, not a browser. -->
+		<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'" />
+		<title>Let's Triage Mail</title>
+		<link rel="stylesheet" href="tokens.css" />
+		<link rel="stylesheet" href="popup.css" />
+	</head>
+	<body>
+		<main id="popup">
+			<header>
+				<p id="count" class="count">0</p>
+				<p id="countLabel" class="label"></p>
+				<p id="subline" class="meta"></p>
+			</header>
+			<p id="summary" class="subhead"></p>
+			<ul id="accounts"></ul>
+			<footer>
+				<button id="start" type="button">Start</button>
+				<button id="stop" type="button">Stop</button>
+				<button id="check" type="button">Check setup</button>
+				<button id="window" type="button">Open window</button>
+				<button id="quit" type="button">Quit</button>
+			</footer>
+		</main>
+		<script src="popup.js"></script>
+	</body>
+</html>

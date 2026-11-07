@@ -31,8 +31,6 @@ export type PopupView = {
 	subline: string;
 	// "1 of 3 connected", or the engine-down / no-accounts copy.
 	summary: string;
-	// Which period the counts cover, in words ("since 21:00").
-	since: string;
 	accounts: AccountRow[];
 	tone: Tone;
 };
@@ -88,7 +86,6 @@ export function buildPopupView(
 			headlineLabel: 'nothing to look at',
 			subline: `0 fyi · 0 done · since ${since}`,
 			summary: 'No accounts configured.',
-			since: `since ${since}`,
 			accounts: [],
 			tone: 'muted',
 		};
@@ -110,7 +107,6 @@ export function buildPopupView(
 		headlineLabel: `${plural(counts.to_look_at, 'message')} to look at`,
 		subline,
 		summary,
-		since: `since ${since}`,
 		accounts,
 		tone: overallTone(accounts, running),
 	};

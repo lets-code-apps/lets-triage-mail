@@ -1,31 +1,41 @@
 // Wiring only: single-instance lock, dock, tray, the controllers and the quit choreography. No
 // triage logic lives here — every engine fact comes from EngineController, which shells out to
-// `lets-triage-mail`. The renderer talks back through the three preload functions only.
+// `lets-triage-mail`. The renderer talks back through the five preload functions only, the popup
+// page through `getStatus` and `command`.
 //
 // The whole app ends only through an explicit quit (tray "Quit", Cmd+Q, or SIGTERM to the app);
-// closing the window just hides it (docs/DESKTOP.md).
+// closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
+// left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain, screen } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { writeFileSync } from 'node:fs';
 
 import { EngineController, defaultSpawn } from './engine.ts';
 import { WindowController } from './window.ts';
+import { buildPopupView } from './popup-model.ts';
+import { POPUP_SIZE, popupPosition } from './popup.ts';
+import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
-import { CHANNEL, checkPayload, type CommandResult } from './ipc.ts';
+import {
+	CHANNEL,
+	IDLE_PAYLOAD,
+	checkPayload,
+	statusPayload,
+	type CommandResult,
+	type EngineCommand,
+	type StatusPayload,
+} from './ipc.ts';
 
 // ESM has no __dirname; derive the directory this module lives in once.
 const HERE = import.meta.dirname;
 const RENDERER = join(HERE, '..', 'renderer', 'index.html');
 const RENDERER_URL = pathToFileURL(RENDERER).href;
-// A valid 1x1 transparent PNG (RGBA). Electron's Tray cannot load an empty image, so the placeholder
-// icon must be real bytes or boot crashes; the real template icon is a private design asset we never
-// copy. Hardcoded (no new dependency, no runtime PNG encoder).
-const TRAY_PLACEHOLDER_PNG = Buffer.from(
-	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=',
-	'base64',
-);
+const POPUP = join(HERE, '..', 'renderer', 'popup.html');
+const POPUP_URL = pathToFileURL(POPUP).href;
+// The design's menu-bar template: the `Template` suffix plus `setTemplateImage` is what lets macOS
+// tint the glyph for a light or dark menu bar.
+const TRAY_ICON = join(HERE, '..', 'assets', 'menubarTemplate.png');
 const engine = new EngineController(process.env, join(HERE, '..', '..'), defaultSpawn);
 
 let currentWindow: BrowserWindow | null = null;
@@ -36,8 +46,17 @@ const ctl = new WindowController(() => makeWindow(), {
 let tray: Tray | undefined;
 let quitInFlight = false;
 
-// Only messages from our own renderer file are trusted; anything else is refused.
-const fromUs = (senderFrame?: { url?: string } | null): boolean => senderFrame?.url === RENDERER_URL;
+// Only messages from our own two pages are trusted; anything else is refused. The popup is the
+// second URL: `getStatus` and `command` both come from here or not at all.
+const fromUs = (senderFrame?: { url?: string } | null): boolean =>
+	senderFrame?.url === RENDERER_URL || senderFrame?.url === POPUP_URL;
+
+// The clock the popup's strings are built with: the user's locale and zone, pinned once per
+// read rather than guessed by the page (see popup-model.ts).
+const clockOptions = () => ({
+	locale: app.getLocale(),
+	timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+});
 
 function makeWindow(): BrowserWindow {
 	const browser = new BrowserWindow({
@@ -53,7 +72,45 @@ function makeWindow(): BrowserWindow {
 	return browser;
 }
 
-function refreshTrayMenu(): void {
+// The popup: a frameless, fixed-size page under the tray icon. `show: false` because the controller
+// decides when it appears; it is never resized, moved or given a menu of its own, and it never
+// touches the dock (a popup opening must not make the app icon appear).
+function makePopupWindow(): BrowserWindow {
+	const bounds = tray?.getBounds() ?? { x: 0, y: 0, width: 0, height: 0 };
+	const area = screen.getPrimaryDisplay().workArea;
+	const at = popupPosition(bounds, area, POPUP_SIZE);
+	const browser = new BrowserWindow({
+		x: at.x,
+		y: at.y,
+		width: POPUP_SIZE.width,
+		height: POPUP_SIZE.height,
+		frame: false,
+		resizable: false,
+		movable: false,
+		show: false,
+		webPreferences: { preload: join(HERE, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
+	});
+	browser.webContents.on('will-navigate', (event: { preventDefault(): void }) => event.preventDefault());
+	browser.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+	// Clicking anywhere else closes the popup, like a native menu (see popup.ts).
+	browser.on('blur', () => popupCtl.handleBlur());
+	// Closing is a hide, except while quitting, when the window really must go away.
+	browser.on('close', (event) => {
+		if (quitInFlight) return;
+		event.preventDefault();
+		browser.hide();
+	});
+	browser.loadFile(POPUP);
+	return browser;
+}
+
+// The popup window's owner. `Date.now` is its clock: a tray click within 250 ms of our own blur-hide
+// is the same gesture, not a new one (popup.ts explains why macOS forces this).
+const popupCtl = new PopupController(() => makePopupWindow(), Date.now);
+
+// The tray menu, built fresh on right-click. No persistent context menu: macOS shows the tray
+// glyph alone until the user asks for the list.
+function trayMenu(): Menu {
 	const template = buildTrayMenu(engine.getState()).map((item) => {
 		const built: { label: string; enabled: boolean; click?: () => void; accelerator?: string } = {
 			label: item.label,
@@ -64,21 +121,18 @@ function refreshTrayMenu(): void {
 		if (item.accelerator) built.accelerator = item.accelerator;
 		return built;
 	});
-	tray?.setContextMenu(Menu.buildFromTemplate(template));
+	return Menu.buildFromTemplate(template);
 }
 
 function makeTray(): Tray {
-	// Placeholder only: a known-good 1x1 transparent PNG. The real template icon is a private design
-	// asset we never copy. An *empty* image is rejected by Electron's Tray (it cannot load it), which
-	// crashes boot and fails the smoke test, so the placeholder must be a valid PNG.
-	const png = join(app.getPath('temp'), 'ltm-tray-placeholder.png');
-	writeFileSync(png, TRAY_PLACEHOLDER_PNG);
-	const created = new Tray(png);
-	created.setTitle('LTM');
-	return created;
+	// The design's template glyph (18x18, with a 36x36 @2x beside it). The `Template` suffix is the
+	// whole contract: Electron's Tray treats such a file as a mask and macOS tints it for a light or
+	// dark menu bar, so there is no light/dark pair to manage. `setTitle` is deliberately absent:
+	// it would put the letters "LTM" in the menu bar next to the glyph.
+	return new Tray(TRAY_ICON);
 }
 
-function runAction(action: 'start' | 'stop' | 'check' | 'openWindow' | 'quit'): void {
+function runAction(action: EngineCommand): void {
 	switch (action) {
 		case 'start':
 			engine.start();
@@ -132,10 +186,12 @@ if (!app.requestSingleInstanceLock()) {
 
 function boot(): void {
 	tray = makeTray();
+	// Left-click toggles the popup; right-click shows the native menu. No persistent context
+	// menu, so the menu bar shows only the template glyph.
+	tray.on('click', () => popupCtl.trayClick(Date.now()));
+	tray.on('right-click', () => tray?.popUpContextMenu(trayMenu()));
 	void engine.readVersion().then(() => {
-		refreshTrayMenu();
 		engine.onState((view) => {
-			refreshTrayMenu();
 			currentWindow?.webContents.send(CHANNEL.state, view);
 		});
 	});
@@ -145,13 +201,26 @@ function boot(): void {
 	if (process.env.LTM_AUTOSTART === '1') engine.start();
 
 	ipcMain.handle(CHANNEL.getState, (event) => (fromUs(event.senderFrame) ? engine.getState() : null));
-	ipcMain.handle(CHANNEL.command, async (event, command: 'start' | 'stop' | 'check') => {
+	// The popup's poll. A hidden popup gets `idle` instead of an engine spawn: polling stops with
+	// the window rather than with a timer, and an invisible page never touches the database.
+	ipcMain.handle(CHANNEL.getStatus, async (event): Promise<StatusPayload> => {
+		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
+		const result = await engine.status();
+		if (result.kind === 'error') return { kind: 'error', message: result.message };
+		return statusPayload(result, buildPopupView(result.report, clockOptions()));
+	});
+	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
 		if (!fromUs(event.senderFrame)) {
 			return { command, view: engine.getState(), error: 'sender not allowed' } satisfies CommandResult;
 		}
 		if (command === 'start') engine.start();
 		else if (command === 'stop') await engine.stop();
-		else {
+		else if (command === 'openWindow') ctl.open();
+		else if (command === 'quit') {
+			// The popup's Quit button: the same path as the tray item and Cmd+Q.
+			app.quit();
+			return { command, view: engine.getState() } satisfies CommandResult;
+		} else {
 			const result = await engine.runCheck();
 			return checkPayload(command, engine.getState(), result) satisfies CommandResult;
 		}
@@ -187,12 +256,26 @@ function runSmoke(): void {
 		browser.close(); // red button / Cmd+W
 		if (browser.isVisible()) fail('window still visible after close');
 		if (engine.getState().state !== 'running') fail('engine stopped when the window closed');
-		// 2. Quit must stop the engine and end the app within the 5s deadline (exit 0).
-		app.on('will-quit', () => {
-			clearTimeout(deadline);
-			console.error('SMOKE OK: window hid, engine ran, quit sent SIGTERM, exit 0');
-		});
-		app.quit();
+		// 2. The popup's data path: one status read, parsed, and turned into ready-to-print strings.
+		//    No window rendering is needed to prove the engine round-trip works end to end.
+		void engine
+			.status()
+			.then((result) => {
+				if (result.kind !== 'status') {
+					fail('status --json did not produce a report');
+					return; // unreachable: `fail` exits; the return only keeps the type narrow
+				}
+				const view = buildPopupView(result.report, clockOptions());
+				if (view.headline.length === 0 || view.accounts.length === 0) fail('the popup view is empty');
+				console.error(`SMOKE STATUS OK: ${view.summary} · ${view.subline}`);
+				// 3. Quit must stop the engine and end the app within the 5s deadline (exit 0).
+				app.on('will-quit', () => {
+					clearTimeout(deadline);
+					console.error('SMOKE OK: window hid, engine ran, status parsed, quit sent SIGTERM, exit 0');
+				});
+				app.quit();
+			})
+			.catch((error: unknown) => fail(`status read threw: ${String(error)}`));
 	};
 	waitForRunning(0);
 }

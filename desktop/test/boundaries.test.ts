@@ -79,14 +79,49 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 
 // The preload is CommonJS (sandbox), so it cannot import CHANNEL from ipc.ts. This closes the seam
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
-test('the preload bridge exposes exactly the channels ipc.ts declares', () => {
+test('the preload bridge exposes exactly the five channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
-	for (const channel of [CHANNEL.getState, CHANNEL.state, CHANNEL.command, CHANNEL.checkResult]) {
+	const channels = [CHANNEL.getState, CHANNEL.state, CHANNEL.command, CHANNEL.checkResult, CHANNEL.getStatus];
+	for (const channel of channels) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// It exposes only getState / onState / onCheckResult / command; nothing that reaches Node or the
-	// network.
-	assert.equal(preload.includes('require('), true);
+	// Five and only five: nothing here reaches Node, the network or the filesystem. The one
+	// `require` allowed is the electron module itself.
+	const requires = preload.match(/require\([^)]*\)/g) ?? [];
+	for (const call of requires) {
+		assert.equal(call, "require('electron')", `preload.cjs may only require electron, saw ${call}`);
+	}
+	for (const forbidden of ['node:', 'readFile', 'fetch', 'child_process', 'process.']) {
+		assert.ok(!preload.includes(forbidden), `preload.cjs must not touch ${forbidden}`);
+	}
+});
+
+// The popup is a second page, so it gets the same lockdown as the window: one exact CSP, no
+// markup sink, and the same two-page allow-list in main. These assertions are the executable
+// version of docs/DESKTOP.md's "Window and tray security stance".
+test('the popup page is as locked down as the window page', () => {
+	const popup = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
+	const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'" />`;
+	assert.ok(popup.includes(CSP), 'popup.html must carry the exact same CSP as index.html');
+	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	// Engine strings are hostile data: text only, never an HTML sink.
+	assert.equal(/\.innerHTML\s*=/.test(script), false, 'popup.js must not assign innerHTML');
+	assert.ok(script.includes('textContent'), 'popup.js must render with textContent');
+});
+
+test('main trusts only the two pages it loads, and answers getStatus behind that guard', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	// Two known files, spelled out; anything else is refused.
+	assert.ok(main.includes('url === RENDERER_URL') && main.includes('url === POPUP_URL'), 'fromUs must name exactly two pages');
+	assert.ok(/senderFrame\?\.url/.test(main), 'the guard must read the sender frame');
+	// The popup's poll is refused (`idle`) for a hidden page or a stranger.
+	assert.ok(main.includes(`if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD`), 'getStatus must be guarded');
+	// The tray glyph is the design's template image, not a placeholder with a text label.
+	assert.equal(main.includes("setTitle('LTM')"), false, 'no text label in the menu bar');
+	assert.ok(main.includes('menubarTemplate.png'), 'the tray must use the template icon');
+	// A popup must never make the app icon appear: the dock belongs to the window controller.
+	const popupLines = main.slice(main.indexOf('function makePopupWindow'), main.indexOf('const popupCtl'));
+	assert.ok(!popupLines.includes('dock.'), 'the popup must not touch the dock');
 });
 
 // The tray advertises "Check setup" as an implemented action, so its click must (a) open a window

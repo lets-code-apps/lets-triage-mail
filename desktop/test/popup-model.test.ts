@@ -107,8 +107,9 @@ test('one message reads "message to look at"', () => {
 
 test('the clock line follows the pinned zone, not the machine', () => {
 	const view = buildPopupView(report(), { locale: 'en-US', timeZone: 'Europe/Berlin' });
-	assert.match(view.since, /^since \d\d:\d\d$/);
-	assert.notEqual(view.since, buildPopupView(report(), OPTS).since);
+	// 1793998800 is 22:00 in Berlin, 21:00 in UTC: the zone is an argument, never the machine's.
+	assert.match(view.subline, /since \d\d:\d\d$/);
+	assert.notEqual(view.subline, buildPopupView(report(), OPTS).subline);
 });
 
 // A report with exactly one account in the given state (totals match it, so the accent is honest).
