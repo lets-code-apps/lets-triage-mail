@@ -29,8 +29,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{AccountConfig, Config};
 use crate::decider::Decider;
 use crate::digest::schedule::{DigestTiming, digest_loop};
-use crate::imap::worker::{WorkerError, backoff_delay, run_account};
+use crate::imap::worker::{WorkerError, backoff_delay, run_account, state_for_error};
 use crate::imap::{ImapError, ImapSession};
 use crate::senders::harvest_known_senders;
 use crate::store::Store;
@@ -63,6 +63,9 @@ pub struct SupervisorTiming {
     pub harvest_retry: Duration,
     /// How the daily digest loop checks the clock and retries.
     pub digest: DigestTiming,
+    /// How often the engine refreshes its `heartbeat_at` row (see `status.rs`). `status` calls
+    /// the engine alive while the heartbeat is fresher than `HEARTBEAT_STALE_SECONDS`.
+    pub heartbeat: Duration,
 }
 
 impl Default for SupervisorTiming {
@@ -76,6 +79,7 @@ impl Default for SupervisorTiming {
             harvest_interval: Duration::from_secs(6 * 60 * 60),
             harvest_retry: Duration::from_secs(15 * 60),
             digest: DigestTiming::default(),
+            heartbeat: Duration::from_secs(30),
         }
     }
 }
@@ -136,10 +140,15 @@ pub enum AccountEnd {
 /// `make_worker` is called once per start and returns the worker's future. Taking a closure
 /// instead of a future is what makes restarting possible: a future can only be run once.
 /// (`FnMut() -> Fut` reads "a function I can call repeatedly, each call giving a new `Fut`".)
+///
+/// `store` is where the account's state row goes (see `status.rs`): `sign_in_failed` when a
+/// refused login is about to be retried, `failed` when the worker gives up. The write is advisory
+/// — a database problem is logged, never turned into a worker failure.
 pub async fn supervise<F, Fut>(
     name: &str,
     shutdown: &CancellationToken,
     timing: &SupervisorTiming,
+    store: Arc<Mutex<Store>>,
     mut make_worker: F,
 ) -> AccountEnd
 where
@@ -159,6 +168,18 @@ where
             failures = 0;
         }
         failures += 1;
+        // What the popup will show for this account: `state_for_error` maps a refused login to
+        // `sign_in_failed` and anything else to `failed` (see `status.rs`).
+        let state = state_for_error(&error);
+        let account = name.to_owned();
+        note_store(
+            Arc::clone(&store),
+            "account state",
+            move |db: &mut Store| -> crate::store::Result<()> {
+                db.set_account_state(&account, state.as_str(), now_unix())
+            },
+        )
+        .await;
         match restart_decision(&error, failures, timing) {
             RestartDecision::GiveUp => {
                 tracing::error!(account = %name, %error, "worker failed; not restarting");
@@ -292,7 +313,28 @@ pub async fn run_service<D: Decider + Send + Sync + 'static>(
 ) -> ServiceReport {
     let names: Vec<String> = config.accounts.iter().map(|a| a.name.clone()).collect();
     let timing = Arc::new(timing);
-    serve(&names, &shutdown, &timing, |index| {
+
+    // Status bookkeeping (see `status.rs`): a one-shot `status --json` in another process
+    // reads these rows. Every write here is advisory: a failure is logged, never fatal.
+    let begin_names = names.clone();
+    note_store(
+        Arc::clone(&store),
+        "begin run",
+        move |db: &mut Store| -> crate::store::Result<()> {
+            db.begin_run(&begin_names, now_unix())
+        },
+    )
+    .await;
+
+    // The heartbeat task rides along with the workers until the service ends: a stale
+    // heartbeat is how `status` learns the engine died without a clean stop.
+    let heartbeat = tokio::spawn(heartbeat_loop(
+        Arc::clone(&store),
+        Arc::clone(&timing),
+        shutdown.clone(),
+    ));
+
+    let report = serve(&names, &shutdown, &timing, |index| {
         account_unit(
             Arc::clone(&config),
             index,
@@ -302,7 +344,82 @@ pub async fn run_service<D: Decider + Send + Sync + 'static>(
             Arc::clone(&timing),
         )
     })
-    .await
+    .await;
+    // The service is over either way (clean stop, or every account gave up): fire the token
+    // so the heartbeat task ends deterministically, wait for it, then clear the engine row at
+    // once: a finished `run` must not keep looking alive for another 90 s.
+    shutdown.cancel();
+    // `await` waits for the heartbeat task to notice the token: no heartbeat can land after
+    // `end_run` clears the rows. A panicked heartbeat is a bug in the bookkeeping, not a
+    // service failure, so it is logged and dropped.
+    if heartbeat.await.is_err() {
+        tracing::warn!("the heartbeat task stopped unexpectedly; status may look stale");
+    }
+    note_store(
+        store,
+        "end run",
+        move |db: &mut Store| -> crate::store::Result<()> { db.end_run() },
+    )
+    .await;
+    report
+}
+
+/// Keeps the engine's heartbeat row fresh until `shutdown` fires. A `status` read in another
+/// process decides liveness from this row (see `status.rs`).
+async fn heartbeat_loop(
+    store: Arc<Mutex<Store>>,
+    timing: Arc<SupervisorTiming>,
+    shutdown: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(timing.heartbeat);
+    // If the machine sleeps (a busy blocking database call), skip beats rather than fire them
+    // all at once: a heartbeat that is 40 s late is still a heartbeat, not four.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick is immediate; `begin_run` just wrote a fresh row
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = shutdown.cancelled() => return
+        }
+        note_store(
+            Arc::clone(&store),
+            "heartbeat",
+            move |db: &mut Store| -> crate::store::Result<()> { db.heartbeat(now_unix()) },
+        )
+        .await;
+    }
+}
+
+/// Runs one status-bookkeeping store call on the blocking pool and logs any failure instead of
+/// propagating it: the status rows are bookkeeping, and mail processing matters more than the
+/// popup. The lock is taken and released inside the blocking closure, so it is never held across
+/// an `await` (the same discipline as `worker.rs`'s `with_store`).
+async fn note_store<F>(store: Arc<Mutex<Store>>, task: &str, work: F)
+where
+    F: FnOnce(&mut Store) -> crate::store::Result<()> + Send + 'static,
+{
+    let outcome = tokio::task::spawn_blocking(move || -> crate::store::Result<()> {
+        let mut guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        work(&mut guard)
+    })
+    .await;
+    // `spawn_blocking` reports a panic inside the call as an error value too; both cases are
+    // logged and dropped.
+    let failure = match outcome {
+        Err(panic) => Some(panic.to_string()),
+        Ok(result) => result.err().map(|error| format!("{error}")),
+    };
+    if let Some(error) = failure {
+        tracing::warn!(task = task, error = %error, "status write failed (ignored)");
+    }
+}
+
+/// Current time as Unix seconds, the same clock the store rows use.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// One account: the supervised inbox worker next to the Sent harvester and the digest loop.
@@ -321,15 +438,21 @@ async fn account_unit<D: Decider + Send + Sync>(
     let side_stop = shutdown.child_token();
 
     let inbox = async {
-        let end = supervise(&account.name, &shutdown, &timing, || {
-            run_account(
-                account,
-                &config,
-                Arc::clone(&decider),
-                Arc::clone(&store),
-                shutdown.clone(),
-            )
-        })
+        let end = supervise(
+            &account.name,
+            &shutdown,
+            &timing,
+            Arc::clone(&store),
+            || {
+                run_account(
+                    account,
+                    &config,
+                    Arc::clone(&decider),
+                    Arc::clone(&store),
+                    shutdown.clone(),
+                )
+            },
+        )
         .await;
         side_stop.cancel();
         end
@@ -416,6 +539,17 @@ mod tests {
         SupervisorTiming::default()
     }
 
+    /// A fresh database for the state writes `supervise` makes (see `status.rs`).
+    fn store() -> Arc<Mutex<Store>> {
+        Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    }
+
+    /// The state rows, as `status --json` would read them.
+    fn states(store: Arc<Mutex<Store>>) -> Vec<(String, String)> {
+        let guard = store.lock().unwrap();
+        guard.account_states().unwrap()
+    }
+
     fn login_error() -> WorkerError {
         WorkerError::Imap(ImapError::Login(
             std::io::Error::other("bad password").into(),
@@ -464,7 +598,8 @@ mod tests {
     async fn supervise_restarts_after_a_login_failure_then_stops_on_shutdown() {
         let shutdown = CancellationToken::new();
         let starts = Arc::new(AtomicU32::new(0));
-        let end = supervise("a", &shutdown, &timing(), || {
+        let store = store();
+        let end = supervise("a", &shutdown, &timing(), Arc::clone(&store), || {
             let (starts, shutdown) = (Arc::clone(&starts), shutdown.clone());
             async move {
                 match starts.fetch_add(1, Ordering::SeqCst) {
@@ -479,6 +614,8 @@ mod tests {
         .await;
         assert_eq!(end, AccountEnd::Stopped);
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+        // The refused login is visible to `status --json` while the retry waits (see `status.rs`).
+        assert_eq!(states(store), [("a".into(), "sign_in_failed".into())]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -486,7 +623,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let timing = timing();
         let starts = Arc::new(Mutex::new(Vec::new()));
-        supervise("a", &shutdown, &timing, || {
+        supervise("a", &shutdown, &timing, store(), || {
             let (starts, shutdown) = (Arc::clone(&starts), shutdown.clone());
             let healthy_for = timing.restart_max;
             async move {
@@ -524,13 +661,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn supervise_gives_up_on_non_restartable_errors() {
         let shutdown = CancellationToken::new();
-        let end = supervise("a", &shutdown, &timing(), || async {
+        let store = store();
+        let end = supervise("a", &shutdown, &timing(), Arc::clone(&store), || async {
             Err(WorkerError::LiveWithoutKeywords {
                 account: "a".into(),
             })
         })
         .await;
         assert!(matches!(end, AccountEnd::GaveUp(reason) if reason.contains("custom keywords")));
+        // The popup's row for an account a restart cannot fix (see `status.rs`).
+        assert_eq!(states(store), [("a".into(), "failed".into())]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -542,7 +682,7 @@ mod tests {
             sleep(Duration::from_secs(1)).await;
             canceller.cancel();
         });
-        let end = supervise("a", &shutdown, &timing(), || {
+        let end = supervise("a", &shutdown, &timing(), store(), || {
             starts.fetch_add(1, Ordering::SeqCst);
             async { Err(login_error()) }
         })

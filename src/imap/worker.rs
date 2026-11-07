@@ -82,6 +82,7 @@ use crate::flags::{StoreChange, clear_change};
 use crate::message::{HEADERS_ONLY_THRESHOLD, ParsedMessage, parse_headers_only, parse_message};
 use crate::precheck::{SOURCE_MODEL, SOURCE_RULE, precheck};
 use crate::senders::{HarvestError, harvest_known_senders, plan_batches};
+use crate::status::AccountState;
 use crate::store::{
     LabelRecord, MailboxState, MessageKey, OwnedFlag, ProcessedRecord, Store, StoreError,
 };
@@ -207,6 +208,41 @@ fn imap_error_is_fatal(error: &ImapError) -> bool {
         | ImapError::EmptyUidSet
         | ImapError::InvalidFolderName(_)
         | ImapError::MissingData(_) => false,
+    }
+}
+
+/// Which account state a worker failure means for the desktop popup (see `status.rs`).
+///
+/// Pure so the mapping is testable without an IMAP server. A refused login is the one case
+/// where the supervisor keeps trying, hence `sign_in_failed`; every other failure leaves the
+/// account stopped, hence `failed`.
+pub fn state_for_error(error: &WorkerError) -> AccountState {
+    match error {
+        WorkerError::Imap(ImapError::Login(_)) => AccountState::SignInFailed,
+        _ => AccountState::Failed,
+    }
+}
+
+/// Records one account's connection state for `status --json` (see `status.rs`).
+///
+/// Advisory: the row exists for the popup, so a database problem is logged at `warn` and
+/// ignored — a badge must never fail mail processing. The lock is taken and released inside
+/// the blocking closure, so it is never held across an `await` (as `Ctx::with_store` does).
+async fn note_state(store: Arc<Mutex<Store>>, account: &str, state: AccountState) {
+    let account = account.to_owned();
+    let word = state.as_str();
+    let outcome = tokio::task::spawn_blocking(move || -> crate::store::Result<()> {
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.set_account_state(&account, word, now_unix())
+    })
+    .await;
+    // `spawn_blocking` also turns a panic inside the call into an error value.
+    let failure = match outcome {
+        Err(panic) => Some(panic.to_string()),
+        Ok(result) => result.err().map(|error| format!("{error}")),
+    };
+    if let Some(error) = failure {
+        tracing::warn!(error = %error, "could not record account state (ignored)");
     }
 }
 
@@ -528,6 +564,13 @@ pub async fn run_account_with_timing<D: Decider>(
                     account = %account.name, %error, retry_in_secs = delay.as_secs(),
                     "connection lost or failed; reconnecting"
                 );
+                // The popup shows the same thing the log says (see `status.rs`); advisory.
+                note_state(
+                    Arc::clone(&store),
+                    &account.name,
+                    AccountState::Reconnecting,
+                )
+                .await;
                 if shutdown
                     .run_until_cancelled(tokio::time::sleep(delay))
                     .await
@@ -576,6 +619,13 @@ impl<D: Decider> Ctx<'_, D> {
             account = %self.account.name, idle = use_idle, mode = self.mode().as_str(),
             "connected"
         );
+        // The same fact, for the desktop popup (see `status.rs`); advisory.
+        note_state(
+            Arc::clone(self.store),
+            &self.account.name,
+            AccountState::Connected,
+        )
+        .await;
 
         let inbox = self.account.inbox.as_str();
         let name = self.account.name.clone();
