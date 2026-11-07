@@ -15,7 +15,8 @@ Cargo.toml            # the Rust crate (root). `exclude = ["desktop/"]` keeps th
 src/**                # the engine and CLI. Does not know the desktop exists.
 desktop/              # the Electron app: its own package.json, no Cargo involvement.
   src/                # main process + controllers (TypeScript, ESM)
-  renderer/           # static placeholder (HTML/CSS/JS, no framework, no remote resources)
+  renderer/           # two pages, no framework, no remote resources: the window and the popup
+  assets/             # the menu-bar template icon (18 px + 36 px @2x)
   test/               # node --test unit tests + synthetic fixtures
 docs/DESKTOP.md       # this file
 ```
@@ -38,24 +39,32 @@ model. If it needs a fact it asks the engine and renders the answer verbatim. Th
 
 ## Interface contract
 
-All calls are **existing** engine commands, so the foundation needs no Rust source change.
+All calls are engine commands. `check`, `run` and `--version` already existed; **`status --json` is
+new**, added for the popup, and it is the only command the engine changed for the desktop's sake.
 
 | Call | Use | Shape the desktop relies on |
 |---|---|---|
 | `lets-triage-mail run` (long-lived child) | the triage engine | stdout/stderr are free-form logs: kept in a ring buffer (last 500 lines, memory only), **never** parsed. Exit 0 = clean stop; non-zero = failed (config missing, or every account failed). |
 | `lets-triage-mail check --json` (one-shot) | "Check setup": the engine validates config, model and accounts; the window lists the `items` | `{ok, failed, warnings, items:[{area, status:"ok"|"warn"|"fail", message, hint: string|null}]}`. Exit is non-zero when something failed but **stdout is still the JSON**: parse stdout, ignore the exit code. A config that does not load is itself a `Config` fail item, so validation is the engine's. Shape is locked by the existing test in `src/check.rs` (~line 1404). |
+| `lets-triage-mail status --json` (one-shot) | the popup under the tray icon: engine liveness, today's counts, every account's state | `{version:1, generated_at, engine:{running, started_at, heartbeat_at}, window:{kind:"today", since}, counts:{to_look_at, fyi, done}, accounts:[{name, mode, state, reason, counts}]}`. Timestamps are Unix seconds and `null` when not running (a key is never missing). `state` is one of `connecting | connected | reconnecting | sign_in_failed | failed | not_running`; `reason` is the engine's own fixed English sentence. **Parse stdout; a non-zero exit with empty stdout is an error** (the first stderr line is the reason); a read is killed after 10 s. Metadata only — never a sender, subject, body or raw server error text. Shape is locked by `status::tests::json_shape_is_locked` in `src/status.rs`. |
 | `lets-triage-mail --version` | show the engine version in the tray menu | one line `lets-triage-mail X.Y.Z` |
 
 Config and database are the **same files the CLI uses**: the desktop passes no `--config` unless
 `LTM_CONFIG` is set. One setup, two front ends.
 
-Changing a `check --json` field is a breaking change for the desktop; the Rust test is the guard.
+Changing a `check --json` or `status --json` field is a breaking change for the desktop; the Rust
+lock tests are the guard. `status --json` also carries `version: 1` and the parser refuses a shape
+version it does not speak, rather than guessing at a renamed key.
 
 ## Lifecycle contract
 
 Engine states: `stopped`, `starting`, `running`, `stopping`, `failed(exit code or signal, last
-stderr lines)`. **`running` means the process is alive, not that mail is healthy** — health comes
-from `check` today and from a future `status`.
+stderr lines)`. **`running` in the tray means the child process is alive**; health and per-account
+progress come from `status` (`check` still answers "is my setup valid"). The popup's `running` is a
+different fact from the same word: it is the engine's **heartbeat** row being fresh (`status --json`
+says `running: false` within 90 s of a crash, and at once on a clean stop, because `run` deletes the
+row). A hard-killed engine child therefore still shows a stale tray state for up to 90 s in the popup
+while the tray already says `failed`.
 
 - `start()`: resolve the binary, spawn `[bin, "run"]` with stdio `["ignore","pipe","pipe"]`.
   `starting → running` on the `spawn` event.
@@ -84,22 +93,30 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
 
 ## Window and tray security stance
 
-- Tray: placeholder title and icon (`setTitle("LTM")` plus a minimal 1x1 transparent PNG; Electron's
-  `Tray` rejects an empty image, so the placeholder must be a real loadable one). The real template icon is
-  a private design asset and is **not** copied. The native menu is a stand-in for the mockup popover in
-  the private `TriageMailTray` design, which is a later increment.
+- Tray: the design's menu-bar **template** icon (`assets/menubarTemplate.png`, 18 px, with a 36 px
+  `@2x` beside it). A file named `*Template.png` is treated as a mask, so macOS tints the glyph for a
+  light or dark menu bar: there is no light/dark pair to manage and no text label (a `setTitle` would
+  put letters in the menu bar). Left-click toggles the popup; right-click pops up the native menu
+  (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
+  and Engine version lines; Quit with Cmd+Q) — no persistent context menu.
+- Popup: a second page, opened by that left-click, frameless, fixed 360×260, centred under the glyph
+  and clamped inside the work area. It hides on blur, like a native menu. It is read-only: no dock
+  handling, no resizing, no moving, and its strings are built in the **main** process
+  (`desktop/src/popup-model.ts`), so the page never formats or colours anything itself.
 - Window: one `BrowserWindow`, default native title bar (the `hiddenInset` treatment comes with the
   design import, since design decisions stay with the board). Created on first open, then hidden/shown,
   never destroyed. Content is a static placeholder: engine state, the `check` result list, and
   Start/Stop/Check buttons, all through a tiny preload API. It is **not** the accounts/folders/settings
   screens.
-- Security defaults, all required: `contextIsolation: true`, `sandbox: true`,
+- Security defaults, all required, on **both** pages: `contextIsolation: true`, `sandbox: true`,
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'`, `will-navigate`
-  and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is our own
-  file, and the preload (see `desktop/src/preload.cjs`) exposes four functions only (`getState`,
-  `onState`, `onCheckResult`, `command(start|stop|check)`). The renderer writes engine text with
-  `textContent`, never `innerHTML`
-  (check messages contain server and folder names).
+  and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
+  two files** (the window page and the popup page), and the preload (see `desktop/src/preload.cjs`)
+  exposes five functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
+  `command(start|stop|check|openWindow|quit)`). A `getStatus` call from a hidden popup is answered
+  `idle`: an invisible page never spawns the engine. The renderer and the popup write engine text with
+  `textContent`, never `innerHTML` (check messages carry server and folder names, and the popup shows
+  config account names), and a pill's colour class can only be one of four allow-listed names.
 
 ## Developer guide
 
@@ -130,9 +147,14 @@ Keeping these three apart is the point: it stops this document from reading like
 
 ### Implemented
 
-- A tray item with a placeholder title and a native menu (status line; Start/Stop triage enabled by
-  engine state; Check setup; Open window; disabled app-name and Engine version lines; Quit with
-  Cmd+Q).
+- A tray item with the design's template icon (tinted by macOS) and a native menu on right-click
+  (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
+  and Engine version lines; Quit with Cmd+Q).
+- The menu-bar **popup**: left-click opens it centred under the glyph, a blur closes it, its content is
+  `status --json` turned into ready-to-print strings in the main process (big "to look at" number,
+  `N fyi · M done · since HH:MM`, `X of Y connected`, one row per account with a state pill).
+- Engine status for the UI: `status --json` (shape locked by a Rust test), fed by two SQLite tables the
+  engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
 - A single window that hides on close and reopens by reuse (never destroyed); the dock hides when no
   window is visible.
 - The engine start/stop/quit lifecycle: one SIGTERM then SIGKILL after the deadline, single-instance
@@ -142,7 +164,6 @@ Keeping these three apart is the point: it stops this document from reading like
 
 ### Mockup only (designed in the private design repo, nothing coded)
 
-- A tray popover with counts and account states (`TriageMailTray`).
 - Accounts list and "add account" (`TriageMailAccounts`).
 - Per-account server folders with modes `off/report/classify/act` and actions (`TriageMailFolders`),
   matching `docs/SPEC.md` §5 and needing engine v1.1a/b first.
@@ -160,12 +181,12 @@ Everything in the "Next increments" table and "Distribution and signing" section
 | # | Increment | Gate |
 |---|---|---|
 | 2 | Engine safe to embed: single-instance lock on `run`, exit when stdin closes, desktop restart policy with backoff, then flip autostart on | `File::lock` is stable only from Rust 1.89 and `rust-version` is 1.85: needs an MSRV bump or a crate. **Board decision.** |
-| 3 | Engine status for the UI: `status --json` (and/or a 0600 Unix-socket channel) with per-account state and counts | Design the channel first; allowlists `node:net` in the boundary test. Never a loopback TCP port. |
+| 3 | **Done by this PR.** Engine status for the UI: `status --json` with per-account state and counts, from two SQLite tables the engine writes | No channel design needed after all: the database the engine already owns is the channel, so `node:net` stays out of the boundary test. A 0600 Unix socket remains available as a later increment. |
 | 4 | Config through the engine: `config show/validate --json` and engine-owned set/add/remove that keep comments and never log passwords; Keychain entry creation | Needs a TOML-editing crate: **board approval**. Prerequisite for 5–7. |
-| 5 | Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; first UI-framework decision. |
+| 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
 | 6 | Accounts screen (add account, test sign-in via `check --account`, password to Keychain, pause/resume) | Needs 4. |
 | 7 | Folders screen | Needs engine v1.1a folder discovery and v1.1b modes first. |
-| 8 | Settings screen (general, notifications, triage) | Needs 4; notifications also need 3. |
+| 8 | Settings screen (general, notifications, triage) | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
 | 9 | Packaging: bundle the engine into the app, locally signed (ad-hoc) dev build, launch at login | Packager choice recorded in `docs/DECISIONS.md`. |
 | 10 | Release pipeline and updates: Developer ID signing, notarization, DMG/zip on GitHub Releases, optional update check, Homebrew cask | Board: Apple Developer Program, CI secrets, public release. Adds the privacy statement. |
 

@@ -185,6 +185,21 @@ lets-triage-mail digest --dry               # print today's digest, change nothi
 lets-triage-mail digest --account zoho      # write it now
 ```
 
+## Engine status
+
+`status` answers one question in one shot, with the engine either running or not: what the
+engine has done today and how far each account got. It reads the state database the running engine
+already owns, so it works while `run` is stopped, and it prints metadata only — no senders, subjects
+or bodies.
+
+```sh
+lets-triage-mail status            # human-readable: engine liveness, today's counts, account states
+lets-triage-mail status --json     # the same snapshot for machines (the desktop popup parses this)
+```
+
+The JSON shape is locked by a test; changing a key or a value is a breaking change for the
+desktop app. See [docs/DESKTOP.md](docs/DESKTOP.md).
+
 ## Providers
 
 What has been tried so far. Reports for other providers are very welcome: open a

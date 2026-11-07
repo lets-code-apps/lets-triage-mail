@@ -27,7 +27,8 @@ Nothing is implemented yet. This is the starting plan; verify crate versions and
 src/
   main.rs            # clap CLI → commands
   config.rs          # TOML → typed config, validation, password_command
-  store.rs           # SQLite: mailbox state, processed log, flag ownership, rules, known senders, digest state, label dataset
+  store.rs           # SQLite: mailbox state, processed log, flag ownership, rules, known senders, digest state, label dataset, engine+account status rows
+  status.rs          # the `status --json` snapshot (pure shaping: liveness from a heartbeat row, today's counts, account states)
   message.rs         # parse raw → ParsedMessage (auth results, bulk headers, body text, spoof signals)
   decider/
     mod.rs           # trait Decider, Evidence, Decision
@@ -117,7 +118,8 @@ docs/DESKTOP.md       # the desktop design, boundaries and lifecycle
 ```
 
 The only seam is the engine's command line: the desktop spawns `lets-triage-mail` as a child
-process and renders what the engine reports (`run` logs, `check --json`, `--version`). The
+process and renders what the engine reports (`run` logs, `check --json`, `status --json`,
+`--version`). The
 desktop never parses config, opens the database, speaks IMAP or calls the model — those stay the
 engine's job. `desktop/test/boundaries.test.ts` enforces the "no network, no config/DB reads, single
 owner of logic" rule, mirroring how `imap/session.rs` is checked so only it speaks IMAP.

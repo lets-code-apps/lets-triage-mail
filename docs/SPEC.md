@@ -96,6 +96,7 @@ lets-triage-mail classify FILE.eml         # dry classification of one message, 
 lets-triage-mail backfill [--days 7] [--account X]   # same pipeline over the last N days, oldest first; never moves the worker's position
 lets-triage-mail digest [--account X] [--dry]         # --dry: print the text, change nothing; else deliver now (append, or a file for a dry-run account)
 lets-triage-mail stats [--days 7]
+lets-triage-mail status [--json]         # one snapshot: engine liveness (heartbeat), today's counts, per-account state; metadata only
 lets-triage-mail rules list|allow|block|remove PATTERN
 ```
 
