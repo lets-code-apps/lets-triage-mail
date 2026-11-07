@@ -1619,6 +1619,28 @@ mod tests {
     }
 
     #[test]
+    fn state_for_error_maps_login_to_sign_in_failed() {
+        // The one failure the supervisor keeps trying, so the popup says what to check.
+        assert_eq!(
+            state_for_error(&WorkerError::Imap(ImapError::Login(
+                std::io::Error::other("bad password").into(),
+            ))),
+            AccountState::SignInFailed,
+        );
+        // Anything else leaves the account stopped.
+        assert_eq!(
+            state_for_error(&WorkerError::LiveWithoutKeywords {
+                account: "a".into(),
+            }),
+            AccountState::Failed,
+        );
+        assert_eq!(
+            state_for_error(&WorkerError::Imap(ImapError::Timeout)),
+            AccountState::Failed,
+        );
+    }
+
+    #[test]
     fn going_live_needs_custom_keywords() {
         // Live without keywords: refused, with a message that says what to do.
         let error = ensure_keywords("zoho", FlagMode::Live, false).unwrap_err();
