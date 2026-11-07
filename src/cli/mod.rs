@@ -1,8 +1,8 @@
 //! The command-line interface: the argument types (parsed by `clap`) and the dispatch.
 //!
 //! Each subcommand lives in its own file and exposes one `async fn run` that returns
-//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `rules` and `backfill` work; the others are
-//! still stubs, see `docs/PLAN.md`.
+//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `status`, `rules` and `backfill`
+//! work; the others are still stubs, see `docs/PLAN.md`.
 
 mod backfill;
 mod check;
@@ -11,6 +11,7 @@ mod digest;
 mod rules;
 mod run;
 mod stats;
+mod status;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -105,6 +106,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Snapshot what the engine is doing now; `--json` is the shape the desktop app reads
+    Status {
+        /// Print machine-readable JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the sender allow and block rules
     #[command(subcommand)]
     Rules(rules::RulesCommand),
@@ -131,6 +138,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             digest::run(&config_path, account.as_deref(), dry).await
         }
         Command::Stats { days, json } => stats::run(&config_path, days, json).await,
+        Command::Status { json } => status::run(&config_path, json).await,
         Command::Rules(command) => rules::run(&config_path, command).await,
     }
 }
@@ -325,6 +333,18 @@ mod tests {
             }
             other => panic!("expected check, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_status_with_and_without_json() {
+        assert!(matches!(
+            parse(&["status"]).unwrap().command,
+            Command::Status { json: false }
+        ));
+        let cli = parse(&["status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { json: true }));
+        // The snapshot takes no account or days filter: it is always "now and today".
+        assert!(parse(&["status", "--account", "work"]).is_err());
     }
 
     #[test]

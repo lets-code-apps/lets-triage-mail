@@ -15,5 +15,6 @@ pub mod imap;
 pub mod message;
 pub mod precheck;
 pub mod senders;
+pub mod status;
 pub mod store;
 pub mod supervisor;

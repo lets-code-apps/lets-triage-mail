@@ -1,0 +1,51 @@
+/* The approved design tokens for this app, as CSS custom properties.
+   Light is the default; the dark block applies when the system asks for dark.
+   Values are copied from the design language's token sheet (see docs/DESKTOP.md: the design
+   files are named, never pathed). Nothing here is loaded over the network: the CSP in
+   popup.html forbids it, and Poppins is not bundled (a font link would break that rule). */
+
+:root {
+  color-scheme: light;
+  --bg: #F5F5F7;
+  --surface: #FFFFFF;
+  --raised: #EDEDF1;
+  --line: #DEDEE4;
+  --fg: #0B0B0E;
+  --muted: #5C5C66;
+  --positive: #17703D;
+  --attention: #8A5700;
+  --danger: #C62828;
+
+  /* Radii, spacing and type scale (px). */
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 24px;
+  --r-pill: 999px;
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-6: 24px;
+  --meta: 13px;
+  --label: 12px;
+  --item: 15px;
+  --subhead: 20px;
+  --count: 40px;
+
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0B0B0E;
+    --surface: #141418;
+    --raised: #1C1C22;
+    --line: #2A2A31;
+    --fg: #F4F4F6;
+    --muted: #A0A0AA;
+    --positive: #5BD08A;
+    --attention: #F2B544;
+    --danger: #FF6B6B;
+  }
+}
