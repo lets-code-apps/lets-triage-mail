@@ -85,7 +85,10 @@ while the tray already says `failed`.
 - **Autostart of the engine on app launch is off in this increment** (`LTM_AUTOSTART=1` or
   `--autostart` turns it on; the smoke test uses it). Tray has explicit "Start triage" / "Stop triage".
   Reason: the engine has no single-instance lock yet, so a launchd agent plus a desktop-started engine
-  would both watch the same mailbox. Target behaviour once the lock lands: autostart on, because the
+  would both watch the same mailbox. This increment does not stop that at the OS level, but the desktop
+  guards the click: a Start (tray or popup) first reads a fresh `status`, and if it reports a running
+  engine the app did not spawn, no second one starts and the popup says "Running outside the app" with
+  Start disabled. Target behaviour once the lock lands: autostart on, because the
   product is "closing the window leaves triage running".
 
 Known limitation, documented: if the Electron main process is killed hard, the engine child is
@@ -151,8 +154,12 @@ Keeping these three apart is the point: it stops this document from reading like
   (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
   and Engine version lines; Quit with Cmd+Q).
 - The menu-bar **popup**: left-click opens it centred under the glyph, a blur closes it, its content is
-  `status --json` turned into ready-to-print strings in the main process (big "to look at" number,
-  `N fyi · M done · since HH:MM`, `X of Y connected`, one row per account with a state pill).
+  `status --json` turned into ready-to-print strings in the main process (a generated date/time line
+  above the counts, the big "to look at" number, `N fyi · M done · since HH:MM`, `X of Y connected`,
+  one row per account with a state pill). Its **Start** is disabled, with the note "Running outside the
+  app", when a fresh `status` shows a live engine the app did not start (there is no single-instance
+  lock yet); its **Check setup** opens the main window and pushes the report there through the same
+  path the tray uses, rather than discarding it.
 - Engine status for the UI: `status --json` (shape locked by a Rust test), fed by two SQLite tables the
   engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
 - A single window that hides on close and reopens by reuse (never destroyed); the dock hides when no
