@@ -13,12 +13,15 @@
 	<body>
 		<main id="popup">
 			<header>
+				<p id="generated" class="meta"></p>
 				<p id="count" class="count">0</p>
 				<p id="countLabel" class="label"></p>
 				<p id="subline" class="meta"></p>
 			</header>
 			<p id="summary" class="subhead"></p>
-			<ul id="accounts"></ul>
+			<!-- The `class` is what popup.css styles (`.accounts`, `.accounts > li`); the id is
+			     what popup.js looks up. Both must stay, or every row renders as an unstyled list. -->
+			<ul id="accounts" class="accounts"></ul>
 			<footer>
 				<button id="start" type="button">Start</button>
 				<button id="stop" type="button">Stop</button>

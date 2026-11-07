@@ -16,11 +16,13 @@ const TONES = ['positive', 'attention', 'danger', 'muted'];
 // process answers `idle` and spawns nothing at all.
 const REFRESH_MS = 5_000;
 
+const generatedEl = document.getElementById('generated');
 const countEl = document.getElementById('count');
 const countLabelEl = document.getElementById('countLabel');
 const sublineEl = document.getElementById('subline');
 const summaryEl = document.getElementById('summary');
 const accountsEl = document.getElementById('accounts');
+const startBtn = document.getElementById('start');
 
 // `render` only paints what main already built; the buttons below are the popup's own actions.
 function render(payload) {
@@ -35,10 +37,14 @@ function render(payload) {
   }
 
   const view = payload.view;
+  generatedEl.textContent = view.generated;
   countEl.textContent = view.headline;
   countLabelEl.textContent = view.headlineLabel;
   sublineEl.textContent = view.subline;
   summaryEl.textContent = view.summary;
+  // main already decided whether Start is safe (a fresh status may show an engine this app did
+  // not start); the page only reflects that, it never decides it.
+  startBtn.disabled = Boolean(view.startDisabled);
 
   // Rebuild the rows: the account list can change (a config edit), and it is short.
   while (accountsEl.firstChild !== null) accountsEl.removeChild(accountsEl.firstChild);

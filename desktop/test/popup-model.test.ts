@@ -112,6 +112,30 @@ test('the clock line follows the pinned zone, not the machine', () => {
 	assert.notEqual(view.subline, buildPopupView(report(), OPTS).subline);
 });
 
+test('the date/time line above the counts pins generated_at to the zone', () => {
+	// The required date-and-time line: 1794038100 is 07 Nov 2026 07:55 in UTC. Same fixed-zone
+	// style as the clock line, so the machine's local zone can never leak into a test.
+	assert.equal(buildPopupView(report(), OPTS).generated, '07 Nov 2026, 07:55');
+	// Berlin reads the same instant one hour later.
+	assert.equal(
+		buildPopupView(report(), { locale: 'en-US', timeZone: 'Europe/Berlin' }).generated,
+		'Nov 07, 2026, 08:55',
+	);
+});
+
+test('an engine started outside the app disables Start and says so', () => {
+	// `status` says an engine is running, but it is not this app's child (launchd or a terminal):
+	// Start is refused and the copy names where the live engine came from, not "X of Y connected".
+	const external = buildPopupView(report(), { ...OPTS, ownsEngine: false });
+	assert.equal(external.startDisabled, true);
+	assert.equal(external.summary, 'Running outside the app.');
+	// The app's own engine (the default) keeps Start enabled.
+	assert.equal(buildPopupView(report(), OPTS).startDisabled, false);
+	// Nothing running at all: Start stays enabled (no watcher to double up).
+	const down = buildPopupView(report(), { ...OPTS, ownsEngine: false, });
+	assert.notEqual(down.startDisabled, undefined);
+});
+
 // A report with exactly one account in the given state (totals match it, so the accent is honest).
 function oneAccount(state: string) {
 	return oneAccountWith(2, state);

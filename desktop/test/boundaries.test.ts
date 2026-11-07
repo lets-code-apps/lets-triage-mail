@@ -136,6 +136,41 @@ test('the tray Check result is opened, built and pushed to the renderer', () => 
 	assert.ok(main.includes(`send(CHANNEL.checkResult`), 'the result must be pushed to the renderer');
 });
 
+// The popup styles its rows with `.accounts` / `.accounts > li`; a selector the markup does not
+// expose is silent breakage (an unstyled browser list). This pins markup and selector together.
+test('the account list exposes the class its CSS targets, and carries the date/time line', () => {
+	const html = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
+	const css = readFileSync(join(DESKTOP, 'renderer', 'popup.css'), 'utf8');
+	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	const ul = /<ul\b[^>]*>/.exec(html);
+	assert.ok(ul, 'popup.html must contain the account list');
+	assert.match(ul[0], /id="accounts"/);
+	assert.match(ul[0], /class="accounts"/, 'the list needs the class popup.css styles');
+	assert.match(css, /\.accounts\s*>\s*li/, 'the stylesheet must target that class');
+	// The required date-and-time line above the counts: present in markup, filled with textContent.
+	assert.match(html, /id="generated"/, 'the popup needs a generated date/time element');
+	assert.match(script, /generatedEl\.textContent/);
+});
+
+// There is no single-instance lock yet, so a Start must not double-watch a mailbox. The guard reads
+// a fresh `status`, the view model names the external engine, and the page only reflects the choice.
+test('the popup cannot start a second engine while one runs outside the app', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.ok(/function performStart/.test(main), 'Start must go through a guard, not engine.start()');
+	assert.ok(/performStart[^]*?engine\.status\(\)/.test(main), 'the guard reads a fresh status');
+	const model = readFileSync(join(SRC, 'popup-model.ts'), 'utf8');
+	assert.ok(model.includes("'Running outside the app.'"), 'the view model names the external engine');
+	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	assert.match(script, /startBtn\.disabled = Boolean\(view\.startDisabled\)/);
+});
+
+// The popup has no room for a report and no onCheckResult sink of its own, so its "Check setup"
+// must reuse the tray path (open the window + push the result) rather than discard a returned one.
+test('the popup Check setup opens the window instead of discarding its report', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.match(main, /POPUP_URL[\s\S]*?deliverCheck\(\)/, 'a popup check must call deliverCheck');
+});
+
 // A window opened while the engine is already running must show the real state and enable the right
 // controls at once: the renderer reads getState() on load before subscribing to future transitions.
 test('the renderer bootstraps the current state and subscribes to check results', () => {

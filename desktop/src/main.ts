@@ -58,6 +58,15 @@ const clockOptions = () => ({
 	timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
 });
 
+// Whether the live engine is the one this app spawned. A fresh `status` that reports `running`
+// while this is false means something else started it (a launchd agent or a terminal). There is no
+// single-instance lock yet, so the popup must not offer to start a second watcher over the same
+// mailbox; the real fix is increment 2 (docs/DESKTOP.md, risk "No single-instance lock yet").
+const appOwnsEngine = (): boolean => {
+	const state = engine.getState().state;
+	return state === 'running' || state === 'starting';
+};
+
 function makeWindow(): BrowserWindow {
 	const browser = new BrowserWindow({
 		width: 640,
@@ -135,13 +144,13 @@ function makeTray(): Tray {
 function runAction(action: EngineCommand): void {
 	switch (action) {
 		case 'start':
-			engine.start();
+			void performStart();
 			break;
 		case 'stop':
 			void engine.stop();
 			break;
 		case 'check':
-			deliverCheck();
+			void deliverCheck();
 			break;
 		case 'openWindow':
 			ctl.open();
@@ -152,14 +161,24 @@ function runAction(action: EngineCommand): void {
 	}
 }
 
+// A Start is only allowed when no engine is already live. A fresh `status --json` is the arbiter:
+// if it says `running` while this app did not spawn that process (appOwnsEngine() is false), starting
+// another would double-watch the mailbox and let two runs overwrite each other's status rows. The
+// popup disables its Start button on the same fact, so the user sees why before they can click it.
+async function performStart(): Promise<void> {
+	const result = await engine.status();
+	const external = result.kind === 'status' && result.report.engine.running && !appOwnsEngine();
+	if (!external) engine.start();
+}
+
 // The tray "Check setup" opens the window (so there is somewhere to show the result) and then
 // pushes the finished check to the renderer as data. It waits for the page to finish loading before
 // sending, otherwise the message races the renderer and is dropped.
-function deliverCheck(): void {
+function deliverCheck(): Promise<void> {
 	ctl.open();
 	const browser = currentWindow;
-	if (browser === null) return;
-	void engine.runCheck().then((result) => {
+	if (browser === null) return Promise.resolve();
+	return engine.runCheck().then((result) => {
 		const payload = checkPayload('check', engine.getState(), result);
 		const send = (): void => browser.webContents.send(CHANNEL.checkResult, payload);
 		if (browser.webContents.isLoading()) browser.webContents.once('did-finish-load', send);
@@ -207,20 +226,30 @@ function boot(): void {
 		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
 		const result = await engine.status();
 		if (result.kind === 'error') return { kind: 'error', message: result.message };
-		return statusPayload(result, buildPopupView(result.report, clockOptions()));
+		return statusPayload(result, buildPopupView(result.report, {
+			...clockOptions(),
+			ownsEngine: appOwnsEngine(),
+		}));
 	});
 	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
 		if (!fromUs(event.senderFrame)) {
 			return { command, view: engine.getState(), error: 'sender not allowed' } satisfies CommandResult;
 		}
-		if (command === 'start') engine.start();
+		if (command === 'start') await performStart();
 		else if (command === 'stop') await engine.stop();
 		else if (command === 'openWindow') ctl.open();
 		else if (command === 'quit') {
 			// The popup's Quit button: the same path as the tray item and Cmd+Q.
 			app.quit();
 			return { command, view: engine.getState() } satisfies CommandResult;
-		} else {
+		} else if (command === 'check') {
+			// The popup has no room for a full report and no `onCheckResult` sink of its own, so
+			// its "Check setup" reuses the tray path: open the main window and push the finished
+			// check there through `deliverCheck`. Only the window page keeps the report inline.
+			if (event.senderFrame?.url === POPUP_URL) {
+				await deliverCheck();
+				return { command, view: engine.getState() } satisfies CommandResult;
+			}
 			const result = await engine.runCheck();
 			return checkPayload(command, engine.getState(), result) satisfies CommandResult;
 		}
