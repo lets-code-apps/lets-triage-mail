@@ -10,6 +10,7 @@ import { EngineController, type EngineProcess } from '../src/engine.ts';
 // The engine is driven with a fake child so no real process, signal or timer is involved: `spawn`
 // and the stop timeout are injected. This mirrors how the Rust supervisor tests inject a closure.
 const REPORT = readFileSync(join(import.meta.dirname, 'fixtures', 'check-report.json'), 'utf8');
+const STATUS = readFileSync(join(import.meta.dirname, 'fixtures', 'status-report.json'), 'utf8');
 // A fixed env so resolveEngine never hits the filesystem: an explicit path short-circuits the lookup.
 const ENV: NodeJS.ProcessEnv = { LTM_ENGINE_PATH: '/fake/lets-triage-mail' };
 
@@ -31,7 +32,16 @@ function makeLong(runKind: 'normal' | 'ignore'): LongChild {
 }
 
 function makeSpawn() {
-	const state = { long: [] as LongChild[], runKind: 'normal' as 'normal' | 'ignore', checkMode: 'json' as 'json' | 'nonjson' };
+	const state = {
+		long: [] as LongChild[],
+		runKind: 'normal' as 'normal' | 'ignore',
+		checkMode: 'json' as 'json' | 'nonjson',
+		// 'json' prints the status fixture; 'refused' exits 1 with nothing on stdout; 'hang' never
+		// closes (the timeout path).
+		statusMode: 'json' as 'json' | 'refused' | 'hang' | 'garbage',
+		statusSpawns: 0,
+		statusSignals: [] as string[],
+	};
 	const spawn = (file: string, args: readonly string[], options?: { stdio?: unknown }) => {
 		void file;
 		void options;
@@ -40,30 +50,52 @@ function makeSpawn() {
 			state.long.push(long);
 			return long.child;
 		}
-		// A short-lived one-shot child (check / --version): it writes then closes.
+		// A short-lived one-shot child (check / status / --version): it writes then closes.
 		const one = new EventEmitter() as unknown as EngineProcess;
 		const stdout = new PassThrough();
 		const stderr = new PassThrough();
 		one.stdout = stdout;
 		one.stderr = stderr;
-		one.kill = () => {};
+		const signals: string[] = [];
+		one.kill = (signal?: NodeJS.Signals | number) => {
+			signals.push(String(signal));
+			// The wedged status child only dies when the desktop escalates.
+			one.emit('exit', null, String(signal));
+			one.emit('close');
+		};
+		state.statusSignals.push(...signals);
 		const wantVersion = args.includes('--version');
+		const wantStatus = args.includes('status');
+		if (wantStatus) state.statusSpawns += 1;
 		queueMicrotask(() => {
 			if (wantVersion) stdout.write('lets-triage-mail 0.1.0\n');
-			else if (state.checkMode === 'json') stdout.write(REPORT);
+			else if (wantStatus && state.statusMode === 'json') {
+				stdout.write(STATUS);
+				one.emit('exit', 0, null);
+			} else if (wantStatus && state.statusMode === 'refused') {
+				// Nothing on stdout, the engine's own reason on stderr, non-zero exit.
+				stderr.write('status: cannot open the state database\n');
+				one.emit('exit', 1, null);
+			} else if (wantStatus && state.statusMode === 'hang') {
+				// 'hang': no output, no close. The status timeout must kill it.
+			} else if (wantStatus && state.statusMode === 'garbage') {
+				// A wedged engine that still printed something half-way: stdout is not a report.
+				stdout.write('status: writing...\n');
+				one.emit('exit', 1, null);
+			} else if (state.checkMode === 'json') stdout.write(REPORT);
 			else {
 				stdout.write('boom, not json\n');
 				stderr.write('server unreachable\n');
 			}
-			one.emit('close');
+			if (!(wantStatus && state.statusMode === 'hang')) one.emit('close');
 		});
 		return one;
 	};
 	return { spawn, state };
 }
 
-const controller = (spawn: ReturnType<typeof makeSpawn>, stopTimeoutMs = 5) =>
-	new EngineController(ENV, '/unused', spawn.spawn, stopTimeoutMs);
+const controller = (spawn: ReturnType<typeof makeSpawn>, stopTimeoutMs = 5, statusTimeoutMs = 5) =>
+	new EngineController(ENV, '/unused', spawn.spawn, stopTimeoutMs, statusTimeoutMs);
 
 test('start walks stopped -> starting -> running on the spawn event', () => {
 	const s = makeSpawn();
@@ -195,4 +227,65 @@ test('readVersion strips the binary name down to the version token', async () =>
 	const s = makeSpawn();
 	const e = controller(s);
 	assert.equal(await e.readVersion(), '0.1.0');
+});
+
+// --- `status --json` for the popup -------------------------------------------------------------
+
+test('status parses the fixture report', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	const result = await e.status();
+	assert.equal(result.kind, 'status');
+	if (result.kind === 'status') {
+		assert.equal(result.report.accounts.length, 2);
+		assert.equal(result.report.engine.running, true);
+	}
+});
+
+test('two polls while one is in flight share a single spawn', async () => {
+	const s = makeSpawn();
+	s.state.statusMode = 'hang'; // the child stays open, so both calls are genuinely concurrent
+	const e = controller(s, 5, 50);
+	const first = e.status();
+	const second = e.status();
+	assert.equal(first, second, 'the same in-flight promise');
+	// One process, and the timeout kills it (the popup must never wait on a wedged engine).
+	await first;
+	assert.equal(s.state.statusSpawns, 1);
+});
+
+test('a wedged status child is killed and the popup gets an error', async () => {
+	const s = makeSpawn();
+	s.state.statusMode = 'hang';
+	const e = controller(s); // statusTimeoutMs = 5
+	const result = await e.status();
+	assert.equal(result.kind, 'error');
+	if (result.kind === 'error') assert.match(result.message, /no output/);
+});
+
+test('a non-zero exit with no stdout reports the engine\'s own first stderr line', async () => {
+	const s = makeSpawn();
+	s.state.statusMode = 'refused';
+	const e = controller(s);
+	const result = await e.status();
+	assert.equal(result.kind, 'error');
+	if (result.kind === 'error') assert.match(result.message, /cannot open the state database/);
+});
+
+test("half-written stdout is a parse error, not the engine's reason", async () => {
+	const s = makeSpawn();
+	s.state.statusMode = 'garbage';
+	const e = controller(s);
+	const result = await e.status();
+	assert.equal(result.kind, 'error');
+	if (result.kind === 'error') assert.match(result.message, /valid JSON/);
+	else assert.fail('expected an error');
+});
+
+test('the next poll starts a fresh spawn once the previous one settled', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	await e.status();
+	await e.status();
+	assert.equal(s.state.statusSpawns, 2);
 });

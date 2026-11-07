@@ -20,8 +20,9 @@ import { EventEmitter } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { parseCheckReport } from './check-report.ts';
+import { parseStatusReport } from './status-report.ts';
 import { resolveEngine } from './engine-path.ts';
-import type { CheckResult, EngineState, EngineView } from './ipc.ts';
+import type { CheckResult, EngineState, EngineView, StatusResult } from './ipc.ts';
 
 // The slice of a child process this controller relies on. A real `ChildProcess` satisfies it;
 // so does the fake used by the tests.
@@ -34,12 +35,16 @@ export interface EngineProcess extends EventEmitter {
 const MAX_LOG_LINES = 500;
 const MAX_STDERR_LINES = 8;
 const DEFAULT_STOP_TIMEOUT_MS = 30_000;
+// One-shot `status --json` reads a local SQLite file; anything slower than this is a wedged
+// engine, and a popup must not wait on one.
+const STATUS_TIMEOUT_MS = 10_000;
 
 export class EngineController {
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly repoRoot: string;
 	private readonly spawn: SpawnLike;
 	private readonly stopTimeoutMs: number;
+	private readonly statusTimeoutMs: number;
 	private readonly resourcesPath: string | undefined;
 
 	private current: EngineState = 'stopped';
@@ -66,6 +71,8 @@ export class EngineController {
 		spawn: SpawnLike,
 		// Stop deadline in ms; docs/DESKTOP.md derives 30 s from `ExitTimeOut`. Tests inject a tiny value.
 		stopTimeoutMs: number = DEFAULT_STOP_TIMEOUT_MS,
+		// How long one `status --json` may take before the popup gives up and kills it. Tests shorten it.
+		statusTimeoutMs: number = STATUS_TIMEOUT_MS,
 		// Electron sets `process.resourcesPath`; undefined when running outside a packaged build.
 		resourcesPath: string | undefined = undefined,
 	) {
@@ -73,6 +80,7 @@ export class EngineController {
 		this.repoRoot = repoRoot;
 		this.spawn = spawn;
 		this.stopTimeoutMs = stopTimeoutMs;
+		this.statusTimeoutMs = statusTimeoutMs;
 		this.resourcesPath = resourcesPath;
 	}
 
@@ -237,14 +245,19 @@ export class EngineController {
 		return this.version;
 	}
 
-	// Runs one short-lived engine call and gathers its streams. Exit code is ignored: for
-	// `check --json` the report is on stdout even when the process exits non-zero.
-	private async collect(subArgs: string[]): Promise<{ stdout: string; stderrTail: string[] }> {
+	// Runs one short-lived engine call and gathers its streams. The exit code is kept (a `status`
+	// failure is only interesting when stdout is empty); for `check --json` it is ignored, because
+	// a failing setup still prints its report.
+	private async collect(
+		subArgs: string[],
+		timeoutMs: number = 0,
+	): Promise<{ stdout: string; stderrTail: string[]; exitCode: number | null }> {
 		const { file, baseArgs } = this.resolve();
 		const child = this.spawn(file, [...baseArgs, ...subArgs], { stdio: ['ignore', 'pipe', 'pipe'] });
 
 		let stdout = '';
 		const stderrTail: string[] = [];
+		let exitCode: number | null = null;
 		if (child.stdout) child.stdout.on('data', (chunk: unknown) => (stdout += String(chunk)));
 		if (child.stderr) {
 			child.stderr.on('data', (chunk: unknown) => {
@@ -254,12 +267,60 @@ export class EngineController {
 				}
 			});
 		}
+		child.once('exit', (code: number | null) => {
+			exitCode = code;
+		});
 
-		await new Promise<void>((resolve) => {
+		const closed = new Promise<void>((resolve) => {
 			child.once('close', () => resolve());
+			// A spawn failure ends the wait too; the empty stdout becomes a parse error.
 			child.once('error', () => resolve());
 		});
-		return { stdout, stderrTail };
+		if (timeoutMs > 0) {
+			// `status` answers in tens of milliseconds, so hitting this limit already means the
+			// engine is wedged: kill the child (SIGKILL, it is not reasoning any more) and move on.
+			const outcome = await Promise.race([
+				closed.then(() => 'closed' as const),
+				delay(timeoutMs).then(() => 'timeout' as const),
+			]);
+			if (outcome === 'timeout') {
+				child.kill('SIGKILL');
+				await closed;
+			}
+		} else {
+			await closed;
+		}
+		return { stdout, stderrTail, exitCode };
+	}
+
+	// --- status for the popup ---------------------------------------------------
+
+	// One in-flight status read. The popup polls every few seconds; sharing the promise means a
+	// slow machine never piles up `status` processes against the database.
+	private statusPromise: Promise<StatusResult> | null = null;
+
+	status(): Promise<StatusResult> {
+		if (this.statusPromise !== null) return this.statusPromise;
+		const done = this.readStatus().finally(() => {
+			// The next poll starts a fresh spawn.
+			this.statusPromise = null;
+		});
+		this.statusPromise = done;
+		return done;
+	}
+
+	private async readStatus(): Promise<StatusResult> {
+		const collected = await this.collect(['status', '--json'], this.statusTimeoutMs);
+		const parsed = parseStatusReport(collected.stdout);
+		if ('report' in parsed) return { kind: 'status', report: parsed.report };
+		// An empty stdout with a non-zero exit is the engine refusing to answer: its own first
+		// stderr line is the reason (hostile data, so it is only ever written as text).
+		const first = collected.stderrTail[0] ?? '';
+		const message =
+			collected.stdout.trim() === '' && collected.exitCode !== null && collected.exitCode !== 0 && first !== ''
+				? first
+				: parsed.error;
+		return { kind: 'error', message };
 	}
 }
 

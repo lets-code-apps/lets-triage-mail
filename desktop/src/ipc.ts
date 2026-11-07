@@ -6,14 +6,17 @@
 // under plain `node --test` (no GUI, no Electron runtime).
 
 import type { CheckReport } from './check-report.ts';
+import type { StatusReport } from './status-report.ts';
+import type { PopupView } from './popup-model.ts';
 
 // Engine lifecycle states, mirrored from docs/DESKTOP.md. `running` means the process is
 // alive, NOT that mail is healthy; health comes from a `check` (see engine.ts).
 export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed';
 
 // A command the renderer can ask the main process to run. Nothing here reaches mail, the
-// model or the database: each maps to one engine subcommand.
-export type EngineCommand = 'start' | 'stop' | 'check';
+// model or the database: each maps to one engine subcommand, or to a window/app action main
+// owns. `openWindow` and `quit` exist so the popup's footer buttons need no extra channel.
+export type EngineCommand = 'start' | 'stop' | 'check' | 'openWindow' | 'quit';
 
 // What the renderer shows about the engine. `exitCode`/`signal`/`failureTail` are filled only in
 // `failed`. `failureTail` is the last few stderr lines the engine printed before it died (bounded
@@ -40,6 +43,7 @@ export const CHANNEL = {
 	state: 'ltm.state',
 	command: 'ltm.command',
 	checkResult: 'ltm.checkResult',
+	getStatus: 'ltm.getStatus',
 } as const;
 
 // Result of a `command` invocation: the command echoed back plus the state it produced.
@@ -48,6 +52,28 @@ export type CommandResult = { command: EngineCommand; view: EngineView; report?:
 // Result of running `check`: either a parsed report (render as data) or a clean error string.
 // Defined here (not in engine.ts) so the payload helper below can stay electron-free and unit-testable.
 export type CheckResult = { kind: 'report'; report: CheckReport } | { kind: 'error'; message: string };
+
+// Result of one `status --json` read: the parsed report, or a clean error string. Also declared
+// here so `engine.ts` and the popup's reader agree on it by construction.
+export type StatusResult = { kind: 'status'; report: StatusReport } | { kind: 'error'; message: string };
+
+// What the popup page actually receives. `idle` is main's answer while the popup is hidden: an
+// invisible page must not spawn the engine, so polling stops with the window, not with a timer.
+// `view` is a ready-to-print `PopupView` (strings + a tone) built in main by `popup-model.ts`, so
+// the sandboxed page never formats or colours anything itself.
+export type StatusPayload =
+	| { kind: 'status'; view: PopupView }
+	| { kind: 'idle' }
+	| { kind: 'error'; message: string };
+
+// Turn a status outcome into the exact payload the popup renders. Pure and typed, so main can
+// neither drop the view nor forget the error (same reasoning as `checkPayload` above).
+export function statusPayload(result: StatusResult, view: PopupView): StatusPayload {
+	return result.kind === 'status' ? { kind: 'status', view } : { kind: 'error', message: result.message };
+}
+
+// The idle answer, spelled in one place so the popup's own reader has one shape to handle.
+export const IDLE_PAYLOAD: StatusPayload = { kind: 'idle' };
 
 // Turn a check outcome into the exact payload the renderer renders. Pure and typed, so a main-process
 // test cannot silently drop the report or the error; both main.ts call sites (the tray and the

@@ -8,20 +8,22 @@
 //   run --ignore-sigterm    ignores SIGTERM forever (simulates the SIGKILL-after-deadline path)
 //   run --emit-logs         floods stdout with 600 lines (ring-buffer cap check)
 //   check --json            prints fixtures/check-report.json
+//   status --json           prints fixtures/status-report.json
+//   status --exit-1         prints nothing and exits 1 (the popup shows the engine's own reason)
 //   --version               prints `lets-triage-mail 0.1.0`
 //
 // Real engine behaviour it mirrors: first SIGTERM is a clean cancel (exit 0); the process never
 // exits on its own while healthy. See src/cli/run.rs::watch_for_signals.
 
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const args = process.argv.slice(2);
+// An ES module has no `__dirname`; this fixture's own URL is the way to find its folder.
+const HERE = dirname(fileURLToPath(import.meta.url));
 
-function report() {
-	const path = join(__dirname, 'check-report.json');
-	return readFileSync(path, 'utf8');
-}
+const fixture = (name) => readFileSync(join(HERE, name), 'utf8');
 
 if (args[0] === '--version') {
 	process.stdout.write('lets-triage-mail 0.1.0\n');
@@ -29,7 +31,17 @@ if (args[0] === '--version') {
 }
 
 if (args[0] === 'check') {
-	process.stdout.write(report());
+	process.stdout.write(fixture('check-report.json'));
+	process.exit(0);
+}
+
+if (args[0] === 'status') {
+	if (args.includes('--exit-1')) {
+		// The engine refusing to answer: no stdout, a reason on stderr, non-zero exit.
+		process.stderr.write('status: cannot open the state database\n');
+		process.exit(1);
+	}
+	process.stdout.write(fixture('status-report.json'));
 	process.exit(0);
 }
 
