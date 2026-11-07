@@ -81,5 +81,5 @@ jobs:
       # Non-blocking for now: the smoke test opens a real tray/window, which needs a GUI session.
       # Kept so a broken lifecycle is visible, but not allowed to turn CI red until it is stable.
       - name: Smoke (real Electron)
-        continue-on-failure: true
+        continue-on-error: true
         run: npm run smoke
