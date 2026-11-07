@@ -869,4 +869,54 @@ mod tests {
         assert_eq!(report.accounts[0].state, AccountState::Failed);
         assert_eq!(report.accounts[0].reason, "Stopped after an error.");
     }
+
+    #[test]
+    fn json_contains_no_sender_or_subject() {
+        // The metadata-only rule, made a regression test: a row that carries sender and subject
+        // still counts toward the numbers, but neither string may reach the JSON. Distinct
+        // sentinels so a leak could not hide behind an account name.
+        let config = config_two("");
+        let sender = "SENTINELSENDER@example.invalid";
+        let subject = "SENTINELSUBLJECT-DO-NOT-LEAK";
+        let raw = RawStatus {
+            engine: Some((940, 1000)), // fresh heartbeat, so the engine reads as running
+            states: [("Example Work".to_string(), "connected".to_string())].to_vec(),
+            rows: [
+                [
+                    row(sender, subject, Some(TriageFlag::ReplyNeeded), None, 950),
+                    row(
+                        sender,
+                        subject,
+                        None,
+                        Some(verdict(Category::Newsletter)),
+                        951,
+                    ),
+                ]
+                .to_vec(),
+                Vec::<DigestRow>::new(),
+            ]
+            .to_vec(),
+        };
+        let report = build_report(1000, 950, &config, raw);
+        // The rows are really counted (so the assertions below are not vacuously true).
+        assert_eq!(report.counts.to_look_at, 1);
+        assert_eq!(report.counts.done, 1);
+
+        let value = serde_json::to_string(&report).unwrap();
+        assert!(
+            !value.contains(sender),
+            "sender leaked into the status JSON"
+        );
+        assert!(
+            !value.contains(subject),
+            "subject leaked into the status JSON"
+        );
+        // And no mail metadata is a field this shape even has.
+        for forbidden in ["sender", "subject", "body", "SENTINEL"] {
+            assert!(
+                !value.contains(forbidden),
+                "{forbidden} appeared in the status JSON"
+            );
+        }
+    }
 }
