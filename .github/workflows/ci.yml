@@ -65,7 +65,7 @@ jobs:
     name: desktop (typecheck, test, smoke)
     runs-on: macos-latest
     defaults:
-      job:
+      run:
         working-directory: desktop
     steps:
       - uses: actions/checkout@v4
