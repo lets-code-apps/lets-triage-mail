@@ -77,32 +77,6 @@ header {
   color: var(--muted);
 }
 
-.pill {
-  padding: var(--s-1) var(--s-2);
-  border-radius: var(--r-pill);
-  font-size: var(--label);
-  font-weight: 500;
-  /* Unknown tones land here: readable, uncoloured. `popup.js` only ever adds a class from the
-     four-name allow-list, so data can never reach a selector. */
-  background: var(--raised);
-  color: var(--muted);
-}
-
-.pill.positive {
-  background: color-mix(in srgb, var(--positive) 14%, var(--raised));
-  color: var(--positive);
-}
-
-.pill.attention {
-  background: color-mix(in srgb, var(--attention) 14%, var(--raised));
-  color: var(--attention);
-}
-
-.pill.danger {
-  background: color-mix(in srgb, var(--danger) 14%, var(--raised));
-  color: var(--danger);
-}
-
 footer {
   display: flex;
   flex-wrap: wrap;

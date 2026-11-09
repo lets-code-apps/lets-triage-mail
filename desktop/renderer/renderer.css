@@ -1,31 +1,209 @@
-/* A static, framework-free placeholder. No remote fonts, no images, no network. */
-:root {
-	font-family: system-ui, sans-serif;
+/* The desktop app shell: app bar, then nav | list | detail in one wrapping flex row.
+   Colours and sizes come from tokens.css; no remote fonts, images or network (see the CSP). */
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 16px;
+  line-height: 1.55;
 }
 
-main {
-	max-width: 40rem;
-	padding: 1rem 1.25rem;
+button {
+  font: inherit;
+  color: inherit;
 }
 
-#state {
-	font-variant-numeric: tabular-nums;
-	margin: 0.25rem 0;
+button:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 2px;
 }
 
-#hint {
-	color: #666;
-	font-size: 0.85rem;
+.appbar {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 64px;
+  padding: 0 var(--s-6) 0 80px;
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
 }
 
-#check {
-	white-space: pre-wrap;
-	padding: 0.5rem;
-	background: #f4f4f4;
-	font-family: ui-monospace, monospace;
+.appbar button {
+  -webkit-app-region: no-drag;
 }
 
-#buttons button {
-	padding: 0.4rem 0.75rem;
-	margin-right: 0.5rem;
+.panes {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.nav {
+  box-sizing: border-box;
+  flex: 1 1 200px;
+  max-width: 240px;
+  padding: var(--s-4) var(--s-3);
+  border-right: 1px solid var(--line);
+}
+
+.nav button {
+  display: block;
+  width: 100%;
+  padding: 10px var(--s-3);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.nav button[aria-current='page'] {
+  background: var(--raised);
+}
+
+.list {
+  box-sizing: border-box;
+  flex: 1 1 360px;
+  max-width: 460px;
+  min-width: 0;
+  padding: var(--s-6) 0 0;
+  border-right: 1px solid var(--line);
+}
+
+.list > h1,
+.list > .summary,
+.list > .buttons {
+  margin: 0;
+  padding: 0 var(--s-4);
+}
+
+h1 {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+h2 {
+  margin: 0 0 var(--s-2);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.summary,
+.meta,
+.hint {
+  font-size: var(--meta);
+  color: var(--muted);
+}
+
+.summary {
+  margin: var(--s-2) 0 var(--s-4);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rows > button {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: var(--s-3);
+  width: 100%;
+  padding: var(--s-3) var(--s-4);
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: none;
+  text-align: left;
+}
+
+.rows > button[aria-pressed='true'] {
+  background: var(--raised);
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-pill);
+  background: var(--raised);
+  font-size: var(--meta);
+  font-weight: 600;
+}
+
+.rows > button[aria-pressed='true'] .avatar {
+  background: var(--surface);
+}
+
+.name {
+  font-size: var(--item);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.text {
+  min-width: 0;
+}
+
+.text > span {
+  display: block;
+}
+
+.buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-top: var(--s-4);
+}
+
+.buttons button {
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--meta);
+}
+
+.buttons button:disabled {
+  color: var(--muted);
+}
+
+.detail {
+  box-sizing: border-box;
+  flex: 999 1 420px;
+  min-width: 0;
+  padding: var(--s-6) 20px 32px;
+}
+
+.detail p {
+  max-width: 62ch;
+  margin: var(--s-3) 0;
+  overflow-wrap: anywhere;
+}
+
+.detail p.meta,
+.detail p.hint {
+  margin: var(--s-4) 0 0;
+}
+
+.checks > div {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--s-1) var(--s-3);
+  padding: var(--s-3) 0;
+  border-top: 1px solid var(--line);
+}
+
+.checks .area {
+  font-weight: 500;
+}
+
+.checks .msg {
+  grid-column: 2;
+  overflow-wrap: anywhere;
 }
