@@ -36,7 +36,7 @@ model. The design assumes that **every email is written by an attacker**.
 | **HTML or header injection** into the digest | Every value from an email is escaped in the HTML and flattened to one line in text and headers, so a subject cannot add a header or markup. |
 | **Tracking via the digest** | The digest loads nothing from the network; its one image is inside the message. |
 | **The service skipping its own digest** being abused to hide mail | The worker skips its digest by the UID the server returned and an unguessable Message-ID, not by a header a sender could copy. |
-| **SSRF** (mail making the service fetch a URL) | The service never follows links or loads anything named in a message. The only outgoing connections are to the configured IMAP servers and model endpoint. |
+| **SSRF** (mail making the service fetch a URL) | The service never follows links or loads anything named in a message. The only outgoing connections are to the configured IMAP servers and model endpoint. Redirects from the model endpoint are not followed. |
 | **Oversized or malformed mail** | Bodies are cut to `llm.max_body_chars` before the model sees them; a message that cannot be parsed is skipped, and a failed classification goes to a retry queue; neither stops the worker. |
 
 ### What is stored
