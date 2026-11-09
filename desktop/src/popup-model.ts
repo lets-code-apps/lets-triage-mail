@@ -21,6 +21,9 @@ export type AccountRow = {
 	note: string;
 	state: string;
 	tone: Tone;
+	// Two capital letters for the window's avatar circle, and the account's own counts line.
+	initials: string;
+	counts: string;
 };
 
 export type PopupView = {
@@ -152,7 +155,19 @@ const accountRow = (account: StatusAccount): AccountRow => ({
 	note: account.reason,
 	state: account.state,
 	tone: toneForState(account.state),
+	initials: initials(account.name),
+	counts: `${account.counts.to_look_at} to look at · ${account.counts.fyi} fyi · ${account.counts.done} done`,
 });
+
+// First letters of the first two words, uppercased ("Example Work" -> "EW"). Spread, not
+// indexing, so an emoji or other astral character is not cut in half.
+export const initials = (name: string): string =>
+	name
+		.split(/\s+/)
+		.filter(Boolean)
+		.slice(0, 2)
+		.map((word) => [...word][0]!.toUpperCase())
+		.join('');
 
 // The popup's accent colour: the worst thing any account is saying.
 const overallTone = (accounts: AccountRow[], running: boolean): Tone => {

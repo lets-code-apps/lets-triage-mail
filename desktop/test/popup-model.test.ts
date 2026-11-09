@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { buildPopupView } from '../src/popup-model.ts';
+import { buildPopupView, initials } from '../src/popup-model.ts';
 import type { Tone } from '../src/popup-model.ts';
 import { parseStatusReport } from '../src/status-report.ts';
 import type { StatusReport } from '../src/status-report.ts';
@@ -151,3 +151,16 @@ function oneAccountWith(toLookAt: number, state: string) {
 		],
 	};
 }
+
+test('initials: first letters of the first two words, uppercased', () => {
+	assert.equal(initials('Example Work'), 'EW');
+	assert.equal(initials('personal'), 'P');
+	assert.equal(initials('  my  home office '), 'MH');
+	assert.equal(initials(''), '');
+});
+
+test('each row carries its own counts line', () => {
+	const row = buildPopupView(oneAccountWith(4, 'connected'), OPTS).accounts[0];
+	assert.equal(row.counts, '4 to look at · 0 fyi · 0 done');
+	assert.equal(row.initials, 'EW');
+});
