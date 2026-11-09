@@ -69,8 +69,11 @@ const appOwnsEngine = (): boolean => {
 
 function makeWindow(): BrowserWindow {
 	const browser = new BrowserWindow({
-		width: 640,
-		height: 480,
+		width: 1100,
+		height: 760,
+		minWidth: 360,
+		minHeight: 480,
+		titleBarStyle: 'hiddenInset',
 		webPreferences: { preload: join(HERE, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
 	});
 	browser.webContents.on('will-navigate', (event: { preventDefault(): void }) => event.preventDefault());
@@ -273,10 +276,13 @@ function boot(): void {
 	if (process.env.LTM_AUTOSTART === '1') engine.start();
 
 	ipcMain.handle(CHANNEL.getState, (event) => (fromUs(event.senderFrame) ? engine.getState() : null));
-	// The popup's poll. A hidden popup gets `idle` instead of an engine spawn: polling stops with
-	// the window rather than with a timer, and an invisible page never touches the database.
+	// The popup's and the window's poll. A hidden page gets `idle` instead of an engine spawn:
+	// polling stops with the surface rather than with a timer, and an invisible page never touches
+	// the database. Each page is gated on its own surface being visible.
 	ipcMain.handle(CHANNEL.getStatus, async (event): Promise<StatusPayload> => {
-		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
+		if (!fromUs(event.senderFrame)) return IDLE_PAYLOAD;
+		const fromPopup = event.senderFrame?.url === POPUP_URL;
+		if (!(fromPopup ? popupCtl.isVisible() : currentWindow?.isVisible())) return IDLE_PAYLOAD;
 		const result = await engine.status();
 		// Build the reply through `statusPayload` whether the engine returned a report or an error,
 		// so the typed handler can neither drop the view nor forget the error. Both are then re-measured
@@ -293,7 +299,7 @@ function boot(): void {
 		// Ask for a re-measure, deferred with `setImmediate` so this handler's return value reaches
 		// the page first; the two-frame wait inside POPUP_MEASURE then covers the paint. The page
 		// polls every 5 s while visible, so a missed measurement self-corrects within one poll.
-		setImmediate(() => void fitPopup());
+		if (fromPopup) setImmediate(() => void fitPopup());
 		return payload;
 	});
 	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
