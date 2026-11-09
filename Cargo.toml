@@ -9,6 +9,10 @@ repository = "https://github.com/lets-code-apps/lets-triage-mail"
 readme = "README.md"
 keywords = ["email", "imap", "triage", "llm", "apple-mail"]
 categories = ["email", "command-line-utilities"]
+# The Electron desktop app in `desktop/` is not Rust and must never enter the published crate.
+# A directory with no `Cargo.toml` is invisible to `cargo build`; `exclude` also keeps it out of
+# `cargo package`/`cargo publish` (which would otherwise ship Node sources and `package-lock.json`).
+exclude = ["desktop/"]
 
 [dependencies]
 anyhow = "1.0.104"

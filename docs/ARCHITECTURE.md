@@ -27,7 +27,8 @@ Nothing is implemented yet. This is the starting plan; verify crate versions and
 src/
   main.rs            # clap CLI → commands
   config.rs          # TOML → typed config, validation, password_command
-  store.rs           # SQLite: mailbox state, processed log, flag ownership, rules, known senders, digest state, label dataset
+  store.rs           # SQLite: mailbox state, processed log, flag ownership, rules, known senders, digest state, label dataset, engine+account status rows
+  status.rs          # the `status --json` snapshot (pure shaping: liveness from a heartbeat row, today's counts, account states)
   message.rs         # parse raw → ParsedMessage (auth results, bulk headers, body text, spoof signals)
   decider/
     mod.rs           # trait Decider, Evidence, Decision
@@ -101,3 +102,28 @@ Keep `engine.rs` and `flags.rs` free of IO. Most logic gets unit-tested there.
 - The prompt-injection blast radius is limited by design: the model returns typed fields only.
 - The DB holds metadata only (sender, subject, verdict, reason). It must never hold bodies or
   passwords, except an explicitly opt-in training dataset.
+
+## Repository layout and the desktop boundary
+
+The Rust crate is the repository root and remains the whole engine + CLI. A second product — the
+macOS menu-bar companion — lives in `desktop/` (TypeScript + Electron) and is **not** part of the
+crate. `Cargo.toml` sets `exclude = ["desktop/"]`, so `cargo package`/`cargo publish` never ship Node
+files; a directory with no `Cargo.toml` is invisible to `cargo build` in the first place.
+
+```
+Cargo.toml            # root crate; exclude = ["desktop/"]
+src/**                # engine + CLI; knows nothing about the desktop
+desktop/              # Electron app: its own package.json, no Cargo involvement
+docs/DESKTOP.md       # the desktop design, boundaries and lifecycle
+```
+
+The only seam is the engine's command line: the desktop spawns `lets-triage-mail` as a child
+process and renders what the engine reports (`run` logs, `check --json`, `status --json`,
+`--version`). The
+desktop never parses config, opens the database, speaks IMAP or calls the model — those stay the
+engine's job. `desktop/test/boundaries.test.ts` enforces the "no network, no config/DB reads, single
+owner of logic" rule, mirroring how `imap/session.rs` is checked so only it speaks IMAP.
+
+For full detail see `docs/DESKTOP.md`. (The "Nothing is implemented yet" line at the top of this
+file refers to the engine and predates the desktop; it is left as-is here and called out as stale in
+the desktop PR.)

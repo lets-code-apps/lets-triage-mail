@@ -61,6 +61,9 @@ Out of scope for v1: folder moves, unsubscribe queue, web review UI, MailKit (Sw
 - `docs/RESEARCH.md`: what we learned about Inbox Zero, Mac mail clients and the Apple Mail extension APIs
 - `docs/OPEN_SOURCE.md`: repo, licence and launch checklist
 - `docs/PLAN.md`: v1 implementation plan: phases, tasks, milestones and the brief for agents
+- `docs/DESKTOP.md`: the macOS menu-bar companion in `desktop/` (post-v1, in development). It keeps
+  every hard rule in this file, talks to the engine only through its command line, and never duplicates
+  engine logic (triage and config validation stay the engine's).
 - Python prototype (working name MailGuard, 34 passing tests): kept **outside** this repo so it
   never enters the public history; its local path is in `CLAUDE.local.md`. Treat it as the
   behavioural reference and port its tests as the spec.

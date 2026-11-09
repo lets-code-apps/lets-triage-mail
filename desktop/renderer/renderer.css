@@ -1,0 +1,31 @@
+/* A static, framework-free placeholder. No remote fonts, no images, no network. */
+:root {
+	font-family: system-ui, sans-serif;
+}
+
+main {
+	max-width: 40rem;
+	padding: 1rem 1.25rem;
+}
+
+#state {
+	font-variant-numeric: tabular-nums;
+	margin: 0.25rem 0;
+}
+
+#hint {
+	color: #666;
+	font-size: 0.85rem;
+}
+
+#check {
+	white-space: pre-wrap;
+	padding: 0.5rem;
+	background: #f4f4f4;
+	font-family: ui-monospace, monospace;
+}
+
+#buttons button {
+	padding: 0.4rem 0.75rem;
+	margin-right: 0.5rem;
+}

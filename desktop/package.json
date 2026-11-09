@@ -1,0 +1,22 @@
+{
+  "name": "lets-triage-mail-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "macOS menu-bar companion for lets-triage-mail. Talks to the Rust engine only through its command line; it never touches mail, the model, the database or the config file.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && cp src/preload.cjs dist/preload.cjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "smoke": "npm run build && LTM_SMOKE=1 LTM_AUTOSTART=1 LTM_ENGINE_PATH=test/fixtures/fake-engine.mjs electron .",
+    "start": "npm run build && electron ."
+  },
+  "dependencies": {
+    "electron": "45.2.3"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "24.19.2"
+  }
+}

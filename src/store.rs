@@ -194,6 +194,26 @@ const MIGRATIONS: &[&str] = &[
     ) WITHOUT ROWID;
     CREATE INDEX misfiled_created ON misfiled (account, created_at);
     ",
+    // Version 5 (increment 3): what `run` publishes for the one-shot `status --json` reader.
+    "
+    -- The singleton row for the running engine: when it started, and when it last proved it
+    -- was alive (every 30 s). A clean stop deletes the row, so its absence is the fastest
+    -- \"not running\" signal; a stale heartbeat covers a hard kill (within 90 s).
+    CREATE TABLE engine_status (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        started_at INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL
+    );
+
+    -- One row per account the engine is supervising: a coarse connection state. The state is
+    -- a small fixed word list shared with `status`; a reader must treat an unknown value as
+    -- \"failed\", so no CHECK constraint here (a newer engine must not break an older reader).
+    CREATE TABLE account_status (
+        account TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 /// Everything that can go wrong in the store.
@@ -1161,6 +1181,82 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    // ---- engine and account status (for `status --json`) --------------------------
+
+    /// Starts the engine's status records: the singleton engine row plus one `connecting`
+    /// row per account. Everything an earlier run left is replaced in one transaction, so
+    /// `status` never reads a half-reset.
+    pub fn begin_run(&mut self, accounts: &[String], now: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM engine_status", [])?;
+        tx.execute("DELETE FROM account_status", [])?;
+        tx.execute(
+            "INSERT INTO engine_status (id, started_at, heartbeat_at) VALUES (1, ?1, ?1)",
+            params![now],
+        )?;
+        for account in accounts {
+            tx.execute(
+                "INSERT INTO account_status (account, state, updated_at) VALUES (?1, 'connecting', ?2)",
+                params![account, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Proves the engine is still alive (called every 30 s by the `run` heartbeat task).
+    /// With no row this is a no-op: a stopped engine stays stopped.
+    pub fn heartbeat(&self, now: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE engine_status SET heartbeat_at = ?1 WHERE id = 1",
+            params![now],
+        )?;
+        Ok(())
+    }
+
+    /// A clean stop: forget the rows, so `status` says "not running" at once instead of waiting
+    /// for the heartbeat to go stale.
+    pub fn end_run(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM engine_status", [])?;
+        self.conn.execute("DELETE FROM account_status", [])?;
+        Ok(())
+    }
+
+    /// Records one account's connection state. The words (`connecting`, `connected`, ...) are
+    /// defined by `status.rs`; the store keeps them verbatim.
+    pub fn set_account_state(&self, account: &str, state: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO account_status (account, state, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account) DO UPDATE SET
+               state = excluded.state, updated_at = excluded.updated_at",
+            params![account, state, now],
+        )?;
+        Ok(())
+    }
+
+    /// The running engine's row (`started_at`, `heartbeat_at`), or `None` when no engine is
+    /// recording a run.
+    pub fn engine_status(&self) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT started_at, heartbeat_at FROM engine_status WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Per account, the last state the engine wrote, alphabetical. Unknown state strings pass
+    /// through untouched; `status.rs` decides what an unreadable one means.
+    pub fn account_states(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account, state FROM account_status ORDER BY account")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     // ---- labels -------------------------------------------------------------------
 
     /// Adds a row to the labelled dataset, replacing an earlier one for the same message.
@@ -1472,9 +1568,96 @@ mod tests {
             "digest_state",
             "labels",
             "misfiled",
+            "engine_status",
+            "account_status",
         ] {
             assert_eq!(count(&s, table), 0, "{table} should exist and be empty");
         }
+    }
+
+    #[test]
+    fn migrating_from_a_4_table_database_applies_only_the_new_script() {
+        // A database shipped by an old version: four scripts applied, `user_version` = 4.
+        // Opening it must apply exactly the fifth one and keep the existing tables.
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS.iter().take(4) {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute("INSERT INTO rules (account, pattern, kind, created_at) VALUES ('*', '@x.com', 'block', 1)", []).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&mut conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("rules"), 1);
+        assert_eq!(count("engine_status"), 0);
+        assert_eq!(count("account_status"), 0);
+    }
+
+    #[test]
+    fn begin_run_resets_accounts_to_connecting() {
+        let mut s = store();
+        s.set_account_state("work", "connected", 10).unwrap(); // leftovers from an earlier run
+        s.begin_run(&["work".to_string(), "home".to_string()], 100)
+            .unwrap();
+        assert_eq!(s.engine_status().unwrap(), Some((100, 100)));
+        assert_eq!(
+            s.account_states().unwrap(),
+            [
+                ("home".to_string(), "connecting".to_string()),
+                ("work".to_string(), "connecting".to_string())
+            ],
+        );
+        // Running again replaces, never accumulates.
+        s.begin_run(&["work".to_string()], 200).unwrap();
+        assert_eq!(s.engine_status().unwrap(), Some((200, 200)));
+        assert_eq!(
+            s.account_states().unwrap(),
+            [("work".to_string(), "connecting".to_string())]
+        );
+    }
+
+    #[test]
+    fn heartbeat_updates_the_row_and_is_a_no_op_when_stopped() {
+        let mut s = store();
+        s.heartbeat(50).unwrap(); // no row: nothing to update, not an error
+        assert_eq!(s.engine_status().unwrap(), None);
+        s.begin_run(&[], 100).unwrap();
+        s.heartbeat(130).unwrap();
+        assert_eq!(s.engine_status().unwrap(), Some((100, 130)));
+    }
+
+    #[test]
+    fn end_run_removes_rows() {
+        let mut s = store();
+        s.begin_run(&["work".to_string()], 100).unwrap();
+        s.set_account_state("work", "connected", 101).unwrap();
+        s.end_run().unwrap();
+        assert_eq!(s.engine_status().unwrap(), None);
+        assert!(s.account_states().unwrap().is_empty());
+        s.end_run().unwrap(); // stopping twice is fine
+    }
+
+    #[test]
+    fn set_account_state_upserts() {
+        let s = store();
+        s.set_account_state("work", "connecting", 1).unwrap();
+        s.set_account_state("work", "connected", 2).unwrap();
+        assert_eq!(
+            s.account_states().unwrap(),
+            [("work".to_string(), "connected".to_string())]
+        );
+        // A state the engine never writes still reads back verbatim.
+        s.set_account_state("odd", "somesuch", 3).unwrap();
+        assert_eq!(
+            s.account_states().unwrap()[0],
+            ("odd".to_string(), "somesuch".to_string())
+        );
     }
 
     #[test]
