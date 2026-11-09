@@ -354,13 +354,18 @@ Found on 2026-10-25: wp.pl filed a DKIM-valid message from the user's own Gmail 
 
 ## Phase 6: Ship v1
 
+**Status (2026-11-04): 6.5 is done: every hard rule was checked against the code at `main`,
+the two prompt-injection gaps and the digest escaping path are now covered by tests, and the
+one real finding (redirects from the model endpoint) is fixed. The release work in 6.3 still
+has to be shipped.**
+
 | # | Task |
 |---|---|
 | 6.1 | `contrib/` launchd plist with KeepAlive; install notes in the README (done: LaunchAgent, restart only on failure, README section "Run in the background") |
 | 6.2 | README quickstart: install, config, `check`, dry-run, going live; provider compatibility table (done) |
 | 6.3 | Releases: `cargo-dist` for macOS arm64 and Linux binaries, Homebrew tap `lets-code-apps/tap` |
 | 6.4 | CONTRIBUTING.md, issue templates, SECURITY.md with the threat model (`OPEN_SOURCE.md`) (done) |
-| 6.5 | Final review against every hard rule in `CLAUDE.md`; a security review of prompt handling and HTML escaping |
+| 6.5 | Final review against every hard rule in `CLAUDE.md`; a security review of prompt handling and HTML escaping (done) |
 
 ## Dependency map
 

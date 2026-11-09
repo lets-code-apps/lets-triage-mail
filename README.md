@@ -193,6 +193,15 @@ with the output of `lets-triage-mail check --account NAME`.
 | iCloud, Fastmail | app password | should work (keywords allowed) | should work | not tried yet |
 | Outlook.com, Microsoft 365 | OAuth only | no | no | no IMAP password login; not supported |
 
+## Privacy
+
+The text of your mail is sent to exactly one place: the model server in `[llm] base_url`. By
+default only local or LAN addresses are accepted — loopback (`127.0.0.1`), a private-network
+IP (`10.x`, `172.16-31.x`, `192.168.x`), or a `.local`, `.lan` or `.home.arpa` name — and any
+other address is refused at start-up. Setting `allow_remote = true` in `[llm]` is an explicit
+opt-in: it accepts a non-local endpoint and your mail text is then sent to that host. Nothing
+else leaves your machines; see [SECURITY.md](SECURITY.md) for the full threat model.
+
 ## Docs
 
 [docs/SPEC.md](docs/SPEC.md) has the full spec. The design notes are in [docs/](docs/): flags,
