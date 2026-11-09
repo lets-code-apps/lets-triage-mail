@@ -124,6 +124,26 @@ test('main trusts only the two pages it loads, and answers getStatus behind that
 	assert.ok(!popupLines.includes('dock.'), 'the popup must not touch the dock');
 });
 
+// A popup must follow its content on an engine error too, not only on a good status: the error
+// renderer clears the account rows a tall list left behind (stale bounds -> an empty band), and a
+// long first error must grow past the 260 px fallback. So the error payload is built, then measured,
+// then returned -- it must never be returned ahead of the re-measure.
+test('a getStatus error is built and measured, not returned before the re-measure', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	// Bound to the getStatus handler: from its open to the next handler.
+	const start = main.indexOf('CHANNEL.getStatus, async');
+	const handler = main.slice(start, main.indexOf('ipcMain.handle(CHANNEL.command', start));
+	// The engine error is folded into the reply, never early-returned ahead of the measurement.
+	assert.doesNotMatch(
+		handler,
+		/return\s*\{\s*kind:\s*'error'/,
+		'an engine error must not return before fitPopup is scheduled',
+	);
+	// Exactly one deferred measurement for every non-idle reply, after the payload is built.
+	assert.equal((handler.match(/setImmediate\(\(\) => void fitPopup\(\)\)/g) ?? []).length, 1, 'fitPopup must be scheduled once');
+	assert.match(handler, /const payload[\s\S]*?setImmediate\(\(\) => void fitPopup\(\)\);[\s\S]*?return payload;/, 'payload built, then measured, then returned');
+});
+
 // The tray advertises "Check setup" as an implemented action, so its click must (a) open a window
 // (somewhere to show the result) and (b) push the finished check to the renderer. Both main.ts call
 // sites build their payload through the one electron-free checkPayload helper, so the report and the

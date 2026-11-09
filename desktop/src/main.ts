@@ -261,15 +261,21 @@ function boot(): void {
 	ipcMain.handle(CHANNEL.getStatus, async (event): Promise<StatusPayload> => {
 		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
 		const result = await engine.status();
-		if (result.kind === 'error') return { kind: 'error', message: result.message };
-		const payload = statusPayload(result, buildPopupView(result.report, {
-			...clockOptions(),
-			ownsEngine: appOwnsEngine(),
-		}));
-		// After the reply is built, ask for a re-measure — deferred with `setImmediate` so this
-		// handler's return value reaches the page first; the two-frame wait inside POPUP_MEASURE
-		// then covers the paint. The page polls every 5 s while visible, so a missed measurement
-		// self-corrects within one poll.
+		// Build the reply through `statusPayload` whether the engine returned a report or an error,
+		// so the typed handler can neither drop the view nor forget the error. Both are then re-measured
+		// like any other visible reply: an error paint clears the account rows the last status left
+		// behind, so a stale tall window would show an empty band, and a long first error must grow
+		// past the 260 px fallback instead of clipping. Neither an error nor a status may return
+		// ahead of the measure.
+		const payload: StatusPayload = result.kind === 'status'
+			? statusPayload(result, buildPopupView(result.report, {
+				...clockOptions(),
+				ownsEngine: appOwnsEngine(),
+			}))
+			: { kind: 'error', message: result.message };
+		// Ask for a re-measure, deferred with `setImmediate` so this handler's return value reaches
+		// the page first; the two-frame wait inside POPUP_MEASURE then covers the paint. The page
+		// polls every 5 s while visible, so a missed measurement self-corrects within one poll.
 		setImmediate(() => void fitPopup());
 		return payload;
 	});
