@@ -37,6 +37,7 @@ button:focus-visible {
 .panes {
   display: flex;
   flex-wrap: wrap;
+  min-height: calc(100vh - 65px); /* app bar 64px + its 1px border */
 }
 
 .nav {
@@ -159,6 +160,10 @@ h2 {
   flex-wrap: wrap;
   gap: var(--s-2);
   margin-top: var(--s-4);
+}
+
+.buttons[hidden] {
+  display: none;
 }
 
 .buttons button {

@@ -86,6 +86,8 @@ function renderAccounts() {
 	const view = accountsView();
 	titleEl.textContent = 'accounts';
 	summaryEl.textContent = view.summary;
+	// The 5 s poll rebuilds the rows; keep keyboard focus on the same account.
+	const focused = rowsEl.contains(document.activeElement) ? document.activeElement.dataset.name : undefined;
 	clear(rowsEl);
 	clear(detailEl);
 
@@ -95,6 +97,7 @@ function renderAccounts() {
 	for (const account of accounts) {
 		const row = el('button');
 		row.type = 'button';
+		row.dataset.name = account.name;
 		row.setAttribute('aria-pressed', String(account.name === selected));
 		const text = el('span', 'text');
 		text.append(el('span', 'name', account.name), el('span', 'meta', account.mode), el('span', 'meta', account.note));
@@ -104,6 +107,7 @@ function renderAccounts() {
 			renderAccounts();
 		});
 		rowsEl.append(row);
+		if (account.name === focused) row.focus();
 	}
 
 	const account = accounts.find((a) => a.name === selected);
@@ -187,6 +191,10 @@ stopBtn.addEventListener('click', () => {
 });
 document.getElementById('checkbtn').addEventListener('click', () => {
 	void api.command('check').then(renderCheck);
+});
+
+document.addEventListener('visibilitychange', () => {
+	if (document.visibilityState === 'visible') refresh();
 });
 
 render();

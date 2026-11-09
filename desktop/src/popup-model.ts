@@ -153,7 +153,8 @@ const accountRow = (account: StatusAccount): AccountRow => ({
 	mode: account.mode,
 	// The engine's own fixed English sentence for this state (never raw server error text).
 	note: account.reason,
-	state: account.state,
+	// Human label for the pill; the tone below still reads the raw state.
+	state: account.state.replaceAll('_', ' '),
 	tone: toneForState(account.state),
 	initials: initials(account.name),
 	counts: `${account.counts.to_look_at} to look at · ${account.counts.fyi} fyi · ${account.counts.done} done`,

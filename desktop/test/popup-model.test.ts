@@ -26,7 +26,7 @@ test('the fixture report renders one row per account, verbatim', () => {
 	assert.equal(view.accounts[0].name, 'Example Work');
 	assert.equal(view.accounts[0].mode, 'live');
 	assert.equal(view.accounts[0].note, 'Watching the inbox.');
-	assert.equal(view.accounts[1].state, 'sign_in_failed');
+	assert.equal(view.accounts[1].state, 'sign in failed');
 });
 
 test('the headline counts today\'s "to look at" total, pluralised', () => {
