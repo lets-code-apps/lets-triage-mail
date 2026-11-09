@@ -114,8 +114,10 @@ test('main trusts only the two pages it loads, and answers getStatus behind that
 	// Two known files, spelled out; anything else is refused.
 	assert.ok(main.includes('url === RENDERER_URL') && main.includes('url === POPUP_URL'), 'fromUs must name exactly two pages');
 	assert.ok(/senderFrame\?\.url/.test(main), 'the guard must read the sender frame');
-	// The popup's poll is refused (`idle`) for a hidden page or a stranger.
-	assert.ok(main.includes(`if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD`), 'getStatus must be guarded');
+	// A stranger gets `idle`; the popup is answered while the popup is visible, the window page
+	// while the window is visible (it no longer gates only on the popup).
+	assert.ok(main.includes(`if (!fromUs(event.senderFrame)) return IDLE_PAYLOAD`), 'getStatus must be guarded');
+	assert.ok(main.includes('fromPopup ? popupCtl.isVisible() : currentWindow?.isVisible()'), 'getStatus must answer the window page too');
 	// The tray glyph is the design's template image, not a placeholder with a text label.
 	assert.equal(main.includes("setTitle('LTM')"), false, 'no text label in the menu bar');
 	assert.ok(main.includes('menubarTemplate.png'), 'the tray must use the template icon');
@@ -213,6 +215,11 @@ test('the renderer bootstraps the current state and subscribes to check results'
 	assert.ok(renderer.indexOf('api.getState()') < renderer.indexOf('api.onState('), 'read before subscribe');
 	assert.ok(renderer.includes('api.onCheckResult('), 'the renderer must show tray check results');
 	// Engine output stays hostile data: state is written with textContent, never an innerHTML assignment.
-	assert.ok(renderer.includes('stateEl.textContent'), 'state must render with textContent');
+	assert.ok(renderer.includes('summaryEl.textContent'), 'state must render with textContent');
 	assert.equal(/\.innerHTML\s*=/.test(renderer), false); // no markup sink, even though the word may appear in prose
+	// Same lockdown as the popup: the exact same CSP in both pages, and the window polls getStatus.
+	const csp = (name: string) => /<meta http-equiv="Content-Security-Policy"[^>]*>/.exec(readFileSync(join(DESKTOP, 'renderer', name), 'utf8'))?.[0];
+	assert.ok(csp('index.html'), 'index.html must carry a CSP');
+	assert.equal(csp('index.html'), csp('popup.html'), 'both pages must carry the identical CSP');
+	assert.ok(renderer.includes('api.getStatus()'), 'the window polls getStatus');
 });

@@ -15,7 +15,7 @@ Cargo.toml            # the Rust crate (root). `exclude = ["desktop/"]` keeps th
 src/**                # the engine and CLI. Does not know the desktop exists.
 desktop/              # the Electron app: its own package.json, no Cargo involvement.
   src/                # main process + controllers (TypeScript, ESM)
-  renderer/           # two pages, no framework, no remote resources: the window and the popup
+  renderer/           # two pages, no framework, no remote resources: the window (app shell) and the popup
   assets/             # the menu-bar template icon (18 px + 36 px @2x)
   test/               # node --test unit tests + synthetic fixtures
 docs/DESKTOP.md       # this file
@@ -108,11 +108,14 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   icon was clicked. It hides on blur, like a native menu. The user cannot resize or move it: no dock
   handling, and its strings are built in the **main** process (`desktop/src/popup-model.ts`), so the
   page never formats or colours anything itself.
-- Window: one `BrowserWindow`, default native title bar (the `hiddenInset` treatment comes with the
-  design import, since design decisions stay with the board). Created on first open, then hidden/shown,
-  never destroyed. Content is a static placeholder: engine state, the `check` result list, and
-  Start/Stop/Check buttons, all through a tiny preload API. It is **not** the accounts/folders/settings
-  screens.
+- Window: one `BrowserWindow` (1100x760, min 360x480), `hiddenInset` title bar with the traffic
+  lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
+  hidden/shown, never destroyed. Below the bar, a wrapping flex row of three panes (nav, list, detail)
+  that stack under each other below about 900 px. Two sections: accounts (rows from the same status
+  view as the popup, plus the selected account's detail) and settings (engine state, Start/Stop/Check
+  buttons, the setup check report). It only shows what the engine reports: no config writing, no
+  add-account form, no folders screen. It polls `getStatus` every 5 s while visible; main answers
+  `idle` while the window is hidden. A tray or popup "Check setup" switches it to settings.
 - Security defaults, all required, on **both** pages: `contextIsolation: true`, `sandbox: true`,
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
