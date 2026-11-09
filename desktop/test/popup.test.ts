@@ -23,13 +23,15 @@ const TRAY = { x: 900, y: 4, width: 18, height: 18 };
 const SIZE = { width: 360, height: 260 };
 const ANCHOR: PopupAnchor = { tray: TRAY, workArea: WORK };
 
-// A stand-in for a real BrowserWindow: three counters plus a log of what the controller did.
+// A stand-in for a real BrowserWindow: counters plus a log of what the controller did, in order.
 class FakeWindow {
 	visible = false;
 	shown = 0;
 	hid = 0;
+	// How many times the controller claimed the desktop it is opening on (`followCurrentSpace`).
+	spaceClaims = 0;
 	bounds: Bounds[] = [];
-	events: Array<'setBounds' | 'show'> = [];
+	events: Array<'follow' | 'setBounds' | 'show'> = [];
 
 	isVisible() {
 		return this.visible;
@@ -44,6 +46,11 @@ class FakeWindow {
 	hide() {
 		this.visible = false;
 		this.hid += 1;
+	}
+
+	followCurrentSpace() {
+		this.spaceClaims += 1;
+		this.events.push('follow');
 	}
 
 	setBounds(bounds: Bounds) {
@@ -132,6 +139,30 @@ test('placement on any secondary display keeps the whole popup inside its work a
 	}
 });
 
+// --- macOS Spaces: several desktops can share one monitor ------------------------------
+
+// The display's geometry is identical on every desktop of a monitor, so placement alone cannot
+// put the popup on the desktop the user swiped to: the window has to be claimed for it first,
+// otherwise showing it drags macOS back to the desktop the window last opened on. The order of the
+// three handle calls is what a test can pin; only the Mac can prove the desktop actually follows.
+test('an open claims the current desktop before it shows, and re-claims on every open', () => {
+	const { popup, win } = opened();
+	popup.trayClick(0);
+	assert.deepEqual(win.events, ['follow', 'setBounds', 'show'], 'claim before place and show');
+	assert.equal(win.spaceClaims, 1);
+	popup.handleBlur(); // macOS closes the popup on blur
+	popup.trayClick(HIDE_GRACE_MS + 10); // a later click: the current desktop may be a different one
+	assert.equal(win.spaceClaims, 2, 'every open re-claims, so a claim lost to a hide cannot stick');
+});
+
+test('a claim never follows a hide: closing does not re-claim the desktop', () => {
+	const { popup, win } = opened();
+	popup.trayClick(0);
+	popup.handleBlur();
+	assert.equal(win.spaceClaims, 1, 'hide must not claim again (each claim costs a Dock flicker)');
+	assert.equal(win.shown, 1);
+});
+
 // --- the new size: fitSize ----------------------------------------------------------------------
 
 test('the height follows the measured content, width stays 360', () => {
@@ -163,10 +194,10 @@ test('a broken measurement keeps the fallback height, still capped', () => {
 
 // --- the controller places and resizes ----------------------------------------------------------
 
-test('opening places the popup first, then shows it', () => {
+test('opening claims the desktop, places the popup, then shows it', () => {
 	const { popup, win } = opened();
 	popup.trayClick(0);
-	assert.deepEqual(win.events, ['setBounds', 'show']);
+	assert.deepEqual(win.events, ['follow', 'setBounds', 'show']);
 	assert.deepEqual(win.bounds[0], { x: 729, y: 26, width: 360, height: 260 }); // fallback size
 });
 

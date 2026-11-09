@@ -18,7 +18,7 @@ export const HIDE_GRACE_MS = 250;
 export const POPUP_WIDTH = 360;
 export const POPUP_FALLBACK_HEIGHT = 260;
 
-// What the main process can do to the popup window. Kept to four methods so a test can watch
+// What the main process can do to the popup window. Kept to five methods so a test can watch
 // exactly what happens. `setBounds` is the one resize/move path: this module alone calls it, and
 // it always places the window fully inside the display's work area.
 export interface PopupHandle {
@@ -26,6 +26,13 @@ export interface PopupHandle {
 	show(): void;
 	hide(): void;
 	setBounds(bounds: Bounds): void;
+	// macOS virtual desktops ("Spaces"): several desktops can share one monitor, and a window that
+	// belongs to a desktop you are not looking at pulls you back to it when it is shown. So the popup
+	// claims the desktop it is being shown on *before* `show`, and never releases the claim: an
+	// Electron call that reverses it flips the app's process type, which briefly hides the window
+	// and the Dock, and a hidden window draws nothing on any desktop anyway. The main process applies
+	// it at most once per window for the same reason.
+	followCurrentSpace(): void;
 }
 
 // A rectangle in screen coordinates: the tray icon's bounds and the work area (the screen minus
@@ -143,11 +150,14 @@ export class PopupController {
 	}
 
 	// The tray icon's left click: one gesture toggles the popup. Placement happens just before
-	// showing so the popup appears under the clicked icon on the clicked display, already sized.
+	// showing so the popup appears under the clicked icon on the clicked display, already sized. The
+	// Space claim comes first of all: it has to be in place before the window appears, or macOS
+	// switches the user back to the desktop the window last opened on.
 	toggle(): void {
 		const window = this.ensure();
 		if (window.isVisible()) window.hide();
 		else {
+			window.followCurrentSpace();
 			this.place(window);
 			window.show();
 		}

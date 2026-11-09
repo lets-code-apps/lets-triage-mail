@@ -160,8 +160,9 @@ Keeping these three apart is the point: it stops this document from reading like
 - A tray item with the design's template icon (tinted by macOS) and a native menu on right-click
   (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
   and Engine version lines; Quit with Cmd+Q).
-- The menu-bar **popup**: left-click opens it on the clicked display, centred under the glyph and
-  sized to its content (the main process measures the page), a blur closes it, and its content is
+- The menu-bar **popup**: left-click opens it on the clicked display and on the macOS desktop (Space)
+  the user is looking at, centred under the glyph and sized to its content (the main process measures
+  the page), a blur closes it, and its content is
   `status --json` turned into ready-to-print strings in the main process (a generated date/time line
   above the counts, the big "to look at" number, `N fyi · M done · since HH:MM`, `X of Y connected`,
   one row per account with a state pill). Its **Start** is disabled, with the note "Running outside the

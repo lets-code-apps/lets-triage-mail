@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { EngineController, defaultSpawn } from './engine.ts';
 import { WindowController } from './window.ts';
 import { buildPopupView } from './popup-model.ts';
-import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor } from './popup.ts';
+import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
 import {
@@ -113,6 +113,23 @@ function makePopupWindow(): BrowserWindow {
 	return browser;
 }
 
+// The popup's view of itself as a `PopupHandle`: `popup.ts` decides *when* the window follows the
+// desktop the user is looking at, and this is where Electron's macOS-only call lives. Claiming
+// it once per window rather than on every open matters: the docs state that each
+// `setVisibleOnAllWorkspaces` call transforms the process type between UIElementApplication and
+// ForegroundApplication, briefly hiding the window and the Dock icon. `visibleOnFullScreen` keeps
+// its default (false), so the popup never rides on top of a full-screen app on another desktop.
+const asPopupHandle = (browser: BrowserWindow): PopupHandle => ({
+	isVisible: () => browser.isVisible(),
+	show: () => browser.show(),
+	hide: () => browser.hide(),
+	setBounds: (bounds) => browser.setBounds(bounds),
+	followCurrentSpace: () => {
+		if (browser.isVisibleOnAllWorkspaces()) return; // already claimed: claiming twice costs a flicker
+		browser.setVisibleOnAllWorkspaces(true);
+	},
+});
+
 // Where to hang the popup: the tray icon's rectangle, and the work area of the display nearest the
 // icon's centre. With "separate Spaces" macOS runs one menu bar per display, so the rectangle the
 // click landed on also names the display (and its coordinate space, negative x/y to the left or
@@ -127,7 +144,7 @@ function popupAnchor(): PopupAnchor {
 // The popup window's owner: it owns creation, placement, sizing and the grace period. `Date.now`
 // is its clock: a tray click within 250 ms of our own blur-hide is the same gesture, not a new one
 // (popup.ts explains why macOS forces this).
-const popupCtl = new PopupController(() => makePopupWindow(), popupAnchor, Date.now);
+const popupCtl = new PopupController(() => asPopupHandle(makePopupWindow()), popupAnchor, Date.now);
 
 // The popup's height follows its content, measured from the **main** side: one read-only
 // expression in the page, one number back. An embedder-initiated `executeJavaScript` script is

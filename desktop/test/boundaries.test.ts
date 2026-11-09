@@ -144,6 +144,20 @@ test('a getStatus error is built and measured, not returned before the re-measur
 	assert.match(handler, /const payload[\s\S]*?setImmediate\(\(\) => void fitPopup\(\)\);[\s\S]*?return payload;/, 'payload built, then measured, then returned');
 });
 
+// macOS Spaces: several desktops can share one monitor, and a window that belongs to a desktop the
+// user is not looking at drags them back to it when it appears. The claim lives in main (Electron
+// only), behind `PopupHandle`, is applied at most once per window because each call briefly hides the
+// window and the Dock icon, and it must not lift the popup above a full-screen app on another desktop.
+test('the popup claims the current desktop through the handle, once per window, not above fullscreen apps', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	const popup = readFileSync(join(SRC, 'popup.ts'), 'utf8');
+	// The tested module decides the order: claim, place, show.
+	assert.match(popup, /window\.followCurrentSpace\(\);\s*this\.place\(window\);\s*window\.show\(\);/, 'claim must precede place and show');
+	assert.ok(main.includes('setVisibleOnAllWorkspaces(true)'), 'main maps the claim onto Electron');
+	assert.ok(main.includes('isVisibleOnAllWorkspaces()'), 'and applies it at most once per window');
+	assert.equal(/visibleOnFullScreen:\s*true/.test(main), false, 'never above a full-screen app on another desktop');
+});
+
 // The tray advertises "Check setup" as an implemented action, so its click must (a) open a window
 // (somewhere to show the result) and (b) push the finished check to the renderer. Both main.ts call
 // sites build their payload through the one electron-free checkPayload helper, so the report and the
