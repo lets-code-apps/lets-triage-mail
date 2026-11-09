@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { EngineController, defaultSpawn } from './engine.ts';
 import { WindowController } from './window.ts';
 import { buildPopupView } from './popup-model.ts';
-import { POPUP_SIZE, popupPosition } from './popup.ts';
+import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
 import {
@@ -81,18 +81,17 @@ function makeWindow(): BrowserWindow {
 	return browser;
 }
 
-// The popup: a frameless, fixed-size page under the tray icon. `show: false` because the controller
-// decides when it appears; it is never resized, moved or given a menu of its own, and it never
-// touches the dock (a popup opening must not make the app icon appear).
+// The popup: a frameless page hung under the tray icon. It is created at the fallback size only;
+// PopupController sizes and places it on every open (and re-sizes it after every poll while it is
+// visible), so it lands on the display whose icon was clicked and is tall enough for every row.
+// `show: false` because the controller decides when it appears; the user cannot resize or move it,
+// and opening a popup must not make the app icon appear (the dock belongs to the window controller).
+let popupWindow: BrowserWindow | null = null;
+
 function makePopupWindow(): BrowserWindow {
-	const bounds = tray?.getBounds() ?? { x: 0, y: 0, width: 0, height: 0 };
-	const area = screen.getPrimaryDisplay().workArea;
-	const at = popupPosition(bounds, area, POPUP_SIZE);
 	const browser = new BrowserWindow({
-		x: at.x,
-		y: at.y,
-		width: POPUP_SIZE.width,
-		height: POPUP_SIZE.height,
+		width: POPUP_WIDTH,
+		height: POPUP_FALLBACK_HEIGHT,
 		frame: false,
 		resizable: false,
 		movable: false,
@@ -110,12 +109,66 @@ function makePopupWindow(): BrowserWindow {
 		browser.hide();
 	});
 	browser.loadFile(POPUP);
+	popupWindow = browser;
 	return browser;
 }
 
-// The popup window's owner. `Date.now` is its clock: a tray click within 250 ms of our own blur-hide
-// is the same gesture, not a new one (popup.ts explains why macOS forces this).
-const popupCtl = new PopupController(() => makePopupWindow(), Date.now);
+// The popup's view of itself as a `PopupHandle`: `popup.ts` decides *when* the window follows the
+// desktop the user is looking at, and this is where Electron's macOS-only call lives. Claiming
+// it once per window rather than on every open matters: the docs state that each
+// `setVisibleOnAllWorkspaces` call transforms the process type between UIElementApplication and
+// ForegroundApplication, briefly hiding the window and the Dock icon. `visibleOnFullScreen` keeps
+// its default (false), so the popup never rides on top of a full-screen app on another desktop.
+const asPopupHandle = (browser: BrowserWindow): PopupHandle => ({
+	isVisible: () => browser.isVisible(),
+	show: () => browser.show(),
+	hide: () => browser.hide(),
+	setBounds: (bounds) => browser.setBounds(bounds),
+	followCurrentSpace: () => {
+		if (browser.isVisibleOnAllWorkspaces()) return; // already claimed: claiming twice costs a flicker
+		browser.setVisibleOnAllWorkspaces(true);
+	},
+});
+
+// Where to hang the popup: the tray icon's rectangle, and the work area of the display nearest the
+// icon's centre. With "separate Spaces" macOS runs one menu bar per display, so the rectangle the
+// click landed on also names the display (and its coordinate space, negative x/y to the left or
+// above the primary) the popup must live in. The controller calls this on every open, so the popup
+// follows the display the user clicks instead of sticking to the first one.
+function popupAnchor(): PopupAnchor {
+	const icon = tray?.getBounds() ?? { x: 0, y: 0, width: 0, height: 0 };
+	const display = screen.getDisplayNearestPoint({ x: icon.x + icon.width / 2, y: icon.y + icon.height / 2 });
+	return { tray: icon, workArea: display.workArea };
+}
+
+// The popup window's owner: it owns creation, placement, sizing and the grace period. `Date.now`
+// is its clock: a tray click within 250 ms of our own blur-hide is the same gesture, not a new one
+// (popup.ts explains why macOS forces this).
+const popupCtl = new PopupController(() => asPopupHandle(makePopupWindow()), popupAnchor, Date.now);
+
+// The popup's height follows its content, measured from the **main** side: one read-only
+// expression in the page, one number back. An embedder-initiated `executeJavaScript` script is
+// not governed by the page's CSP, so this adds no preload function and no IPC channel. It waits
+// two animation frames (the page has painted the reply that just arrived by then) and reports the
+// `#popup` box plus the body's default 8 px margins — the real content height includes them,
+// and leaving them out would reintroduce a scrollbar.
+const POPUP_MEASURE =
+	"new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => {" +
+	"const box = document.getElementById('popup');" +
+	"const body = getComputedStyle(document.body);" +
+	"resolve(box.getBoundingClientRect().height + parseFloat(body.marginTop) + parseFloat(body.marginBottom));" +
+	"})));";
+
+// Measure an open popup after a status paint and hand the height to the controller. A hidden
+// window does not run animation frames, so this runs only while the popup is visible; a failed
+// measure is ignored (the window keeps its last size) and the next poll retries it.
+function fitPopup(): void {
+	if (!popupCtl.isVisible() || popupWindow === null) return;
+	void popupWindow.webContents
+		.executeJavaScript(POPUP_MEASURE)
+		.then((height: unknown) => popupCtl.setContentHeight(Number(height)))
+		.catch(() => undefined);
+}
 
 // The tray menu, built fresh on right-click. No persistent context menu: macOS shows the tray
 // glyph alone until the user asks for the list.
@@ -225,11 +278,23 @@ function boot(): void {
 	ipcMain.handle(CHANNEL.getStatus, async (event): Promise<StatusPayload> => {
 		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
 		const result = await engine.status();
-		if (result.kind === 'error') return { kind: 'error', message: result.message };
-		return statusPayload(result, buildPopupView(result.report, {
-			...clockOptions(),
-			ownsEngine: appOwnsEngine(),
-		}));
+		// Build the reply through `statusPayload` whether the engine returned a report or an error,
+		// so the typed handler can neither drop the view nor forget the error. Both are then re-measured
+		// like any other visible reply: an error paint clears the account rows the last status left
+		// behind, so a stale tall window would show an empty band, and a long first error must grow
+		// past the 260 px fallback instead of clipping. Neither an error nor a status may return
+		// ahead of the measure.
+		const payload: StatusPayload = result.kind === 'status'
+			? statusPayload(result, buildPopupView(result.report, {
+				...clockOptions(),
+				ownsEngine: appOwnsEngine(),
+			}))
+			: { kind: 'error', message: result.message };
+		// Ask for a re-measure, deferred with `setImmediate` so this handler's return value reaches
+		// the page first; the two-frame wait inside POPUP_MEASURE then covers the paint. The page
+		// polls every 5 s while visible, so a missed measurement self-corrects within one poll.
+		setImmediate(() => void fitPopup());
+		return payload;
 	});
 	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
 		if (!fromUs(event.senderFrame)) {

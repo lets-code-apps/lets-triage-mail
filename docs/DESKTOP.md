@@ -102,10 +102,12 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   put letters in the menu bar). Left-click toggles the popup; right-click pops up the native menu
   (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
   and Engine version lines; Quit with Cmd+Q) — no persistent context menu.
-- Popup: a second page, opened by that left-click, frameless, fixed 360×260, centred under the glyph
-  and clamped inside the work area. It hides on blur, like a native menu. It is read-only: no dock
-  handling, no resizing, no moving, and its strings are built in the **main** process
-  (`desktop/src/popup-model.ts`), so the page never formats or colours anything itself.
+- Popup: a second page, opened by that left-click, frameless, 360 px wide, its height sized to its
+  content (measured by the main process, capped to the work area of the display that holds the icon),
+  centred under the glyph and clamped inside that display's work area — it opens on the display whose
+  icon was clicked. It hides on blur, like a native menu. The user cannot resize or move it: no dock
+  handling, and its strings are built in the **main** process (`desktop/src/popup-model.ts`), so the
+  page never formats or colours anything itself.
 - Window: one `BrowserWindow`, default native title bar (the `hiddenInset` treatment comes with the
   design import, since design decisions stay with the board). Created on first open, then hidden/shown,
   never destroyed. Content is a static placeholder: engine state, the `check` result list, and
@@ -143,6 +145,11 @@ Environment variables:
 Engine lookup order: `LTM_ENGINE_PATH`, then a packaged `<resources>/engine/lets-triage-mail`
 (implemented, nothing ships there yet), then `../target/debug/lets-triage-mail`.
 
+Popup height is read with `webContents.executeJavaScript`: a **main**-initiated, read-only expression
+that returns one number after each status paint, then applied with `setBounds`. An embedder-initiated
+script is not subject to the page's CSP, so this adds no preload function and no IPC channel; if a
+measurement ever fails the popup just keeps its last size (the next 5 s poll retries).
+
 ## Implemented, mockup only, future
 
 Keeping these three apart is the point: it stops this document from reading like a wish list, and
@@ -153,7 +160,9 @@ Keeping these three apart is the point: it stops this document from reading like
 - A tray item with the design's template icon (tinted by macOS) and a native menu on right-click
   (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
   and Engine version lines; Quit with Cmd+Q).
-- The menu-bar **popup**: left-click opens it centred under the glyph, a blur closes it, its content is
+- The menu-bar **popup**: left-click opens it on the clicked display and on the macOS desktop (Space)
+  the user is looking at, centred under the glyph and sized to its content (the main process measures
+  the page), a blur closes it, and its content is
   `status --json` turned into ready-to-print strings in the main process (a generated date/time line
   above the counts, the big "to look at" number, `N fyi · M done · since HH:MM`, `X of Y connected`,
   one row per account with a state pill). Its **Start** is disabled, with the note "Running outside the

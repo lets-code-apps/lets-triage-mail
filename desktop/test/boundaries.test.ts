@@ -124,6 +124,40 @@ test('main trusts only the two pages it loads, and answers getStatus behind that
 	assert.ok(!popupLines.includes('dock.'), 'the popup must not touch the dock');
 });
 
+// A popup must follow its content on an engine error too, not only on a good status: the error
+// renderer clears the account rows a tall list left behind (stale bounds -> an empty band), and a
+// long first error must grow past the 260 px fallback. So the error payload is built, then measured,
+// then returned -- it must never be returned ahead of the re-measure.
+test('a getStatus error is built and measured, not returned before the re-measure', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	// Bound to the getStatus handler: from its open to the next handler.
+	const start = main.indexOf('CHANNEL.getStatus, async');
+	const handler = main.slice(start, main.indexOf('ipcMain.handle(CHANNEL.command', start));
+	// The engine error is folded into the reply, never early-returned ahead of the measurement.
+	assert.doesNotMatch(
+		handler,
+		/return\s*\{\s*kind:\s*'error'/,
+		'an engine error must not return before fitPopup is scheduled',
+	);
+	// Exactly one deferred measurement for every non-idle reply, after the payload is built.
+	assert.equal((handler.match(/setImmediate\(\(\) => void fitPopup\(\)\)/g) ?? []).length, 1, 'fitPopup must be scheduled once');
+	assert.match(handler, /const payload[\s\S]*?setImmediate\(\(\) => void fitPopup\(\)\);[\s\S]*?return payload;/, 'payload built, then measured, then returned');
+});
+
+// macOS Spaces: several desktops can share one monitor, and a window that belongs to a desktop the
+// user is not looking at drags them back to it when it appears. The claim lives in main (Electron
+// only), behind `PopupHandle`, is applied at most once per window because each call briefly hides the
+// window and the Dock icon, and it must not lift the popup above a full-screen app on another desktop.
+test('the popup claims the current desktop through the handle, once per window, not above fullscreen apps', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	const popup = readFileSync(join(SRC, 'popup.ts'), 'utf8');
+	// The tested module decides the order: claim, place, show.
+	assert.match(popup, /window\.followCurrentSpace\(\);\s*this\.place\(window\);\s*window\.show\(\);/, 'claim must precede place and show');
+	assert.ok(main.includes('setVisibleOnAllWorkspaces(true)'), 'main maps the claim onto Electron');
+	assert.ok(main.includes('isVisibleOnAllWorkspaces()'), 'and applies it at most once per window');
+	assert.equal(/visibleOnFullScreen:\s*true/.test(main), false, 'never above a full-screen app on another desktop');
+});
+
 // The tray advertises "Check setup" as an implemented action, so its click must (a) open a window
 // (somewhere to show the result) and (b) push the finished check to the renderer. Both main.ts call
 // sites build their payload through the one electron-free checkPayload helper, so the report and the
