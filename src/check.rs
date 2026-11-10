@@ -250,7 +250,7 @@ pub fn database_item(path: &Path) -> CheckItem {
 // Model
 // ---------------------------------------------------------------------------------------------
 
-const MODEL: &str = "Model";
+pub const MODEL: &str = "Model";
 
 /// Runs all model checks: endpoint, model name, one test classification.
 pub async fn probe_model(llm: &LlmConfig) -> Vec<CheckItem> {
@@ -514,7 +514,7 @@ pub fn decide_error_hint(error: &DecideError) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// The report area for an account.
-fn account_area(name: &str) -> String {
+pub fn account_area(name: &str) -> String {
     format!("Account {name}")
 }
 
