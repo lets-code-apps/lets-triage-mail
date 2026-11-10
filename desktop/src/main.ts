@@ -7,7 +7,7 @@
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, nativeTheme, screen } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen } from 'electron';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,7 +18,6 @@ import { buildPopupView } from './popup-model.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
-import { CANVAS, trayBitmap } from './tray-image.ts';
 import { DEFAULT_SETTINGS, isAllowedSetting, parseSettings, type Settings } from './settings.ts';
 import {
 	CHANNEL,
@@ -97,6 +96,8 @@ function makeWindow(): BrowserWindow {
 		// nav 200 + list 420 + detail 420: the panes never stack, the window just stops shrinking.
 		minWidth: 1040,
 		minHeight: 640,
+		// The macOS buttons are ~14 px tall; centred in the 64 px app bar that is y = (64 - 14) / 2 = 25.
+		trafficLightPosition: { x: 20, y: 25 },
 		titleBarStyle: 'hiddenInset',
 		webPreferences: { preload: join(HERE, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
 	});
@@ -131,10 +132,6 @@ function makePopupWindow(): BrowserWindow {
 	browser.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 	// Clicking anywhere else closes the popup, like a native menu (see popup.ts).
 	browser.on('blur', () => popupCtl.handleBlur());
-	// macOS highlights a menu-bar item while its menu is open; the popup is our own window, so the
-	// tray image is swapped for the one with the highlight pill while it is on screen.
-	browser.on('show', () => tray?.setImage(trayImages.active));
-	browser.on('hide', () => tray?.setImage(trayImages.normal));
 	// Closing is a hide, except while quitting, when the window really must go away.
 	browser.on('close', (event) => {
 		if (quitInFlight) return;
@@ -220,25 +217,12 @@ function trayMenu(): Menu {
 	return Menu.buildFromTemplate(template);
 }
 
-// The template glyph on a fixed canvas, plain and with the highlight pill (see tray-image.ts). Both
-// are template images, so macOS tints them for a light or dark menu bar and the 25% pill stays
-// translucent. Built from the @2x bitmap, once, at boot.
-const trayImages = { normal: nativeImage.createEmpty(), active: nativeImage.createEmpty() };
-
 function makeTray(): Tray {
-	// `setTitle` is deliberately absent: it would put the letters "LTM" in the menu bar next to the glyph.
-	const glyph = nativeImage.createFromPath(TRAY_ICON);
-	const size = glyph.getSize();
-	const bitmap = glyph.toBitmap({ scaleFactor: 2 });
-	for (const [name, pill] of [['normal', false], ['active', true]] as const) {
-		const image = nativeImage.createFromBitmap(trayBitmap(bitmap, size.width * 2, size.height * 2, pill), {
-			...CANVAS,
-			scaleFactor: 2,
-		});
-		image.setTemplateImage(true);
-		trayImages[name] = image;
-	}
-	return new Tray(trayImages.normal);
+	// The design's template glyph (18x18, with a 36x36 @2x beside it). The `Template` suffix is the
+	// whole contract: Electron's Tray treats such a file as a mask and macOS tints it for a light or
+	// dark menu bar, so there is no light/dark pair to manage. `setTitle` is deliberately absent:
+	// it would put the letters "LTM" in the menu bar next to the glyph.
+	return new Tray(TRAY_ICON);
 }
 
 function runAction(action: EngineCommand): void {
@@ -326,8 +310,10 @@ function boot(): void {
 	// Our app stopped being the active one (a click on another app or the desktop): close like a menu.
 	app.on('did-resign-active', () => popupCtl.handleBlur());
 	void engine.readVersion().then(() => {
+		// Both pages show the engine state (the popup's pause/start button and status line).
 		engine.onState((view) => {
 			currentWindow?.webContents.send(CHANNEL.state, view);
+			popupWindow?.webContents.send(CHANNEL.state, view);
 		});
 	});
 	app.dock?.hide(); // menu-bar companion: no dock icon until a window is shown

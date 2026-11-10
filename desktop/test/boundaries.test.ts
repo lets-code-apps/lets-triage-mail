@@ -225,3 +225,13 @@ test('setSetting is validated in main before anything is written', () => {
 	const handler = main.slice(start, main.indexOf('ipcMain.handle(CHANNEL.getStatus', start));
 	assert.match(handler, /!fromUs\(event\.senderFrame\) \|\| !isAllowedSetting\(name, value\)\) return null;[\s\S]*setLoginItemSettings/);
 });
+
+// The popup shows the engine state too (its pause/start button and status line), so main must push
+// every state change to both pages, and the popup must read the current state on load.
+test('engine state is pushed to the window and the popup, and the popup reads it on load', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.ok(main.includes('currentWindow?.webContents.send(CHANNEL.state'), 'state goes to the window');
+	assert.ok(main.includes('popupWindow?.webContents.send(CHANNEL.state'), 'state goes to the popup');
+	const popup = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	assert.ok(popup.includes('api.getState()') && popup.includes('api.onState('), 'the popup bootstraps and subscribes');
+});

@@ -110,12 +110,13 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   page never formats or colours anything itself. It is the design's tray card: lockup and "open app",
   a summary box (count, pill, `N fyi · M done · since HH:MM`) that opens the window, the account rows,
   and a footer with pause/start triage, a settings button (opens the window on settings) and quit. The
-  window is transparent so the card's rounded corners show. While it is open the tray glyph is swapped
-  for a version with macOS's highlight pill behind it (`desktop/src/tray-image.ts` draws both from
-  the template icon at runtime, same canvas so the menu bar does not shift). It closes like a native
-  menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, or opening
+  window is transparent so the card's rounded corners show. There is no tray highlight while it is open: Electron has no
+  API for macOS's native one (macOS shows it only while the mouse is down), and a hand-drawn one never
+  matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, or opening
   the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
   name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
+  Above its buttons a status line shows the app's engine state (running, starting, pausing, paused,
+  failed with the first failure line, or "running outside the app"); main pushes the state to both pages.
 - Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
   lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
   hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
