@@ -68,7 +68,7 @@ h2 {
 
 .list {
   box-sizing: border-box;
-  flex: 1 1 360px;
+  flex: 1 1 420px; /* design range 360–460; 420 leaves the account name room next to pill + chevron */
   max-width: 460px;
   min-width: 0;
   padding: var(--s-6) 0 0;
@@ -275,9 +275,9 @@ h2 {
 }
 
 /* Stacked panes: the dividers move from the right edge to the bottom edge. The detail pane drops
-   under the list below about 980px; the nav drops above the list below about 600px and becomes a
+   under the list below about 1040px; the nav drops above the list below about 600px and becomes a
    horizontal row. */
-@media (max-width: 980px) {
+@media (max-width: 1039px) {
   .list {
     border-right: 0;
     border-bottom: 1px solid var(--line);
