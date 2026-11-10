@@ -1,5 +1,6 @@
 {
   "name": "lets-triage-mail-desktop",
+  "productName": "Let's Triage Mail",
   "version": "0.1.0",
   "private": true,
   "type": "module",

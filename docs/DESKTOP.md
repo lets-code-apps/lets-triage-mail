@@ -16,7 +16,7 @@ src/**                # the engine and CLI. Does not know the desktop exists.
 desktop/              # the Electron app: its own package.json, no Cargo involvement.
   src/                # main process + controllers (TypeScript, ESM)
   renderer/           # two pages, no framework, no remote resources: the window (app shell) and the popup
-  assets/             # the menu-bar template icon (18 px + 36 px @2x)
+  assets/             # the menu-bar template icon (18 px + 36 px @2x) and the app icon (icon.png, 1024 px)
   test/               # node --test unit tests + synthetic fixtures
 docs/DESKTOP.md       # this file
 ```

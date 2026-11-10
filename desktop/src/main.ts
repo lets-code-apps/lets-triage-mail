@@ -40,6 +40,9 @@ const POPUP_URL = pathToFileURL(POPUP).href;
 // The design's menu-bar template: the `Template` suffix plus `setTemplateImage` is what lets macOS
 // tint the glyph for a light or dark menu bar.
 const TRAY_ICON = join(HERE, '..', 'assets', 'menubarTemplate.png');
+// The app icon (design: ember grain tile, white emblem). A packaged build gets it from its bundle;
+// `npm start` runs inside Electron.app, so the dock would show Electron's icon without this.
+const APP_ICON = join(HERE, '..', 'assets', 'icon.png');
 const engine = new EngineController(process.env, join(HERE, '..', '..'), defaultSpawn);
 
 let currentWindow: BrowserWindow | null = null;
@@ -369,6 +372,9 @@ function boot(): void {
 			popupWindow?.webContents.send(CHANNEL.state, view);
 		});
 	});
+	if (!app.isPackaged) app.dock?.setIcon(APP_ICON);
+	// Without this the About panel of a dev run shows Electron's own name and version.
+	app.setAboutPanelOptions({ applicationName: app.name, applicationVersion: app.getVersion(), version: '' });
 	app.dock?.hide(); // menu-bar companion: no dock icon until a window is shown
 	app.on('window-all-closed', () => ctl.handleWindowAllClosed());
 
