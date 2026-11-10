@@ -7,7 +7,7 @@
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, nativeTheme, screen } from 'electron';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,6 +18,7 @@ import { buildPopupView } from './popup-model.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
+import { CANVAS, trayBitmap } from './tray-image.ts';
 import { DEFAULT_SETTINGS, isAllowedSetting, parseSettings, type Settings } from './settings.ts';
 import {
 	CHANNEL,
@@ -93,8 +94,9 @@ function makeWindow(): BrowserWindow {
 	const browser = new BrowserWindow({
 		width: 1100,
 		height: 760,
-		minWidth: 360,
-		minHeight: 480,
+		// nav 200 + list 420 + detail 420: the panes never stack, the window just stops shrinking.
+		minWidth: 1040,
+		minHeight: 640,
 		titleBarStyle: 'hiddenInset',
 		webPreferences: { preload: join(HERE, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
 	});
@@ -129,6 +131,10 @@ function makePopupWindow(): BrowserWindow {
 	browser.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 	// Clicking anywhere else closes the popup, like a native menu (see popup.ts).
 	browser.on('blur', () => popupCtl.handleBlur());
+	// macOS highlights a menu-bar item while its menu is open; the popup is our own window, so the
+	// tray image is swapped for the one with the highlight pill while it is on screen.
+	browser.on('show', () => tray?.setImage(trayImages.active));
+	browser.on('hide', () => tray?.setImage(trayImages.normal));
 	// Closing is a hide, except while quitting, when the window really must go away.
 	browser.on('close', (event) => {
 		if (quitInFlight) return;
@@ -151,6 +157,7 @@ const asPopupHandle = (browser: BrowserWindow): PopupHandle => ({
 	show: () => browser.show(),
 	hide: () => browser.hide(),
 	setBounds: (bounds) => browser.setBounds(bounds),
+	focus: () => browser.focus(),
 	followCurrentSpace: () => {
 		if (browser.isVisibleOnAllWorkspaces()) return; // already claimed: claiming twice costs a flicker
 		browser.setVisibleOnAllWorkspaces(true);
@@ -213,12 +220,25 @@ function trayMenu(): Menu {
 	return Menu.buildFromTemplate(template);
 }
 
+// The template glyph on a fixed canvas, plain and with the highlight pill (see tray-image.ts). Both
+// are template images, so macOS tints them for a light or dark menu bar and the 25% pill stays
+// translucent. Built from the @2x bitmap, once, at boot.
+const trayImages = { normal: nativeImage.createEmpty(), active: nativeImage.createEmpty() };
+
 function makeTray(): Tray {
-	// The design's template glyph (18x18, with a 36x36 @2x beside it). The `Template` suffix is the
-	// whole contract: Electron's Tray treats such a file as a mask and macOS tints it for a light or
-	// dark menu bar, so there is no light/dark pair to manage. `setTitle` is deliberately absent:
-	// it would put the letters "LTM" in the menu bar next to the glyph.
-	return new Tray(TRAY_ICON);
+	// `setTitle` is deliberately absent: it would put the letters "LTM" in the menu bar next to the glyph.
+	const glyph = nativeImage.createFromPath(TRAY_ICON);
+	const size = glyph.getSize();
+	const bitmap = glyph.toBitmap({ scaleFactor: 2 });
+	for (const [name, pill] of [['normal', false], ['active', true]] as const) {
+		const image = nativeImage.createFromBitmap(trayBitmap(bitmap, size.width * 2, size.height * 2, pill), {
+			...CANVAS,
+			scaleFactor: 2,
+		});
+		image.setTemplateImage(true);
+		trayImages[name] = image;
+	}
+	return new Tray(trayImages.normal);
 }
 
 function runAction(action: EngineCommand): void {
@@ -299,7 +319,12 @@ function boot(): void {
 	// Left-click toggles the popup; right-click shows the native menu. No persistent context
 	// menu, so the menu bar shows only the template glyph.
 	tray.on('click', () => popupCtl.trayClick(Date.now()));
-	tray.on('right-click', () => tray?.popUpContextMenu(trayMenu()));
+	tray.on('right-click', () => {
+		popupCtl.close(); // no grace period: the menu must not open on top of a lingering popup
+		tray?.popUpContextMenu(trayMenu());
+	});
+	// Our app stopped being the active one (a click on another app or the desktop): close like a menu.
+	app.on('did-resign-active', () => popupCtl.handleBlur());
 	void engine.readVersion().then(() => {
 		engine.onState((view) => {
 			currentWindow?.webContents.send(CHANNEL.state, view);
@@ -359,8 +384,13 @@ function boot(): void {
 		}
 		if (command === 'start') await performStart();
 		else if (command === 'stop') await engine.stop();
-		else if (command === 'openWindow') ctl.open();
-		else if (command === 'openSettings') runAction('openSettings');
+		else if (command === 'openWindow') {
+			popupCtl.close();
+			ctl.open();
+		} else if (command === 'openSettings') {
+			popupCtl.close();
+			runAction('openSettings');
+		}
 		else if (command === 'quit') {
 			// The popup's Quit button: the same path as the tray item and Cmd+Q.
 			app.quit();
