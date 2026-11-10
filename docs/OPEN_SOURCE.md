@@ -10,8 +10,9 @@
 - [ ] README that leads with: a GIF/screenshot of flagged mail in Apple Mail plus a digest email;
       "your email never leaves your machine"; "works with Ollama, LM Studio, llama.cpp, MLX";
       "any IMAP provider".
-- [ ] Install: `cargo install`, a Homebrew tap, prebuilt macOS (arm64) and Linux binaries via
-      GitHub Releases (cargo-dist is worth a look).
+- [x] Install: a Homebrew tap (`lets-code-apps/tap`), prebuilt macOS (arm64) and Linux (x86_64)
+      binaries via GitHub Releases (cargo-dist generates the release workflow and the formula),
+      plus `cargo install` from source.
 - [x] `check` command that diagnoses setup (model reachable, IMAP caps, keyword support, folders).
 - [x] CI: fmt, clippy, tests on macOS and Linux.
 - [x] CONTRIBUTING.md, issue templates (bug / provider compatibility report), a SECURITY.md with

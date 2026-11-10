@@ -282,8 +282,12 @@ pub async fn probe_model(llm: &LlmConfig) -> Vec<CheckItem> {
 
 /// `GET {base_url}/models`. Returns the HTTP status and body, or the transport error text.
 async fn fetch_models(llm: &LlmConfig, url: &str) -> Result<(u16, String), String> {
+    // Same reason as in `decider/llm.rs`: a redirect would send the request to a host the
+    // configured server chose, outside the local-network rule. The status we get back is what
+    // the report shows.
     let client = reqwest::Client::builder()
         .timeout(LISTING_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let mut request = client.get(url);
@@ -910,7 +914,7 @@ pub fn junk_item(area: &str, junk: Option<&str>, resolved: &ResolvedFolders) -> 
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{any, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -1103,6 +1107,40 @@ mod tests {
         let items = probe_model(&config).await;
         assert_eq!(statuses(&items), [Status::Fail]);
         assert!(items[0].message.contains("cannot reach"));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_while_listing_models_is_not_followed() {
+        // Same rule as in the decider: the configured endpoint is the only host we talk to, so
+        // a redirect from it is reported instead of followed.
+        let configured = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/v1/models", elsewhere.uri())),
+            )
+            .mount(&configured)
+            .await;
+        // `expect(0)` fails the test at the drop of this mock server if anything was requested.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body(&["test-model"])))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+
+        // `fetch_models` is usually reached through `probe_model`, which installs the TLS
+        // provider first. Called directly, a test has to do the same: reqwest panics otherwise.
+        install_tls_provider();
+
+        let url = format!("{}/v1/models", configured.uri());
+        let (status, _) = fetch_models(&llm_config(&configured), &url).await.unwrap();
+        assert_eq!(status, 302);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the request was repeated on another host"
+        );
     }
 
     #[tokio::test]

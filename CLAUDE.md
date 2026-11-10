@@ -41,8 +41,10 @@ Out of scope for v1: folder moves, unsubscribe queue, web review UI, MailKit (Sw
 
 ## Hard rules
 
-- **Privacy:** no cloud AI calls. The model endpoint is local (or on the user's LAN). Never store
-  message bodies; store metadata only.
+- **Privacy:** no cloud AI by default. The model endpoint must be local (or on the user's LAN);
+  config validation refuses anything else. The only exception is the explicit, off-by-default
+  `llm.allow_remote = true` opt-out (see `docs/DECISIONS.md`, 2026-11-04). Never add another path
+  that sends mail text off the user's network. Never store message bodies; store metadata only.
 - **Never destroy or hide mail in v1.** It only sets or clears flag keywords.
 - **Red flag is reserved for the user.** The service never sets red.
 - **Only clear flags the service set itself.** Track ownership in the DB; if the user changed a
