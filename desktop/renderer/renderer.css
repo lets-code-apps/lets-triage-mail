@@ -400,6 +400,7 @@ h2 {
   cursor: default;
 }
 
-.checks:empty {
+.checks:empty,
+.form-msg:empty {
   display: none;
 }
