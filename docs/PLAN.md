@@ -376,7 +376,7 @@ board decisions.
 | # | Increment | Status / gate |
 |---|---|---|
 | 7.0 | Desktop foundation: `desktop/` app, tray + one window, engine lifecycle, `check --json` rendering, boundaries enforced by tests, `Cargo.toml` `exclude` (done: this PR) | |
-| 7.1 | Engine safe to embed: single-instance lock on `run`, exit on stdin close, restart policy, flip autostart on | **Board decision** (MSRV bump or a lock crate; `File::lock` is 1.89+) |
+| 7.1 | Engine safe to embed: single-instance lock on `run`, exit on stdin close, restart policy, flip autostart on | Done (MSRV 1.89, `File::lock`) |
 | 7.2 | Engine status for the UI: `status --json` (and/or a 0600 Unix-socket channel) | Design the channel first; never a loopback TCP port |
 | 7.3 | Config through the engine (`config show/validate --json`, set/add/remove keeping comments) | Needs a TOML-editing crate: **board approval** |
 | 7.4 | Tray popover + design import (emblem, tokens, Switch, icons) | Board approves each published asset; first UI-framework decision |

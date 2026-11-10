@@ -66,11 +66,17 @@ says `running: false` within 90 s of a crash, and at once on a clean stop, becau
 row). A hard-killed engine child therefore still shows a stale tray state for up to 90 s in the popup
 while the tray already says `failed`.
 
-- `start()`: resolve the binary, spawn `[bin, "run"]` with stdio `["ignore","pipe","pipe"]`.
+- `start()`: resolve the binary, spawn `[bin, "run", "--exit-on-stdin-close"]` with stdio
+  `["pipe","pipe","pipe"]`. The desktop never writes to stdin; the open pipe is the tether: when the
+  app dies, however hard, the pipe closes and the engine shuts down gracefully (the same path as a
+  first SIGTERM). The flag is opt-in and hidden from `--help`; launchd and terminals do not pass it.
   `starting → running` on the `spawn` event.
-- Unexpected exit while `running` → `failed`; the tray shows it. **No automatic restart** in this
-  increment (a process-level restart policy with backoff is a later increment; the engine already
-  restarts its own account workers).
+- Unexpected exit while `running` → `failed`, then a restart after a backoff of 1 s, 2 s, 4 s, 8 s
+  ... capped at 60 s. After **5** consecutive failed restarts it stays `failed`. A run that stayed up
+  10 min resets the count; a user Start also does. The window shows "restarting in N s…" while it
+  waits (the delay when it was scheduled, not a live countdown). **No restart** after exit code 75
+  (another engine holds the lock; the failure text says "Another engine is already running."), after
+  Stop/Pause, or while quitting; Stop, Start and Quit all cancel a pending timer.
 - `stop()`: send **SIGTERM once**, wait up to **30 s**, then SIGKILL. 30 s matches `ExitTimeOut` in
   `contrib/launchd/*.plist` (grace 10 s plus margin). **Never a second SIGTERM or any SIGINT**:
   `src/cli/run.rs::watch_for_signals` treats a second signal as "exit now with 130, skip cleanup".
@@ -82,17 +88,12 @@ while the tray already says `failed`.
   `await engine.stop()`, then quit for real. A second quit request while stopping is ignored.
 - Launching a second copy of the app focuses the first (`requestSingleInstanceLock`, `second-instance`
   opens the window). This also prevents two desktop-owned engines.
-- **Autostart of the engine on app launch is off in this increment** (`LTM_AUTOSTART=1` or
-  `--autostart` turns it on; the smoke test uses it). Tray has explicit "Start triage" / "Stop triage".
-  Reason: the engine has no single-instance lock yet, so a launchd agent plus a desktop-started engine
-  would both watch the same mailbox. This increment does not stop that at the OS level, but the desktop
-  guards the click: a Start (tray or popup) first reads a fresh `status`, and if it reports a running
-  engine the app did not spawn, no second one starts and the popup says "Running outside the app" with
-  Start disabled. Target behaviour once the lock lands: autostart on, because the
-  product is "closing the window leaves triage running".
-
-Known limitation, documented: if the Electron main process is killed hard, the engine child is
-orphaned. Fixed in a later increment (engine exits when its stdin closes).
+- **The engine starts on app launch by default** ("closing the window leaves triage running").
+  The launch goes through the same guard as the Start button: it reads `status` first, and if an
+  engine the app did not spawn is running it does not start one (the popup says "Running outside the
+  app"). The engine's own single-instance lock (`<db_path>.lock`, exit 75) makes a race harmless.
+  `LTM_AUTOSTART=0` disables it (dev escape hatch); `LTM_AUTOSTART=1` starts without the status
+  guard (the smoke test's fake engine reports a running engine).
 
 ## Window and tray security stance
 
@@ -165,7 +166,7 @@ Environment variables:
 - `LTM_ENGINE_PATH` — a specific engine binary (a debug build in development).
 - `LTM_CONFIG` — a config file; forwarded to the engine as a global `--config`. Unset means the
   engine's default config and database paths.
-- `LTM_AUTOSTART=1` — start the engine on app launch (the smoke test sets this).
+- `LTM_AUTOSTART=0` — do not start the engine on app launch; `=1` skips the "already running" check (the smoke test).
 - `LTM_SMOKE=1` — run the executable smoke check (see Tests).
 
 Engine lookup order: `LTM_ENGINE_PATH`, then a packaged `<resources>/engine/lets-triage-mail`
@@ -222,7 +223,7 @@ Everything in the "Next increments" table and "Distribution and signing" section
 
 | # | Increment | Gate |
 |---|---|---|
-| 2 | Engine safe to embed: single-instance lock on `run`, exit when stdin closes, desktop restart policy with backoff, then flip autostart on | `File::lock` is stable only from Rust 1.89 and `rust-version` is 1.85: needs an MSRV bump or a crate. **Board decision.** |
+| 2 | **Done.** Engine safe to embed: single-instance lock on `run`, exit when stdin closes, desktop restart policy with backoff, autostart on | MSRV raised to 1.89 for `File::lock` (board decision 2026-11-10) |
 | 3 | **Done by this PR.** Engine status for the UI: `status --json` with per-account state and counts, from two SQLite tables the engine writes | No channel design needed after all: the database the engine already owns is the channel, so `node:net` stays out of the boundary test. A 0600 Unix socket remains available as a later increment. |
 | 4 | Config through the engine: `config show/validate --json` and engine-owned set/add/remove that keep comments and never log passwords; Keychain entry creation | Needs a TOML-editing crate: **board approval**. Prerequisite for 5–7. |
 | 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
