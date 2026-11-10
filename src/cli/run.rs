@@ -188,8 +188,9 @@ fn shutdown_on_stdin_eof(shutdown: CancellationToken) {
     std::thread::spawn(move || {
         // Any read error also ends the wait: a broken stdin is as good as a closed one.
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-        tracing::info!("stdin closed: shutting down");
+        // Cancel first: the app that read our stderr is usually gone too, so logging may fail.
         shutdown.cancel();
+        tracing::info!("stdin closed: shutting down");
     });
 }
 

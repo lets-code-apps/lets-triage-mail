@@ -41,5 +41,8 @@ fn init_logging(verbosity: u8) {
         .with_writer(std::io::stderr)
         // Colour codes are noise in a log file (launchd, `> file`); keep them for terminals only.
         .with_ansi(std::io::stderr().is_terminal())
+        // Its fallback `eprintln!` panics when stderr is gone (the desktop app died), which killed
+        // the thread that logged; a lost log line must never take down the engine.
+        .log_internal_errors(false)
         .init();
 }
