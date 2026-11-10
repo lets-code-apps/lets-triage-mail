@@ -8,6 +8,7 @@
 import type { CheckReport } from './check-report.ts';
 import type { StatusReport } from './status-report.ts';
 import type { PopupView } from './popup-model.ts';
+import type { Appearance } from './settings.ts';
 
 // Engine lifecycle states, mirrored from docs/DESKTOP.md. `running` means the process is
 // alive, NOT that mail is healthy; health comes from a `check` (see engine.ts).
@@ -16,7 +17,7 @@ export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'fai
 // A command the renderer can ask the main process to run. Nothing here reaches mail, the
 // model or the database: each maps to one engine subcommand, or to a window/app action main
 // owns. `openWindow` and `quit` exist so the popup's footer buttons need no extra channel.
-export type EngineCommand = 'start' | 'stop' | 'check' | 'openWindow' | 'quit';
+export type EngineCommand = 'start' | 'stop' | 'check' | 'openWindow' | 'openSettings' | 'quit';
 
 // What the renderer shows about the engine. `exitCode`/`signal`/`failureTail` are filled only in
 // `failed`. `failureTail` is the last few stderr lines the engine printed before it died (bounded
@@ -44,7 +45,18 @@ export const CHANNEL = {
 	command: 'ltm.command',
 	checkResult: 'ltm.checkResult',
 	getStatus: 'ltm.getStatus',
+	getSettings: 'ltm.getSettings',
+	setSetting: 'ltm.setSetting',
 } as const;
+
+// What the window's settings screen shows. `section` is a one-shot hint: "settings" once after the
+// popup asked to open the window there (the window reads it on focus and main clears it), else null.
+export type SettingsPayload = {
+	appearance: Appearance;
+	openAtLogin: boolean;
+	log: string[];
+	section: 'settings' | null;
+};
 
 // Result of a `command` invocation: the command echoed back plus the state it produced.
 export type CommandResult = { command: EngineCommand; view: EngineView; report?: CheckView | null; error?: string | null };

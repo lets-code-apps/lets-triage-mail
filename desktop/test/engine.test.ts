@@ -122,6 +122,11 @@ test('the ring buffer keeps the last 500 log lines', () => {
 	e.start();
 	for (let i = 0; i < 600; i += 1) s.state.long[0].stdout.write(`log line ${i}\n`);
 	assert.equal(e.logCount(), 500);
+	// getLog hands out a copy: the oldest line is gone, and editing the copy changes nothing.
+	const log = e.getLog();
+	assert.equal(log[0], 'log line 100');
+	log.length = 0;
+	assert.equal(e.logCount(), 500);
 });
 
 test('an unexpected exit code moves the engine to failed, with no restart', () => {

@@ -167,6 +167,11 @@ export class EngineController {
 		return this.logs.length;
 	}
 
+	// A copy of the buffer, for the window's log box.
+	getLog(): string[] {
+		return [...this.logs];
+	}
+
 	private record(text: string, isErr: boolean): void {
 		this.pendingLine += text;
 		const parts = this.pendingLine.split('\n');
