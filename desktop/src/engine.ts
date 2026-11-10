@@ -9,7 +9,9 @@
 // Lifecycle (docs/DESKTOP.md):
 //   stopped -> starting -> running            (the `spawn` event moves starting -> running)
 //   running --stop--> stopping -> stopped     (one SIGTERM, then SIGKILL after the deadline)
-//   running/starting --unexpected exit--> failed (exit code + signal + last stderr, no restart)
+//   running/starting --unexpected exit--> failed (exit code + signal + last stderr)
+//   failed --backoff timer--> starting        (1 s, 2 s, 4 s ... up to 5 restarts; not after the
+//                                              "already running" exit, a stop or a quit)
 //
 // Why exactly one SIGTERM: `src/cli/run.rs::watch_for_signals` treats the FIRST SIGTERM as
 // "cancel, let workers finish" and the SECOND as "exit now with 130, skip cleanup". A second
@@ -38,6 +40,28 @@ const DEFAULT_STOP_TIMEOUT_MS = 30_000;
 // One-shot `status --json` reads a local SQLite file; anything slower than this is a wedged
 // engine, and a popup must not wait on one.
 const STATUS_TIMEOUT_MS = 10_000;
+// `run` exits with this when another engine holds the database lock (src/cli/run.rs). Retrying
+// would only fail again, so it is the one failure that is never restarted.
+const ALREADY_RUNNING_EXIT_CODE = 75;
+const MAX_RESTARTS = 5;
+// A run that stayed up this long was healthy, so the next failure starts the backoff over.
+const STABLE_RUN_MS = 10 * 60_000;
+const MAX_BACKOFF_MS = 60_000;
+
+// 1 s, 2 s, 4 s ... capped at 60 s.
+export const backoffMs = (restarts: number): number => Math.min(1000 * 2 ** restarts, MAX_BACKOFF_MS);
+
+// Injected so the tests drive the restart timer by hand.
+export type Clock = {
+	now(): number;
+	setTimeout(fn: () => void, ms: number): unknown;
+	clearTimeout(handle: unknown): void;
+};
+const realClock: Clock = {
+	now: () => Date.now(),
+	setTimeout: (fn, ms) => setTimeout(fn, ms),
+	clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+};
 
 export class EngineController {
 	private readonly env: NodeJS.ProcessEnv;
@@ -46,6 +70,13 @@ export class EngineController {
 	private readonly stopTimeoutMs: number;
 	private readonly statusTimeoutMs: number;
 	private readonly resourcesPath: string | undefined;
+	private readonly clock: Clock;
+
+	// Restart policy: consecutive restarts so far, when the current run began, the pending timer.
+	private restarts = 0;
+	private startedAt = 0;
+	private restartTimer: unknown = null;
+	private restartDelayMs: number | null = null;
 
 	private current: EngineState = 'stopped';
 	private child: EngineProcess | null = null;
@@ -75,7 +106,9 @@ export class EngineController {
 		statusTimeoutMs: number = STATUS_TIMEOUT_MS,
 		// Electron sets `process.resourcesPath`; undefined when running outside a packaged build.
 		resourcesPath: string | undefined = undefined,
+		clock: Clock = realClock,
 	) {
+		this.clock = clock;
 		this.env = env;
 		this.repoRoot = repoRoot;
 		this.spawn = spawn;
@@ -91,7 +124,10 @@ export class EngineController {
 			version: this.version ?? '',
 			exitCode: failed ? this.exitCode : null,
 			signal: failed ? this.signal : null,
-			failureTail: failed ? [...this.stderrLines] : [],
+			failureTail: failed
+				? [...(this.exitCode === ALREADY_RUNNING_EXIT_CODE ? ['Another engine is already running.'] : []), ...this.stderrLines]
+				: [],
+			restartInSeconds: failed && this.restartDelayMs !== null ? Math.round(this.restartDelayMs / 1000) : null,
 		};
 	}
 
@@ -116,8 +152,32 @@ export class EngineController {
 		if (this.current === 'running' || this.current === 'starting' || this.current === 'stopping') {
 			return;
 		}
+		this.restarts = 0; // a user start gets a full set of restarts
+		this.launch();
+	}
+
+	// A failed run: schedule a restart unless the failure is final.
+	private afterFailure(): void {
+		if (this.clock.now() - this.startedAt >= STABLE_RUN_MS) this.restarts = 0;
+		if (this.exitCode === ALREADY_RUNNING_EXIT_CODE || this.restarts >= MAX_RESTARTS) return;
+		this.restartDelayMs = backoffMs(this.restarts);
+		this.restarts += 1;
+		this.restartTimer = this.clock.setTimeout(() => this.launch(), this.restartDelayMs);
+	}
+
+	private clearRestart(): void {
+		if (this.restartTimer !== null) this.clock.clearTimeout(this.restartTimer);
+		this.restartTimer = null;
+		this.restartDelayMs = null;
+	}
+
+	private launch(): void {
+		this.clearRestart();
+		this.startedAt = this.clock.now();
 		const { file, baseArgs } = this.resolve();
-		const child = this.spawn(file, [...baseArgs, 'run'], { stdio: ['ignore', 'pipe', 'pipe'] });
+		// stdin stays an open pipe we never write to: when this app dies the pipe closes and the
+		// engine shuts down (`--exit-on-stdin-close`), so it can never be orphaned.
+		const child = this.spawn(file, [...baseArgs, 'run', '--exit-on-stdin-close'], { stdio: ['pipe', 'pipe', 'pipe'] });
 		this.child = child;
 		this.exitCode = null;
 		this.signal = null;
@@ -138,7 +198,10 @@ export class EngineController {
 		child.once('error', () => {
 			// Spawn failed (e.g. binary vanished): a failure, not a crash.
 			this.child = null;
-			if (this.current !== 'stopping') this.setState('failed');
+			if (this.current !== 'stopping') {
+				this.afterFailure();
+				this.setState('failed');
+			}
 			this.exitResolve?.();
 		});
 		child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
@@ -149,6 +212,7 @@ export class EngineController {
 			} else {
 				this.exitCode = code;
 				this.signal = signal ?? null;
+				this.afterFailure();
 				this.setState('failed');
 			}
 			this.exitResolve?.();
@@ -202,6 +266,7 @@ export class EngineController {
 		// Idempotent while stopping: a second Stop, or Quit right after Stop, reuses the in-flight
 		// stop instead of sending a second SIGTERM.
 		if (this.current === 'stopping' && this.stopPromise) return this.stopPromise;
+		this.clearRestart(); // a stop (or the quit that calls it) cancels a pending restart
 		if (this.current === 'stopped' || this.current === 'failed' || this.child === null) {
 			this.setState('stopped');
 			return Promise.resolve();
@@ -332,7 +397,7 @@ export class EngineController {
 type EnginePathRef = { file: string; baseArgs: string[] };
 type SpawnLike = (file: string, args: readonly string[], options?: { stdio?: unknown }) => EngineProcess;
 
-// The real spawner, used by the main process. `stdio: ['ignore','pipe','pipe']` keeps stdin closed
-// (the engine will exit on stdin-close in increment 2) and pipes stdout/stderr into the ring buffer.
+// The real spawner, used by the main process. `stdio: ['pipe','pipe','pipe']` keeps stdin an open pipe
+// (the engine exits when it closes) and pipes stdout/stderr into the ring buffer.
 export const defaultSpawn: SpawnLike = (file, args, options) =>
-	nodeSpawn(file, [...args], (options as SpawnOptions) ?? { stdio: ['ignore', 'pipe', 'pipe'] }) as unknown as EngineProcess;
+	nodeSpawn(file, [...args], (options as SpawnOptions) ?? { stdio: ['pipe', 'pipe', 'pipe'] }) as unknown as EngineProcess;

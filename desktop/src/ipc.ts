@@ -29,6 +29,8 @@ export type EngineView = {
 	exitCode: number | null;
 	signal: string | null;
 	failureTail: string[];
+	// Seconds until the next automatic restart while `failed`, else null (see engine.ts).
+	restartInSeconds: number | null;
 };
 
 // A full check report is sent to the renderer as data only. It carries server and folder names,
