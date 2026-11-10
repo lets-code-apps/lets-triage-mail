@@ -1,12 +1,13 @@
 //! The command-line interface: the argument types (parsed by `clap`) and the dispatch.
 //!
 //! Each subcommand lives in its own file and exposes one `async fn run` that returns
-//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `status`, `rules` and `backfill`
+//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `status`, `rules`, `config` and `backfill`
 //! work; the others are still stubs, see `docs/PLAN.md`.
 
 mod backfill;
 mod check;
 mod classify;
+mod config;
 mod digest;
 mod rules;
 mod run;
@@ -120,6 +121,9 @@ pub enum Command {
     /// Manage the sender allow and block rules
     #[command(subcommand)]
     Rules(rules::RulesCommand),
+    /// Show, validate and edit the config; accounts keep their comments
+    #[command(subcommand)]
+    Config(config::ConfigCommand),
 }
 
 /// Runs the chosen subcommand.
@@ -147,6 +151,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Stats { days, json } => stats::run(&config_path, days, json).await,
         Command::Status { json } => status::run(&config_path, json).await,
         Command::Rules(command) => rules::run(&config_path, command).await,
+        Command::Config(command) => config::run(&config_path, command).await,
     }
 }
 
