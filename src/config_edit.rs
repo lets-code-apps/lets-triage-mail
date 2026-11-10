@@ -252,6 +252,10 @@ pub fn validate_text(new_text: &str) -> Result<Config> {
 /// two processes ever edit the config, for example the app and a terminal at the same time.
 pub fn write_config(path: &Path, new_text: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // Write through a symlink (dotfile managers link the config): renaming over the link itself
+    // would replace it with a plain file.
+    let resolved = std::fs::canonicalize(path).ok();
+    let path = resolved.as_deref().unwrap_or(path);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     let dir = dir.unwrap_or(Path::new("."));
     crate::store::create_private_dir(dir)?;
@@ -284,7 +288,7 @@ pub fn write_config(path: &Path, new_text: &str) -> Result<()> {
 /// Creates or truncates `path` with mode 0600 and writes `bytes`, optionally fsyncing.
 fn write_private(path: &Path, bytes: &[u8], fsync: bool) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let _ = std::fs::remove_file(path).ok().filter(|_| fsync);
+    let _ = std::fs::remove_file(path); // start fresh, so no older file's owner or ACL carries over
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -562,6 +566,23 @@ time = \"07:30\"
             assert!(check_password(bad).is_err(), "{bad:?}");
         }
         check_password("a \"q\" \\ 'x' #y $z").unwrap();
+    }
+
+    #[test]
+    fn write_goes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_config(&link, "new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
     }
 
     #[test]
