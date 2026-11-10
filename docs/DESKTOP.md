@@ -112,8 +112,8 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   and a footer with pause/start triage, a settings button (opens the window on settings) and quit. The
   window is transparent so the card's rounded corners show. There is no tray highlight while it is open: Electron has no
   API for macOS's native one (macOS shows it only while the mouse is down), and a hand-drawn one never
-  matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, or opening
-  the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
+  matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, another menu-bar
+  item opening its menu (`com.apple.HIToolbox.beginMenuTrackingNotification`), or opening the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
   name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
   Its pause/start button behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the
   new state); there is no separate status line. Main pushes the engine state to both pages.

@@ -7,7 +7,7 @@
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen, systemPreferences } from 'electron';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -309,6 +309,11 @@ function boot(): void {
 	});
 	// Our app stopped being the active one (a click on another app or the desktop): close like a menu.
 	app.on('did-resign-active', () => popupCtl.handleBlur());
+	// Another menu-bar item opened its menu (the clock, Wi-Fi, another app's tray menu). Those clicks
+	// don't activate their app, so neither blur nor did-resign-active fires; macOS broadcasts this
+	// distributed notification whenever any menu starts tracking, which is how native menus close
+	// each other. Items that open a popover window instead of a menu may still not send it.
+	systemPreferences.subscribeNotification('com.apple.HIToolbox.beginMenuTrackingNotification', () => popupCtl.handleBlur());
 	void engine.readVersion().then(() => {
 		// Both pages show the engine state (the popup's pause/start button and status line).
 		engine.onState((view) => {
