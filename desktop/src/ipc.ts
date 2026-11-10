@@ -49,6 +49,8 @@ export const CHANNEL = {
 	getStatus: 'ltm.getStatus',
 	getSettings: 'ltm.getSettings',
 	setSetting: 'ltm.setSetting',
+	getConfig: 'ltm.getConfig',
+	editAccount: 'ltm.editAccount',
 } as const;
 
 // What the window's settings screen shows. `section` is a one-shot hint: "settings" once after the

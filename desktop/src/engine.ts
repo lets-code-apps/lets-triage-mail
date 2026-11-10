@@ -29,11 +29,17 @@ import type { CheckResult, EngineState, EngineView, StatusResult } from './ipc.t
 // The slice of a child process this controller relies on. A real `ChildProcess` satisfies it;
 // so does the fake used by the tests.
 export interface EngineProcess extends EventEmitter {
+	// Only set for one-shot calls that are given input (a password on `config account ...`).
+	stdin?: NodeJS.WritableStream | null;
 	stdout: NodeJS.ReadableStream | null;
 	stderr: NodeJS.ReadableStream | null;
 	kill(signal?: NodeJS.Signals | number): void;
 }
 
+// `config account test` signs in to a real server (up to a few steps of 15 s each); the other config
+// calls only touch the file and the Keychain.
+const CONFIG_TIMEOUT_MS = 10_000;
+export const CONFIG_TEST_TIMEOUT_MS = 60_000;
 const MAX_LOG_LINES = 500;
 const MAX_STDERR_LINES = 8;
 const DEFAULT_STOP_TIMEOUT_MS = 30_000;
@@ -306,6 +312,21 @@ export class EngineController {
 		return { kind: 'report', report: parsed.report };
 	}
 
+	// One `config ...` call: `args` after `lets-triage-mail`, the optional `stdin` text written to the
+	// child and closed (a password goes here and only here: never argv, never env, never logged).
+	// Resolves with the engine's JSON, or `{ok:false, error}`; the engine prints JSON even when it
+	// fails, so the exit code is ignored. The child's stderr is not echoed: it is one sentence at best.
+	async runConfig(args: string[], stdin?: string, timeoutMs: number = CONFIG_TIMEOUT_MS): Promise<Record<string, unknown>> {
+		const collected = await this.collect(['config', ...args], timeoutMs, stdin);
+		try {
+			const parsed: unknown = JSON.parse(collected.stdout);
+			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+		} catch {
+			// fall through
+		}
+		return { ok: false, error: collected.stderrTail[0] ?? 'the engine gave no answer' };
+	}
+
 	// `--version` prints `lets-triage-mail X.Y.Z`; the tray shows just the version token.
 	async readVersion(): Promise<string> {
 		const collected = await this.collect(['--version']);
@@ -321,9 +342,15 @@ export class EngineController {
 	private async collect(
 		subArgs: string[],
 		timeoutMs: number = 0,
+		input?: string,
 	): Promise<{ stdout: string; stderrTail: string[]; exitCode: number | null }> {
 		const { file, baseArgs } = this.resolve();
-		const child = this.spawn(file, [...baseArgs, ...subArgs], { stdio: ['ignore', 'pipe', 'pipe'] });
+		const child = this.spawn(file, [...baseArgs, ...subArgs], { stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+		if (input !== undefined && child.stdin) {
+			// An early exit closes the pipe under us; the answer is read from stdout either way.
+			child.stdin.on('error', () => undefined);
+			child.stdin.end(input);
+		}
 
 		let stdout = '';
 		const stderrTail: string[] = [];
@@ -347,12 +374,15 @@ export class EngineController {
 			child.once('error', () => resolve());
 		});
 		if (timeoutMs > 0) {
+			const cancel = new AbortController();
 			// `status` answers in tens of milliseconds, so hitting this limit already means the
 			// engine is wedged: kill the child (SIGKILL, it is not reasoning any more) and move on.
 			const outcome = await Promise.race([
 				closed.then(() => 'closed' as const),
-				delay(timeoutMs).then(() => 'timeout' as const),
+				// Cancelled once the child closes, so a finished call leaves no timer behind.
+				delay(timeoutMs, undefined, { signal: cancel.signal }).then(() => 'timeout' as const, () => 'closed' as const),
 			]);
+			cancel.abort();
 			if (outcome === 'timeout') {
 				child.kill('SIGKILL');
 				await closed;

@@ -1,18 +1,19 @@
 // Wiring only: single-instance lock, dock, tray, the controllers and the quit choreography. No
 // triage logic lives here — every engine fact comes from EngineController, which shells out to
-// `lets-triage-mail`. The renderer talks back through the five preload functions only, the popup
+// `lets-triage-mail`. The renderer talks back through the nine preload functions only, the popup
 // page through `getStatus` and `command`.
 //
 // The whole app ends only through an explicit quit (tray "Quit", Cmd+Q, or SIGTERM to the app);
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen, systemPreferences } from 'electron';
+import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeTheme, screen, systemPreferences } from 'electron';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { EngineController, defaultSpawn } from './engine.ts';
+import { EngineController, CONFIG_TEST_TIMEOUT_MS, defaultSpawn } from './engine.ts';
+import { buildEditRequests, parseConfigShow, toEditResult, type AccountOp, type EditResult } from './account-edit.ts';
 import { WindowController } from './window.ts';
 import { buildPopupView } from './popup-model.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
@@ -72,6 +73,9 @@ function settingsPayload(): SettingsPayload {
 // second URL: `getStatus` and `command` both come from here or not at all.
 const fromUs = (senderFrame?: { url?: string } | null): boolean =>
 	senderFrame?.url === RENDERER_URL || senderFrame?.url === POPUP_URL;
+const firstLine = (failed: unknown): string => (failed instanceof Error ? failed.message : String(failed)).split('\n')[0];
+// The config calls are for the window page alone.
+const fromWindow = (senderFrame?: { url?: string } | null): boolean => senderFrame?.url === RENDERER_URL;
 
 // The clock the popup's strings are built with: the user's locale and zone, pinned once per
 // read rather than guessed by the page (see popup-model.ts).
@@ -258,6 +262,47 @@ async function performStart(): Promise<void> {
 	if (!external) engine.start();
 }
 
+// One accounts-screen action: validate, confirm if it is consequential, run, then restart the engine
+// the app owns so a change takes effect (the engine reads its config only at start).
+async function editAccount(op: unknown, fields: unknown): Promise<EditResult> {
+	const built = buildEditRequests(op, fields);
+	if ('error' in built) return { ok: false, error: built.error };
+	for (const request of built.requests) {
+		if (request.confirm && !(await confirm(request.confirm))) return { ok: false, error: 'Cancelled.' };
+	}
+	let result: EditResult = { ok: true };
+	for (const request of built.requests) {
+		const raw = await engine.runConfig(request.args, request.stdin, request.slow ? CONFIG_TEST_TIMEOUT_MS : undefined);
+		result = toEditResult(op as AccountOp, raw);
+		if (!result.ok) return result;
+	}
+	if (result.restart === undefined) return result;
+	if (appOwnsEngine()) {
+		await engine.stop();
+		engine.start();
+		return { ...result, restart: 'done' };
+	}
+	const status = await engine.status();
+	return { ...result, restart: status.kind === 'status' && status.report.engine.running ? 'external' : 'none' };
+}
+
+// The native confirmation for going live or removing an account; "cancel" is the default button.
+async function confirm(kind: 'live' | 'remove'): Promise<boolean> {
+	const live = kind === 'live';
+	const options = {
+		type: 'warning' as const,
+		buttons: [live ? 'go live' : 'remove', 'cancel'],
+		defaultId: 1,
+		cancelId: 1,
+		message: live ? 'Let triage change this account on the server?' : 'Remove this account?',
+		detail: live
+			? 'Triage will set flag colours on the server. It never moves or deletes mail.'
+			: 'The account and its saved password are removed. Mail on the server is not touched.',
+	};
+	const { response } = currentWindow ? await dialog.showMessageBox(currentWindow, options) : await dialog.showMessageBox(options);
+	return response === 0;
+}
+
 // The tray "Check setup" opens the window (so there is somewhere to show the result) and then
 // pushes the finished check to the renderer as data. It waits for the page to finish loading before
 // sending, otherwise the message races the renderer and is dropped.
@@ -375,6 +420,26 @@ function boot(): void {
 		// polls every 5 s while visible, so a missed measurement self-corrects within one poll.
 		if (fromPopup) setImmediate(() => void fitPopup());
 		return payload;
+	});
+	// The accounts screen. Both come from the window page only: the popup must not read or write the
+	// config. `getConfig` is the engine's `config show`, trimmed; `editAccount` validates every field
+	// (account-edit.ts), asks for a native confirmation before going live or removing an account,
+	// runs the engine's own `config account ...` command and restarts the engine it owns.
+	ipcMain.handle(CHANNEL.getConfig, async (event) => {
+		if (!fromWindow(event.senderFrame)) return null;
+		try {
+			return parseConfigShow(await engine.runConfig(['show', '--json']));
+		} catch (failed) {
+			return parseConfigShow({ ok: false, error: firstLine(failed) }); // no engine binary, say
+		}
+	});
+	ipcMain.handle(CHANNEL.editAccount, async (event, op: unknown, fields: unknown): Promise<EditResult | null> => {
+		if (!fromWindow(event.senderFrame)) return null;
+		try {
+			return await editAccount(op as AccountOp, fields);
+		} catch (failed) {
+			return { ok: false, error: firstLine(failed) };
+		}
 	});
 	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
 		if (!fromUs(event.senderFrame)) {

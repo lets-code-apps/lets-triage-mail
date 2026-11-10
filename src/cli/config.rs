@@ -4,11 +4,12 @@
 //! [`lets_triage_mail::config_edit`]; this file only does the IO and the output.
 
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
-use lets_triage_mail::config::Config;
+use lets_triage_mail::check::{self, DigestCheck, Report};
+use lets_triage_mail::config::{AccountConfig, Config, Secret};
 use lets_triage_mail::config_edit::{self as edit, NewAccount};
 use serde_json::{Value, json};
 
@@ -78,6 +79,28 @@ pub enum AccountCommand {
         #[command(flatten)]
         out: JsonFlag,
     },
+    /// Try signing in, changing nothing: with `NAME` (stored password) or with `--host` and
+    /// `--username` and the password on stdin (nothing is stored)
+    Test {
+        /// An account in the config; no other option is allowed with it
+        #[arg(conflicts_with_all = ["host", "username", "port", "tls", "password_stdin"])]
+        name: Option<String>,
+        #[arg(long, required_unless_present = "name", requires_all = ["username", "password_stdin"])]
+        host: Option<String>,
+        #[arg(long, requires = "host")]
+        username: Option<String>,
+        /// Default: 993 for tls, 143 otherwise
+        #[arg(long, requires = "host")]
+        port: Option<u16>,
+        /// tls (default), starttls or none (loopback only)
+        #[arg(long, requires = "host")]
+        tls: Option<String>,
+        /// Read the password from stdin (one line)
+        #[arg(long)]
+        password_stdin: bool,
+        #[command(flatten)]
+        out: JsonFlag,
+    },
     /// Replace an account's Keychain password
     Password {
         name: String,
@@ -115,6 +138,7 @@ impl ConfigCommand {
                 AccountCommand::Add { out, .. }
                 | AccountCommand::Set { out, .. }
                 | AccountCommand::Remove { out, .. }
+                | AccountCommand::Test { out, .. }
                 | AccountCommand::Password { out, .. },
             ) => out.json,
         }
@@ -124,6 +148,23 @@ impl ConfigCommand {
 /// Runs one config command. In JSON mode a failure is `{"ok":false,...}` on stdout and exit 1.
 pub async fn run(config_path: &Path, command: ConfigCommand) -> anyhow::Result<()> {
     let json = command.wants_json();
+    if let ConfigCommand::Account(AccountCommand::Test {
+        name,
+        host,
+        username,
+        port,
+        tls,
+        ..
+    }) = command
+    {
+        return match test(config_path, name, host, username, port, tls, json).await {
+            Err(error) if json => {
+                println!("{}", failure_json(&error));
+                std::process::exit(1);
+            }
+            other => other,
+        };
+    }
     match execute(config_path, command) {
         Ok(outcome) if json => println!("{}", serde_json::to_string_pretty(&outcome.json)?),
         Ok(outcome) => println!("{}", outcome.text),
@@ -190,7 +231,86 @@ fn execute(path: &Path, command: ConfigCommand) -> anyhow::Result<Outcome> {
             ..
         }) => remove(path, &name, forget_password),
         ConfigCommand::Account(AccountCommand::Password { name, .. }) => password(path, &name),
+        ConfigCommand::Account(AccountCommand::Test { .. }) => unreachable!("handled in run"),
     }
+}
+
+/// The account `config account test --host ...` signs in to: built through the same
+/// validation as `add`, so a bad host, port or `tls none` on a remote host is refused the same way.
+fn ad_hoc_account(
+    host: String,
+    username: String,
+    port: Option<u16>,
+    tls: Option<String>,
+) -> anyhow::Result<AccountConfig> {
+    let account = NewAccount {
+        name: "test".into(),
+        host,
+        username,
+        port,
+        tls,
+        ..Default::default()
+    };
+    let config = edit::validate_text(&edit::add_account("", &account)?)?;
+    Ok(config
+        .accounts
+        .into_iter()
+        .next()
+        .expect("one account was added"))
+}
+
+/// `config account test`: the sign-in checks of `check`, without the model and without touching
+/// the config or the Keychain. Prints the `check --json` report; exits 1 when something failed.
+async fn test(
+    path: &Path,
+    name: Option<String>,
+    host: Option<String>,
+    username: Option<String>,
+    port: Option<u16>,
+    tls: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let items = match (name, host, username) {
+        (Some(name), ..) => {
+            let config = load(path)?;
+            let account = config
+                .account(&name)
+                .with_context(|| format!("no account named `{name}` in the config"))?;
+            check::probe_account(account, &DigestCheck::for_account(&config, account)).await
+        }
+        (None, Some(host), Some(username)) => {
+            let account = ad_hoc_account(host, username, port, tls)?;
+            let password = read_password()?;
+            // A dry-run digest check, so no digest folder is looked for.
+            let digest = DigestCheck {
+                time: String::new(),
+                folder: String::new(),
+                dry_run: true,
+                previews_dir: PathBuf::new(),
+            };
+            check::probe_imap(
+                "test",
+                &account.imap_settings(&Secret::new(password)),
+                &account.inbox,
+                "",
+                None,
+                account.flagging,
+                &digest,
+            )
+            .await
+        }
+        _ => bail!("give an account name, or --host and --username"),
+    };
+    let report = Report { items };
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        println!("{}\n{}", report.to_text(), report.summary());
+    }
+    if report.has_failures() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn read(path: &Path) -> anyhow::Result<String> {
@@ -392,6 +512,80 @@ mod tests {
         );
         // The command text itself never appears.
         assert!(!value.to_string().contains("hunter2"));
+    }
+
+    fn dry_digest() -> DigestCheck {
+        DigestCheck {
+            time: String::new(),
+            folder: String::new(),
+            dry_run: true,
+            previews_dir: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn ad_hoc_account_maps_the_arguments_and_validates() {
+        let a = ad_hoc_account("imap.example.com".into(), "me".into(), None, None).unwrap();
+        assert_eq!(
+            (a.host.as_str(), a.username.as_str(), a.port()),
+            ("imap.example.com", "me", 993)
+        );
+        let a = ad_hoc_account(
+            "imap.example.com".into(),
+            "me".into(),
+            Some(143),
+            Some("starttls".into()),
+        )
+        .unwrap();
+        assert_eq!(a.port(), 143);
+        // Same rules as `add`: no plain text to a remote host, no odd tls word.
+        assert!(
+            ad_hoc_account(
+                "imap.example.com".into(),
+                "me".into(),
+                None,
+                Some("none".into())
+            )
+            .is_err()
+        );
+        assert!(
+            ad_hoc_account(
+                "imap.example.com".into(),
+                "me".into(),
+                None,
+                Some("ssl".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_one_failed_item_in_the_check_shape() {
+        let account = ad_hoc_account(
+            "127.0.0.1".into(),
+            "me".into(),
+            Some(1),
+            Some("none".into()),
+        )
+        .unwrap();
+        let items = check::probe_imap(
+            "test",
+            &account.imap_settings(&Secret::new("pw")),
+            "INBOX",
+            "",
+            None,
+            true,
+            &dry_digest(),
+        )
+        .await;
+        let value = Report { items }.to_json();
+        assert_eq!(
+            (value["ok"].clone(), value["failed"].clone()),
+            (json!(false), json!(1))
+        );
+        assert_eq!(value["items"][0]["area"], "test");
+        assert_eq!(value["items"][0]["status"], "fail");
+        assert!(!value.to_string().contains("\"pw\""));
     }
 
     #[test]

@@ -82,8 +82,15 @@ h2 {
   border-right: 1px solid var(--line);
 }
 
-.list > h1,
 .list > .summary {
+  padding: 0 var(--s-4);
+}
+
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
   padding: 0 var(--s-4);
 }
 
@@ -283,4 +290,117 @@ h2 {
   display: flex;
   flex-wrap: wrap;
   gap: var(--s-2);
+}
+
+/* The accounts forms. A text field per the design's TextField: label above, 44px field, 1px line,
+   a visible focus ring, helper in muted text, errors in the danger tone. */
+.account-form,
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  max-width: 520px;
+}
+
+.group {
+  gap: var(--s-2);
+  align-items: flex-start;
+  margin-top: var(--s-6);
+}
+
+.group h3 {
+  margin: 0;
+  font-size: var(--item);
+  font-weight: 500;
+}
+
+.detail .group p,
+.detail .group p.meta,
+.group .checks {
+  margin: 0;
+  max-width: 100%;
+}
+
+.group .checks {
+  width: 100%;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field.grow {
+  flex: 3 1 220px;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-4);
+}
+
+.field-row .field:not(.grow) {
+  flex: 1 1 96px;
+}
+
+.field label {
+  font-size: var(--label);
+  font-weight: 500;
+}
+
+.field input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: var(--item);
+  font-family: inherit;
+}
+
+.field input:focus-visible {
+  outline: 3px solid var(--fg);
+  outline-offset: 2px;
+}
+
+.field .helper {
+  margin: 0;
+  font-size: var(--meta);
+  color: var(--muted);
+}
+
+.form-msg {
+  min-height: 1.55em;
+  margin: 0;
+  font-size: var(--meta);
+}
+
+.form-error {
+  color: var(--danger);
+}
+
+.btn.ghost.danger {
+  margin: var(--s-6) 0 0 -18px; /* the label lines up with the text above, not the button edge */
+  color: var(--danger);
+}
+
+.row .meta.user {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.seg button[aria-checked='true'] {
+  cursor: default;
+}
+
+.checks:empty,
+.form-msg:empty {
+  display: none;
 }

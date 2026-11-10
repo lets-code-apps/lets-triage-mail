@@ -79,14 +79,14 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 
 // The preload is CommonJS (sandbox), so it cannot import CHANNEL from ipc.ts. This closes the seam
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
-test('the preload bridge exposes exactly the seven channels ipc.ts declares', () => {
+test('the preload bridge exposes exactly the nine channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
 	const channels = Object.values(CHANNEL);
-	assert.equal(channels.length, 7, 'ipc.ts declares seven channels');
+	assert.equal(channels.length, 9, 'ipc.ts declares nine channels');
 	for (const channel of channels) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// Seven and only seven: nothing here reaches Node, the network or the filesystem. The one
+	// Nine and only nine: nothing here reaches Node, the network or the filesystem. The one
 	// `require` allowed is the electron module itself.
 	const requires = preload.match(/require\([^)]*\)/g) ?? [];
 	for (const call of requires) {
@@ -234,4 +234,23 @@ test('engine state is pushed to the window and the popup, and the popup reads it
 	assert.ok(main.includes('popupWindow?.webContents.send(CHANNEL.state'), 'state goes to the popup');
 	const popup = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
 	assert.ok(popup.includes('api.getState()') && popup.includes('api.onState('), 'the popup bootstraps and subscribes');
+});
+
+// The accounts screen writes the user's config, so the two new calls come from the window page only
+// (the popup must not read or write it), every edit is validated in main, and the password is never
+// part of an argv: it is written to the child's stdin.
+test('getConfig and editAccount are window-only, validated in main, and the password goes to stdin', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.ok(main.includes("senderFrame?.url === RENDERER_URL;"), 'fromWindow names the window page only');
+	for (const channel of ['getConfig', 'editAccount']) {
+		const start = main.indexOf(`CHANNEL.${channel}`);
+		assert.ok(start > 0, `${channel} has a handler`);
+		assert.match(main.slice(start, start + 200), /!fromWindow\(event\.senderFrame\)\) return null/, `${channel} must refuse other senders`);
+	}
+	assert.ok(/buildEditRequests\(op, fields\)/.test(main), 'editAccount validates through buildEditRequests');
+	assert.ok(main.includes('engine.runConfig(request.args, request.stdin'), 'the password is passed as stdin');
+	const engine = readFileSync(join(SRC, 'engine.ts'), 'utf8');
+	assert.ok(engine.includes('child.stdin.end(input)'), 'stdin is written and closed');
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	assert.equal(/\.innerHTML\s*=/.test(renderer), false);
 });
