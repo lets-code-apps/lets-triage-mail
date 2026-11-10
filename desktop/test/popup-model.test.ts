@@ -29,11 +29,12 @@ test('the fixture report renders one row per account, verbatim', () => {
 	assert.equal(view.accounts[1].state, 'sign in failed');
 });
 
-test('the headline counts today\'s "to look at" total, pluralised', () => {
+test('the headline is the "to look at" total, with a pill that follows it and the engine', () => {
 	const view = buildPopupView(report(), OPTS);
 	assert.equal(view.headline, '4');
-	// The number is the headline; the label only carries the noun, so it pluralises.
-	assert.equal(view.headlineLabel, 'messages to look at');
+	assert.deepEqual([view.pill, view.pillTone], ['needs reply', 'attention']);
+	const clear = buildPopupView(oneAccountWith(0, 'connected'), OPTS);
+	assert.deepEqual([clear.pill, clear.pillTone], ['all clear', 'positive']);
 });
 
 test('the subline carries the other two buckets and the window', () => {
@@ -85,6 +86,7 @@ test('engine down: accounts read not_running and the copy says so', () => {
 	assert.equal(view.summary, 'Engine not running. Counts are from the database.');
 	// The accent is muted: nothing is alarming, nothing is live.
 	assert.equal(view.tone, 'muted');
+	assert.deepEqual([view.pill, view.pillTone], ['not running', 'muted']);
 });
 
 test('no accounts configured: a calm empty popup', () => {
@@ -99,28 +101,11 @@ test('no accounts configured: a calm empty popup', () => {
 	assert.equal(view.headline, '0');
 });
 
-test('one message reads "message to look at"', () => {
-	const view = buildPopupView(oneAccountWith(1, 'connected'), OPTS);
-	assert.equal(view.headline, '1');
-	assert.equal(view.headlineLabel, 'message to look at');
-});
-
 test('the clock line follows the pinned zone, not the machine', () => {
 	const view = buildPopupView(report(), { locale: 'en-US', timeZone: 'Europe/Berlin' });
 	// 1793998800 is 22:00 in Berlin, 21:00 in UTC: the zone is an argument, never the machine's.
 	assert.match(view.subline, /since \d\d:\d\d$/);
 	assert.notEqual(view.subline, buildPopupView(report(), OPTS).subline);
-});
-
-test('the date/time line above the counts pins generated_at to the zone', () => {
-	// The required date-and-time line: 1794038100 is 07 Nov 2026 07:55 in UTC. Same fixed-zone
-	// style as the clock line, so the machine's local zone can never leak into a test.
-	assert.equal(buildPopupView(report(), OPTS).generated, '07 Nov 2026, 07:55');
-	// Berlin reads the same instant one hour later.
-	assert.equal(
-		buildPopupView(report(), { locale: 'en-US', timeZone: 'Europe/Berlin' }).generated,
-		'Nov 07, 2026, 08:55',
-	);
 });
 
 test('an engine started outside the app disables Start and says so', () => {

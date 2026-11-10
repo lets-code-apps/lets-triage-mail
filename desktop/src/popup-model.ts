@@ -27,11 +27,10 @@ export type AccountRow = {
 };
 
 export type PopupView = {
-	// The date-and-time line above the counts: when this snapshot was generated.
-	generated: string;
-	// The big number and its label ("4" + "messages to look at").
+	// The big number ("4") and the pill beside it ("needs reply", "all clear", "not running").
 	headline: string;
-	headlineLabel: string;
+	pill: string;
+	pillTone: Tone;
 	// "2 fyi · 7 done · since 21:00"
 	subline: string;
 	// "1 of 3 connected", or the engine-down / no-accounts copy.
@@ -64,29 +63,11 @@ const toneFor = (state: AccountState): Tone => {
 
 const toneForState = (state: string): Tone => (isKnown(state) ? toneFor(state as AccountState) : 'muted');
 
-// "4 messages to look at" / "1 message to look at". English-only in v1 (see DECISIONS.md);
-// `locale` decides the clock format only.
-const plural = (count: number, singular: string): string =>
-	count === 1 ? singular : `${singular}s`;
-
 // HH:MM of `since`, in the machine's zone unless the caller pins one (tests pin UTC).
 const clock = (epochSeconds: number, locale: string, timeZone: string): string =>
 	new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', timeZone, hour12: false }).format(
 		new Date(epochSeconds * 1000),
 	);
-
-// The date-and-time line above the counts: when the snapshot was made (`generated_at`), in the
-// same pinned zone as `since`. Date + HH:MM so it reads as "these numbers are as of this moment".
-const stamp = (epochSeconds: number, locale: string, timeZone: string): string =>
-	new Intl.DateTimeFormat(locale, {
-	 year: 'numeric',
-	 month: 'short',
-	 day: '2-digit',
-	 hour: '2-digit',
-	 minute: '2-digit',
-	 timeZone,
-	 hour12: false,
-	}).format(new Date(epochSeconds * 1000));
 
 // The plan's sketch also passed a wall clock. It is dropped deliberately: the report already
 // carries `generated_at`, and a second clock to agree with is a second thing to test.
@@ -98,12 +79,16 @@ export function buildPopupView(
 ): PopupView {
 	const { locale, timeZone } = options;
 	const ownsEngine = options.ownsEngine ?? true;
-	const generated = stamp(report.generated_at, locale, timeZone);
 	const since = clock(report.window.since, locale, timeZone);
 	const counts = report.counts;
 	const subline = `${counts.fyi} fyi · ${counts.done} done · since ${since}`;
 
 	const running = report.engine.running;
+	const [pill, pillTone]: [string, Tone] = !running
+		? ['not running', 'muted']
+		: counts.to_look_at > 0
+			? ['needs reply', 'attention']
+			: ['all clear', 'positive'];
 	// An engine is running, but not one this app spawned (launchd or a terminal): Start must be
 	// refused, and the popup says where the live engine came from instead of "X of Y connected".
 	const external = running && !ownsEngine;
@@ -111,9 +96,9 @@ export function buildPopupView(
 	if (report.accounts.length === 0) {
 		// The config has no accounts: nothing can be connected, and the numbers are all zero.
 		return {
-			generated,
 			headline: '0',
-			headlineLabel: 'nothing to look at',
+			pill,
+			pillTone,
 			subline: `0 fyi · 0 done · since ${since}`,
 			summary: external
 				? 'Running outside the app. No accounts configured.'
@@ -137,9 +122,9 @@ export function buildPopupView(
 	const accounts = report.accounts.map((account) => accountRow(account));
 
 	return {
-		generated,
 		headline: String(counts.to_look_at),
-		headlineLabel: `${plural(counts.to_look_at, 'message')} to look at`,
+		pill,
+		pillTone,
 		subline,
 		summary,
 		accounts,
