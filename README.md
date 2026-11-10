@@ -33,7 +33,7 @@ it (the LaunchAgent, a terminal `run`, or the desktop) so two engines never watc
 ## Quickstart
 
 You need macOS or Linux, a local model server, and an IMAP account that allows app passwords.
-Rust 1.85 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
+Rust 1.89 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
 route below.
 
 ### 1. Install

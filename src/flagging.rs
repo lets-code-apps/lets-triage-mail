@@ -194,10 +194,11 @@ pub fn reply_ids_from_header(raw: &[u8]) -> Vec<String> {
         while let Some(start) = rest.find('<') {
             let after = &rest[start + 1..];
             let Some(end) = after.find('>') else { break };
-            if let Some(id) = normalise_message_id(&after[..end]) {
-                if !ids.contains(&id) && ids.len() < MAX_IDS_PER_MESSAGE {
-                    ids.push(id);
-                }
+            if let Some(id) = normalise_message_id(&after[..end])
+                && !ids.contains(&id)
+                && ids.len() < MAX_IDS_PER_MESSAGE
+            {
+                ids.push(id);
             }
             rest = &after[end + 1..];
         }
