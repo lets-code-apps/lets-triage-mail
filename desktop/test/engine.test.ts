@@ -413,3 +413,54 @@ test('the engine is spawned with --exit-on-stdin-close and a stdin pipe', () => 
 	assert.deepEqual(calls[0].args.slice(-2), ['run', '--exit-on-stdin-close']);
 	assert.deepEqual(calls[0].stdio, ['pipe', 'pipe', 'pipe']);
 });
+
+// `config ...` calls: the password is written to the child's stdin and nowhere else.
+function configSpawn(reply: string, exit = 0) {
+	const seen = { args: [] as string[], stdin: '', stdio: undefined as unknown };
+	const spawn = (_file: string, args: readonly string[], options?: { stdio?: unknown }) => {
+		seen.args = [...args];
+		seen.stdio = options?.stdio;
+		const one = new EventEmitter() as unknown as EngineProcess;
+		const stdout = new PassThrough();
+		const stdin = new PassThrough();
+		stdin.on('data', (chunk) => (seen.stdin += String(chunk)));
+		one.stdout = stdout;
+		one.stderr = new PassThrough();
+		one.stdin = stdin;
+		one.kill = () => undefined;
+		stdin.on('finish', () => {
+			if (reply !== '') stdout.write(reply);
+			one.emit('exit', exit, null);
+			one.emit('close');
+		});
+		return one;
+	};
+	return { spawn, seen };
+}
+
+test('runConfig writes the password to stdin only and parses the JSON answer', async () => {
+	const c = configSpawn('{"ok":true,"restart_needed":true}\n');
+	const e = new EngineController(ENV, '/unused', c.spawn);
+	const result = await e.runConfig(['account', 'password', '--json', '--password-stdin', '--', 'work'], 'secret-pw\n');
+	assert.deepEqual(result, { ok: true, restart_needed: true });
+	assert.equal(c.seen.stdin, 'secret-pw\n');
+	assert.ok(!c.seen.args.join(' ').includes('secret-pw'));
+	assert.deepEqual(c.seen.args.slice(0, 2), ['config', 'account']);
+	assert.deepEqual(c.seen.stdio, ['pipe', 'pipe', 'pipe']);
+	assert.equal(e.logCount(), 0, 'one-shot output never enters the log buffer');
+});
+
+test('runConfig ignores the exit code when the engine printed its JSON failure', async () => {
+	const c = configSpawn('{"ok":false,"error":"no account named `x`"}\n', 1);
+	const e = new EngineController(ENV, '/unused', c.spawn);
+	assert.deepEqual(await e.runConfig(['show', '--json'], ''), { ok: false, error: 'no account named `x`' });
+});
+
+test('runConfig turns silence or garbage into an error result', async () => {
+	for (const reply of ['', 'not json']) {
+		const e = new EngineController(ENV, '/unused', configSpawn(reply, 1).spawn);
+		const result = await e.runConfig(['show', '--json'], '');
+		assert.equal(result.ok, false);
+		assert.equal(typeof result.error, 'string');
+	}
+});
