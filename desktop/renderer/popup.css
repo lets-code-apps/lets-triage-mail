@@ -89,15 +89,21 @@ body {
 
 .acc-head {
   display: flex;
-  align-items: baseline;
+  align-items: center; /* a long engine sentence wraps; it stays centred on the heading */
   justify-content: space-between;
   gap: var(--s-3);
-  padding: 0 var(--s-4) var(--s-1);
+  padding: 0 var(--s-4) var(--s-3);
   border-bottom: 1px solid var(--line);
 }
 
+.acc-head #connected {
+  min-width: 0;
+  text-align: right;
+}
+
 .acc-head h2 {
-  margin: 0 0 var(--s-2);
+  flex: none;
+  margin: 0;
   font-size: var(--subhead);
   font-weight: 600;
   letter-spacing: -0.01em;
