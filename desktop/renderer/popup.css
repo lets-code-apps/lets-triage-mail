@@ -109,29 +109,11 @@ body {
   list-style: none;
 }
 
-/* The app's engine state, above the footer buttons. */
-.status {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  margin: 0;
-  padding: var(--s-3) var(--s-4) 0;
-  font-size: var(--meta);
-  color: var(--muted);
-}
-
-#statusText {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 footer {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  padding: var(--s-2) var(--s-4) var(--s-4);
+  padding: var(--s-3) var(--s-4) var(--s-4);
 }
 
 .spacer {

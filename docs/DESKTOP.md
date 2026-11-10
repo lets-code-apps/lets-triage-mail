@@ -115,8 +115,8 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, or opening
   the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
   name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
-  Above its buttons a status line shows the app's engine state (running, starting, pausing, paused,
-  failed with the first failure line, or "running outside the app"); main pushes the state to both pages.
+  Its pause/start button behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the
+  new state); there is no separate status line. Main pushes the engine state to both pages.
 - Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
   lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
   hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);

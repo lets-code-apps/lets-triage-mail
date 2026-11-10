@@ -23,8 +23,6 @@ const connectedEl = document.getElementById('connected');
 const accountsEl = document.getElementById('accounts');
 const toggleBtn = document.getElementById('toggle');
 const toggleLabel = document.getElementById('toggleLabel');
-const statusDot = document.getElementById('statusDot');
-const statusText = document.getElementById('statusText');
 
 let engineView = { state: 'stopped', failureTail: [] };
 let startDisabled = false;
@@ -42,19 +40,9 @@ function span(className, text) {
 	return node;
 }
 
-// The app's engine state as the status line: [dot tone, text]. A tone of 'busy' is the pulsing dot.
-const STATUS = {
-	running: ['positive', 'triage running'],
-	starting: ['busy', 'starting…'],
-	stopping: ['busy', 'pausing…'],
-	stopped: ['muted', 'triage paused'],
-	failed: ['danger', 'triage stopped'],
-};
-const DOT_TONES = ['positive', 'danger', 'muted'];
-
-// The footer's one engine button and the status line above it. "pause triage" while the app's
-// engine runs, otherwise "start triage"; busy while starting or stopping; disabled when main says
-// an outside engine is live (a second one would double-watch the mailbox).
+// The footer's one engine button, the same as the window's: "pause triage" while the app's engine
+// runs, otherwise "start triage"; busy while starting or stopping; disabled when main says an
+// outside engine is live (a second one would double-watch the mailbox).
 function renderEngine() {
 	const state = engineView.state;
 	const busy = state === 'starting' || state === 'stopping';
@@ -65,12 +53,7 @@ function renderEngine() {
 	toggleBtn.querySelector('.busy-dot').hidden = !busy;
 	toggleBtn.disabled = busy || (!running && startDisabled);
 
-	const outside = startDisabled && (state === 'stopped' || state === 'failed');
-	const [tone, text] = outside ? ['muted', 'running outside the app'] : (STATUS[state] ?? STATUS.stopped);
-	const tail = state === 'failed' && !outside ? engineView.failureTail ?? [] : [];
-	statusDot.className = tone === 'busy' ? 'busy-dot' : DOT_TONES.includes(tone) ? 'dot ' + tone : 'dot';
-	statusText.textContent = tail.length > 0 ? text + ': ' + tail[0] : text;
-	statusText.title = tail.join('\n'); // the full failure, when the line is cut off
+	toggleBtn.title = !running && startDisabled ? 'Triage is running outside the app.' : '';
 }
 
 // `render` only paints what main already built; the buttons below are the popup's own actions.

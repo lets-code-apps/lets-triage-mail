@@ -218,20 +218,3 @@ button {
     animation: none;
   }
 }
-
-/* A static status dot; the tone classes come from an allow-list in the page script. */
-.dot {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--muted);
-}
-
-.dot.positive {
-  background: var(--positive);
-}
-
-.dot.danger {
-  background: var(--danger);
-}
