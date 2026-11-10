@@ -33,6 +33,10 @@ let statusPayload = null;
 let checkResult = null;
 let selected = null; // account name
 let logOpen = false;
+let checking = null; // { startedAt } while a check runs
+let checkTimer = null;
+let checkedAt = ''; // HH:MM of the last result
+let showResults = true;
 
 const clear = (node) => {
 	while (node.firstChild !== null) node.removeChild(node.firstChild);
@@ -73,6 +77,8 @@ function renderState(view) {
 function renderCheck(result) {
 	if (!result) return;
 	checkResult = result;
+	checkedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+	showResults = true; // a fresh result is shown; hiding it is the user's call
 	renderChecks();
 	show('settings');
 }
@@ -141,21 +147,55 @@ function renderAccounts() {
 }
 
 // The engine row: its state line (with the bounded stderr tail the engine printed before dying)
-// and one button, "pause triage" while the app's engine runs, otherwise "start triage".
+// and one button, "pause triage" while the app's engine runs, otherwise "start triage"; busy
+// while starting or stopping.
 function renderEngine() {
 	if (!engineView) return;
 	const tail = Array.isArray(engineView.failureTail) ? engineView.failureTail : [];
 	const state = 'Engine: ' + String(engineView.state);
 	$('engineNote').textContent = tail.length > 0 ? state + ' — ' + tail.join('\n') : state;
 	const running = engineView.state === 'running';
-	$('toggleLabel').textContent = running ? 'pause triage' : 'start triage';
-	toggleBtn.firstElementChild.hidden = !running; // the pause glyph
+	const busy = engineView.state === 'starting' || engineView.state === 'stopping';
+	$('toggleLabel').textContent = busy ? (engineView.state === 'starting' ? 'starting…' : 'pausing…') : running ? 'pause triage' : 'start triage';
+	toggleBtn.querySelector('use').setAttribute('href', running ? '#i-pause' : '#i-play');
+	toggleBtn.querySelector('.icon').toggleAttribute('hidden', busy); // SVG elements have no .hidden property
+	toggleBtn.querySelector('.busy-dot').hidden = !busy;
 	const idle = engineView.state === 'stopped' || engineView.state === 'failed';
-	toggleBtn.disabled = !running && (!idle || Boolean(accountsView().startDisabled));
+	toggleBtn.disabled = busy || (!running && (!idle || Boolean(accountsView().startDisabled)));
+}
+
+const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+
+// The setup check row: the note, the main button and the results toggle follow one of three
+// states: never run, running (with an elapsed-seconds counter), or done.
+function renderCheckRow() {
+	const note = $('checkNote');
+	const button = $('checkbtn');
+	button.disabled = checking !== null;
+	button.querySelector('.busy-dot').hidden = checking === null;
+	$('resultsbtn').hidden = checking !== null || !checkResult;
+	$('resultsbtn').textContent = showResults ? 'hide results' : 'show results';
+	checksEl.hidden = !showResults;
+	if (checking !== null) {
+		const n = accountsView().accounts.length;
+		const seconds = Math.floor((Date.now() - checking.startedAt) / 1000);
+		$('checkLabel').textContent = 'checking…';
+		note.textContent = 'Checking the model and ' + (n > 0 ? plural(n, 'account') : 'accounts') + '… ' + seconds + ' s';
+	} else if (!checkResult) {
+		$('checkLabel').textContent = 'check setup';
+		note.textContent = 'Validates config, model and accounts.';
+	} else {
+		$('checkLabel').textContent = 'check again';
+		const report = checkResult.report;
+		note.textContent = checkResult.error
+			? 'Check failed'
+			: 'Checked at ' + checkedAt + (report ? ' · ' + plural(report.warnings, 'warning') + ', ' + report.failed + ' failed' : '');
+	}
 }
 
 function renderChecks() {
 	clear(checksEl);
+	renderCheckRow();
 	if (!checkResult) return;
 	if (checkResult.error) {
 		checksEl.append(el('p', '', 'Check failed: ' + String(checkResult.error)));
@@ -228,7 +268,20 @@ toggleBtn.addEventListener('click', () => {
 	});
 });
 $('checkbtn').addEventListener('click', () => {
-	void api.command('check').then(renderCheck);
+	checking = { startedAt: Date.now() };
+	checkTimer = setInterval(renderCheckRow, 1000);
+	renderCheckRow();
+	// Whatever happens, the busy state ends with the answer.
+	const done = (result) => {
+		clearInterval(checkTimer);
+		checking = null;
+		renderCheck(result ?? { error: 'no answer' });
+	};
+	void Promise.resolve(api.command('check')).then(done, (failed) => done({ error: String(failed) }));
+});
+$('resultsbtn').addEventListener('click', () => {
+	showResults = !showResults;
+	renderCheckRow();
 });
 logBtn.addEventListener('click', () => {
 	logOpen = !logOpen;

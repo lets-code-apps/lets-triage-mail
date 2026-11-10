@@ -192,3 +192,46 @@ button {
 .sprite {
   position: absolute;
 }
+
+/* A small pulsing dot for work in progress: fades only, and not at all when motion is reduced. */
+.busy-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: 5px; /* the footprint of an 18px icon */
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes pulse {
+  from {
+    opacity: 0.3;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy-dot {
+    animation: none;
+  }
+}
+
+/* A static status dot; the tone classes come from an allow-list in the page script. */
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dot.positive {
+  background: var(--positive);
+}
+
+.dot.danger {
+  background: var(--danger);
+}

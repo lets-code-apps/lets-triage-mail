@@ -23,8 +23,10 @@ const connectedEl = document.getElementById('connected');
 const accountsEl = document.getElementById('accounts');
 const toggleBtn = document.getElementById('toggle');
 const toggleLabel = document.getElementById('toggleLabel');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
 
-let engineState = 'stopped';
+let engineView = { state: 'stopped', failureTail: [] };
 let startDisabled = false;
 
 const pillClass = (tone) => (TONES.includes(tone) ? 'pill ' + tone : 'pill');
@@ -40,14 +42,35 @@ function span(className, text) {
 	return node;
 }
 
-// The footer's one engine button: "pause triage" while the app's engine runs, otherwise "start
-// triage", disabled while it is changing state or when main says an outside engine is live.
-function renderToggle() {
-	const running = engineState === 'running';
-	toggleLabel.textContent = running ? 'pause triage' : 'start triage';
-	toggleBtn.firstElementChild.hidden = !running; // the pause glyph
-	const idle = engineState === 'stopped' || engineState === 'failed';
-	toggleBtn.disabled = !running && (!idle || startDisabled);
+// The app's engine state as the status line: [dot tone, text]. A tone of 'busy' is the pulsing dot.
+const STATUS = {
+	running: ['positive', 'triage running'],
+	starting: ['busy', 'starting…'],
+	stopping: ['busy', 'pausing…'],
+	stopped: ['muted', 'triage paused'],
+	failed: ['danger', 'triage stopped'],
+};
+const DOT_TONES = ['positive', 'danger', 'muted'];
+
+// The footer's one engine button and the status line above it. "pause triage" while the app's
+// engine runs, otherwise "start triage"; busy while starting or stopping; disabled when main says
+// an outside engine is live (a second one would double-watch the mailbox).
+function renderEngine() {
+	const state = engineView.state;
+	const busy = state === 'starting' || state === 'stopping';
+	const running = state === 'running';
+	toggleLabel.textContent = busy ? (state === 'starting' ? 'starting…' : 'pausing…') : running ? 'pause triage' : 'start triage';
+	toggleBtn.querySelector('use').setAttribute('href', running ? '#i-pause' : '#i-play');
+	toggleBtn.querySelector('.icon').toggleAttribute('hidden', busy); // SVG elements have no .hidden property
+	toggleBtn.querySelector('.busy-dot').hidden = !busy;
+	toggleBtn.disabled = busy || (!running && startDisabled);
+
+	const outside = startDisabled && (state === 'stopped' || state === 'failed');
+	const [tone, text] = outside ? ['muted', 'running outside the app'] : (STATUS[state] ?? STATUS.stopped);
+	const tail = state === 'failed' && !outside ? engineView.failureTail ?? [] : [];
+	statusDot.className = tone === 'busy' ? 'busy-dot' : DOT_TONES.includes(tone) ? 'dot ' + tone : 'dot';
+	statusText.textContent = tail.length > 0 ? text + ': ' + tail[0] : text;
+	statusText.title = tail.join('\n'); // the full failure, when the line is cut off
 }
 
 // `render` only paints what main already built; the buttons below are the popup's own actions.
@@ -74,7 +97,7 @@ function render(payload) {
 	// main already decided whether Start is safe (a fresh status may show an engine this app did
 	// not start); the page only reflects that, it never decides it.
 	startDisabled = Boolean(view.startDisabled);
-	renderToggle();
+	renderEngine();
 
 	// Rebuild the rows: the account list can change (a config edit), and it is short.
 	clear();
@@ -105,8 +128,8 @@ function refresh() {
 
 function renderState(view) {
 	if (!view) return;
-	engineState = view.state;
-	renderToggle();
+	engineView = view;
+	renderEngine();
 }
 
 // Run a command, then repaint: the engine state arrives through onState, the numbers through refresh.
@@ -114,7 +137,7 @@ const run = (command) => () => {
 	void api.command(command).then(refresh);
 };
 
-toggleBtn.addEventListener('click', () => run(engineState === 'running' ? 'stop' : 'start')());
+toggleBtn.addEventListener('click', () => run(engineView.state === 'running' ? 'stop' : 'start')());
 document.getElementById('open').addEventListener('click', run('openWindow'));
 document.getElementById('summary').addEventListener('click', run('openWindow'));
 document.getElementById('settings').addEventListener('click', run('openSettings'));
@@ -123,6 +146,7 @@ document.getElementById('quit').addEventListener('click', () => {
 	void api.command('quit');
 });
 
+renderEngine();
 void api.getState().then(renderState);
 api.onState(renderState);
 

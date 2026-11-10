@@ -128,7 +128,13 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   Settings is one article (the `TriageMailSettings` design): **general** (appearance system/dark/light,
   stored in `userData/settings.json` and applied through `nativeTheme.themeSource`; open at login, kept
   by macOS and read/written with `app.get/setLoginItemSettings`) and **triage** (engine pause/start,
-  setup check, and a log box with the engine's last 500 lines, in memory only). The **notifications**
+  setup check, and a log box with the engine's last 500 lines, in memory only). The window
+  scrolls per pane (the app bar never moves). The pause/start button shows a play or pause glyph (the
+  design set has no play glyph yet) and a pulsing dot while the engine is starting or stopping. A setup
+  check shows "checking…" with an elapsed-seconds counter, then "Checked at HH:MM · N warnings, M
+  failed", a "check again" button and a hide/show toggle for the results (per session). The engine's
+  `check` runs the model probe and every account probe at the same time and still prints and
+  reports them in the fixed order (config, model, accounts), so the report is the same, only sooner. The **notifications**
   group is left out until the engine reports events. Poppins (400/500/600, latin) is bundled in
   `desktop/renderer/fonts/` under the SIL OFL; the CSP therefore also allows `font-src 'self'`.
 - Security defaults, all required, on **both** pages: `contextIsolation: true`, `sandbox: true`,
