@@ -6,7 +6,8 @@
 //! signal handling and the exit code. The task management lives in
 //! [`lets_triage_mail::supervisor`], the mailbox work in [`lets_triage_mail::imap::worker`].
 
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -20,9 +21,51 @@ use tokio_util::sync::CancellationToken;
 /// convention for "killed by Ctrl-C").
 const FORCED_EXIT_CODE: i32 = 130;
 
-/// Watches the accounts until Ctrl-C or SIGTERM.
-pub async fn run(config_path: &Path) -> anyhow::Result<()> {
+/// Exit status when another engine already holds the lock (`EX_TEMPFAIL`). The desktop app reads
+/// it to avoid restarting an engine that would only fail again.
+const ALREADY_RUNNING_EXIT_CODE: i32 = 75;
+
+/// Takes the single-instance lock for `db_path`: an exclusive `flock` on `<db_path>.lock`.
+/// Keep the returned file alive for the whole run. The OS drops the lock when the process
+/// ends, even on a crash or `kill -9`, so there is never a stale lock to clean up.
+fn lock_instance(db_path: &Path) -> anyhow::Result<Result<File, ()>> {
+    let mut lock_path = db_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(dir) = lock_path.parent() {
+        lets_triage_mail::store::create_private_dir(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    let file = File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Ok(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Err(())),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("could not lock {}", lock_path.display()))
+        }
+    }
+}
+
+/// Watches the accounts until Ctrl-C or SIGTERM (or, with `exit_on_stdin_close`, stdin EOF).
+pub async fn run(config_path: &Path, exit_on_stdin_close: bool) -> anyhow::Result<()> {
     let config = super::load_config(config_path)?;
+
+    // Held until `run` returns. Only `run` locks, so `status`, `check` and `digest` keep working.
+    let _instance_lock = match lock_instance(&config.db_path())? {
+        Ok(file) => file,
+        Err(()) => {
+            tracing::error!(
+                "another lets-triage-mail engine is already running for {}",
+                config.db_path().display()
+            );
+            std::process::exit(ALREADY_RUNNING_EXIT_CODE);
+        }
+    };
 
     // Built once and shared by every account worker. `Arc` is a reference-counted pointer:
     // cloning it hands the same decider or store to another task without copying it.
@@ -40,6 +83,9 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     tokio::spawn(watch_for_signals(shutdown.clone()));
+    if exit_on_stdin_close {
+        tokio::spawn(shutdown_on_stdin_eof(shutdown.clone()));
+    }
 
     let report = run_service(
         Arc::new(config),
@@ -133,6 +179,16 @@ fn mode_summary(config: &Config) -> Vec<String> {
     lines
 }
 
+/// Cancels `shutdown` (the graceful path, like a first SIGTERM) once stdin hits end-of-file.
+/// The desktop holds the pipe's write end, so EOF means the app is gone.
+async fn shutdown_on_stdin_eof(shutdown: CancellationToken) {
+    let mut sink = tokio::io::sink();
+    // Any read error also ends the wait: a broken stdin is as good as a closed one.
+    let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut sink).await;
+    tracing::info!("stdin closed: shutting down");
+    shutdown.cancel();
+}
+
 /// Cancels `shutdown` on the first Ctrl-C or SIGTERM, and exits at once on the second.
 pub(super) async fn watch_for_signals(shutdown: CancellationToken) {
     wait_for_signal().await;
@@ -177,6 +233,25 @@ mod tests {
 
     fn account(name: &str, extra: &str) -> String {
         format!("{}{extra}", ACCOUNT.replace("{n}", name))
+    }
+
+    #[test]
+    fn a_second_lock_on_the_same_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let _first = lock_instance(&db).unwrap().expect("first lock is free");
+        assert!(
+            lock_instance(&db).unwrap().is_err(),
+            "second must say already running"
+        );
+    }
+
+    #[test]
+    fn the_lock_is_released_when_the_holder_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        drop(lock_instance(&db).unwrap().unwrap());
+        assert!(lock_instance(&db).unwrap().is_ok());
     }
 
     #[test]

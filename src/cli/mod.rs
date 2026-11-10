@@ -56,7 +56,12 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Watch the accounts, classify new mail, and set and clear flags (per account: live or dry-run)
-    Run,
+    Run {
+        /// Shut down gracefully when stdin reaches end-of-file (set by the desktop app, so the
+        /// engine never outlives it)
+        #[arg(long, hide = true)]
+        exit_on_stdin_close: bool,
+    },
     /// Test the model and each account; show server capabilities and folders
     Check {
         /// Only this account (by name)
@@ -122,7 +127,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config_path();
     tracing::debug!(config = %config_path.display(), "using config file");
     match cli.command {
-        Command::Run => run::run(&config_path).await,
+        Command::Run {
+            exit_on_stdin_close,
+        } => run::run(&config_path, exit_on_stdin_close).await,
         Command::Check { account, json } => {
             check::run(&config_path, account.as_deref(), json).await
         }
