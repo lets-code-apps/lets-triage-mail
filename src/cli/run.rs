@@ -84,7 +84,7 @@ pub async fn run(config_path: &Path, exit_on_stdin_close: bool) -> anyhow::Resul
     let shutdown = CancellationToken::new();
     tokio::spawn(watch_for_signals(shutdown.clone()));
     if exit_on_stdin_close {
-        tokio::spawn(shutdown_on_stdin_eof(shutdown.clone()));
+        shutdown_on_stdin_eof(shutdown.clone());
     }
 
     let report = run_service(
@@ -181,12 +181,16 @@ fn mode_summary(config: &Config) -> Vec<String> {
 
 /// Cancels `shutdown` (the graceful path, like a first SIGTERM) once stdin hits end-of-file.
 /// The desktop holds the pipe's write end, so EOF means the app is gone.
-async fn shutdown_on_stdin_eof(shutdown: CancellationToken) {
-    let mut sink = tokio::io::sink();
-    // Any read error also ends the wait: a broken stdin is as good as a closed one.
-    let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut sink).await;
-    tracing::info!("stdin closed: shutting down");
-    shutdown.cancel();
+///
+/// A plain thread, not a tokio task: a blocking stdin read inside the runtime would keep the
+/// process alive after a SIGTERM shutdown (the runtime waits for blocking tasks on drop).
+fn shutdown_on_stdin_eof(shutdown: CancellationToken) {
+    std::thread::spawn(move || {
+        // Any read error also ends the wait: a broken stdin is as good as a closed one.
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        tracing::info!("stdin closed: shutting down");
+        shutdown.cancel();
+    });
 }
 
 /// Cancels `shutdown` on the first Ctrl-C or SIGTERM, and exits at once on the second.
