@@ -81,6 +81,7 @@ function render(payload) {
 	for (const account of view.accounts) {
 		const row = document.createElement('li');
 		row.className = 'row';
+		row.title = account.note;
 
 		const text = document.createElement('div');
 		text.className = 'text';

@@ -117,6 +117,7 @@ function renderAccounts() {
 		const row = el('button', 'row');
 		row.type = 'button';
 		row.dataset.name = account.name;
+		row.title = account.note;
 		row.setAttribute('aria-pressed', String(account.name === selected));
 		const line = el('div', 'line');
 		line.append(el('span', 'name', account.name), el('span', 'meta', account.mode));

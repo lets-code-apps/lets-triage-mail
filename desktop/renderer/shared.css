@@ -153,7 +153,7 @@ button {
 }
 
 .name {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   font-size: var(--item);
@@ -162,15 +162,24 @@ button {
   white-space: nowrap;
 }
 
+/* The name wins the width: the mode shrinks (and ellipsizes) long before the name does. */
 .line > .meta {
-  flex: none;
-  font-size: var(--label);
-}
-
-.text > .note {
+  flex: 0 100 auto;
+  min-width: 0;
+  margin-left: auto;
   overflow: hidden;
+  font-size: var(--label);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Engine sentences ("Connection timed out. Retrying in 5 s.") get two lines; the row's title
+   attribute carries the full text. */
+.text > .note {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 /* The inline icon sprite: a style attribute would break the CSP, so it is a class. */

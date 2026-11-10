@@ -254,6 +254,11 @@ h2 {
 .checks .msg {
   grid-column: 2;
   overflow-wrap: anywhere;
+  font-size: var(--meta);
+}
+
+.checks .msg.meta {
+  color: var(--muted);
 }
 
 .log {
@@ -267,4 +272,28 @@ h2 {
   font: 12px/1.5 ui-monospace, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Stacked panes: the dividers move from the right edge to the bottom edge. The detail pane drops
+   under the list below about 980px; the nav drops above the list below about 600px and becomes a
+   horizontal row. */
+@media (max-width: 980px) {
+  .list {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 600px) {
+  .nav {
+    display: flex;
+    flex: 1 1 100%;
+    max-width: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .nav button {
+    width: auto;
+  }
 }
