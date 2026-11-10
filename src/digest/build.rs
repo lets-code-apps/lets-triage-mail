@@ -616,6 +616,99 @@ mod tests {
         assert_eq!(digest.total, 0);
     }
 
+    /// Hard rules 2 and 4 of `CLAUDE.md` in one test: email text is hostile, and the digest is
+    /// HTML. Everything from a row is escaped in the HTML part and flattened to one line in the
+    /// text part, and the finished MIME message gains no header of its own.
+    #[test]
+    fn hostile_mail_is_escaped_from_database_row_to_mime() {
+        use crate::digest::render::{Envelope, compose, render};
+
+        let rows = [row(
+            "<b>Eve</b> <eve@x.com>",
+            "<script>alert(1)</script> & \"q\"",
+            Some(TriageFlag::ReplyNeeded),
+            Some(verdict(Category::Personal, "<img src=x onerror=alert(1)>")),
+            1_792_950_000,
+        )];
+        let misfiled = [MisfiledRow {
+            sender: "<script>anna</script>@friend.example".into(),
+            subject: "<b>Lunch?</b>".into(),
+            date: None,
+            created_at: 1_792_950_100,
+        }];
+        let config = Config::default();
+        let digest = build(&DigestInput {
+            account: "work",
+            date: civil::date(2026, 10, 26),
+            period: (1_792_911_600, 1_792_998_000),
+            rows: &rows,
+            misfiled: &misfiled,
+            tz: &TimeZone::UTC,
+            flag_name: &|flag| config.flag_name(flag).to_owned(),
+            flag_colour: &|flag| flag.colour(),
+            derive_flags: None,
+            dry_run: false,
+        });
+
+        let envelope = Envelope {
+            from_name: "Let's Triage Mail",
+            from_address: "lets-triage-mail@localhost",
+            to_address: "me@example.org",
+            message_id: "0123abcd@lets-triage-mail.invalid",
+            date: 1_792_998_000,
+        };
+        let bytes = compose(&render(&digest), &envelope).unwrap();
+        let message = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+
+        // The HTML part carries no markup that came from mail, only the escaped forms.
+        let html = message.body_html(0).unwrap();
+        for forged in ["<script", "<img src=x", "<b>Eve", "<b>Lunch"] {
+            assert!(!html.contains(forged), "{forged} reached the HTML:\n{html}");
+        }
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;q&quot;"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;img src=x onerror=alert(1)&gt;"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;b&gt;Eve&lt;/b&gt; &lt;eve@x.com&gt;"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;anna&lt;/script&gt;@friend.example"),
+            "{html}"
+        );
+
+        // The text part has no markup to escape; `clean_line` put each value on one line.
+        let text = message.body_text(0).unwrap().replace("\r\n", "\n");
+        assert!(text.contains("<b>Eve</b> <eve@x.com>"), "{text}");
+        assert!(text.contains("<script>alert(1)</script> & \"q\""), "{text}");
+        let item = &digest.sections[0].items[0];
+        assert!(
+            !item.sender.contains('\n') && !item.sender.contains('\r'),
+            "{item:?}"
+        );
+        assert_eq!(item.subject, "<script>alert(1)</script> & \"q\"");
+
+        // The message gained no header of its own and no break inside its own headers.
+        let header_values = |name: &str| -> Vec<String> {
+            message
+                .headers()
+                .all(name)
+                .map(|h| String::from_utf8_lossy(h.raw_value()).trim().to_owned())
+                .collect()
+        };
+        for name in ["Subject", "From"] {
+            let values = header_values(name);
+            assert_eq!(values.len(), 1, "{name}");
+            assert!(values[0].lines().count() == 1, "{values:?}");
+        }
+        assert!(header_values("Bcc").is_empty());
+    }
+
     #[test]
     fn misfiled_text_is_cleaned_and_the_list_is_capped() {
         let mut rows = vec![misfiled_row("evil\r\nname@x.example", None, 1_792_911_600)];

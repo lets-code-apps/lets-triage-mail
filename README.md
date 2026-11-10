@@ -5,8 +5,9 @@ Local-first email triage for **any IMAP account**, written in Rust. New mail is 
 Mail sets **Apple Mail flag colours** on the server and writes a **daily digest email** into your
 mailbox.
 
-> **Status: v1 works, not released yet.** It runs every day on its author's own accounts. There
-> are no prebuilt binaries or Homebrew formula yet, so you build it from source (below).
+> **Status: v1 works, not released yet.** It runs every day on its author's own accounts. Prebuilt
+> binaries and a Homebrew tap arrive with the first tagged release; until then, build from source
+> (below).
 
 ## What it does
 
@@ -31,10 +32,45 @@ it (the LaunchAgent, a terminal `run`, or the desktop) so two engines never watc
 
 ## Quickstart
 
-You need macOS or Linux, Rust 1.85 or newer ([rustup.rs](https://rustup.rs)), a local model
-server, and an IMAP account that allows app passwords.
+You need macOS or Linux, a local model server, and an IMAP account that allows app passwords.
+Rust 1.89 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
+route below.
 
 ### 1. Install
+
+Homebrew (Apple silicon macOS, x86_64 Linux), once the first release is published:
+
+```sh
+brew install lets-code-apps/tap/lets-triage-mail
+```
+
+Prebuilt binary for the same two platforms: download `lets-triage-mail-aarch64-apple-darwin.tar.xz`
+or `lets-triage-mail-x86_64-unknown-linux-gnu.tar.xz` from the [releases page](https://github.com/lets-code-apps/lets-triage-mail/releases). Each one unpacks into a folder named after the
+platform; the snippet below installs the binary into `~/.local/bin` (which may not exist yet, so
+it creates it) and puts that directory on your `PATH` — copy the `export` line into `~/.zshrc`
+(or the startup file of your shell) as well, so new terminals find it too; `chmod +x` the
+binary if it is not executable already:
+
+```sh
+tar -xJf lets-triage-mail-aarch64-apple-darwin.tar.xz
+mkdir -p ~/.local/bin
+mv lets-triage-mail-aarch64-apple-darwin/lets-triage-mail ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"   # also add this line to ~/.zshrc
+```
+
+Only these two platforms are built: an Intel Mac has no binary, so use `cargo install`. The Linux
+binary links the system glibc, so it needs glibc 2.35 or newer (it is built on Ubuntu 22.04). The
+binary is unsigned, so a binary you downloaded with a browser may need
+`xattr -d com.apple.quarantine ~/.local/bin/lets-triage-mail` (run it on the moved path, not
+the downloaded folder) before it runs; a `curl` download is not quarantined.
+
+From source (works anywhere, including an Intel Mac):
+
+```sh
+cargo install --git https://github.com/lets-code-apps/lets-triage-mail
+```
+
+To work on the code, clone it and install from the checkout instead:
 
 ```sh
 git clone https://github.com/lets-code-apps/lets-triage-mail
@@ -42,7 +78,7 @@ cd lets-triage-mail
 cargo install --path .
 ```
 
-This puts `lets-triage-mail` in `~/.cargo/bin`.
+Either way this puts `lets-triage-mail` in `~/.cargo/bin`.
 
 ### 2. Start a model
 
@@ -139,7 +175,9 @@ In Mail on the Mac you can rename the flags in the sidebar (expand Flagged), so 
 
 A LaunchAgent starts the service at login and restarts it after a crash. It runs as you, so the
 login Keychain works for `password_command`. It assumes the binary is in `~/.cargo/bin`;
-otherwise edit the path in the plist.
+otherwise edit the path in the plist. Installed with Homebrew the binary is
+`/opt/homebrew/bin/lets-triage-mail` (check with `which lets-triage-mail`), which is the path to
+edit in that case.
 
 ```sh
 L=io.github.lets-code-apps.lets-triage-mail
@@ -214,6 +252,15 @@ with the output of `lets-triage-mail check --account NAME`.
 | Dovecot | password | yes | yes | the integration tests run against it |
 | iCloud, Fastmail | app password | should work (keywords allowed) | should work | not tried yet |
 | Outlook.com, Microsoft 365 | OAuth only | no | no | no IMAP password login; not supported |
+
+## Privacy
+
+The text of your mail is sent to exactly one place: the model server in `[llm] base_url`. By
+default only local or LAN addresses are accepted — loopback (`127.0.0.1`), a private-network
+IP (`10.x`, `172.16-31.x`, `192.168.x`), or a `.local`, `.lan` or `.home.arpa` name — and any
+other address is refused at start-up. Setting `allow_remote = true` in `[llm]` is an explicit
+opt-in: it accepts a non-local endpoint and your mail text is then sent to that host. Nothing
+else leaves your machines; see [SECURITY.md](SECURITY.md) for the full threat model.
 
 ## Docs
 

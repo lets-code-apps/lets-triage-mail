@@ -153,7 +153,8 @@ function renderEngine() {
 	if (!engineView) return;
 	const tail = Array.isArray(engineView.failureTail) ? engineView.failureTail : [];
 	const state = 'Engine: ' + String(engineView.state);
-	$('engineNote').textContent = tail.length > 0 ? state + ' — ' + tail.join('\n') : state;
+	const retry = engineView.restartInSeconds == null ? '' : '\nrestarting in ' + engineView.restartInSeconds + ' s…';
+	$('engineNote').textContent = (tail.length > 0 ? state + ' — ' + tail.join('\n') : state) + retry;
 	const running = engineView.state === 'running';
 	const busy = engineView.state === 'starting' || engineView.state === 'stopping';
 	$('toggleLabel').textContent = busy ? (engineView.state === 'starting' ? 'starting…' : 'pausing…') : running ? 'pause triage' : 'start triage';

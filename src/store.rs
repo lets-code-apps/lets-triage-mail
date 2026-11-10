@@ -1328,7 +1328,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     // `recursive` creates missing parents too; existing directories are left untouched.
     std::fs::DirBuilder::new()
@@ -1338,7 +1338,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -1822,6 +1822,58 @@ mod tests {
         assert_eq!(subject.chars().count(), MAX_SUBJECT_CHARS);
         assert_eq!(category_from_str(&category).unwrap(), Category::Personal);
         assert_eq!(flag, "reply_needed");
+        let columns: Vec<String> = s
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('processed')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|c| c.contains("body")));
+    }
+
+    /// Hard rule: message bodies are never stored. The earlier review checked the `processed`
+    /// table only; this checks every table the schema can create, because a later phase adds
+    /// tables and the rule applies to them too.
+    #[test]
+    fn no_table_has_a_body_column() {
+        let s = store();
+        let tables: Vec<String> = s
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        // The guard is only worth having if it actually saw the service's own tables.
+        assert!(tables.len() >= 11, "tables seen: {tables:?}");
+
+        for table in tables {
+            let columns: Vec<String> = s
+                .conn
+                .prepare("SELECT name FROM pragma_table_info(?)")
+                .unwrap()
+                .query_map([table.as_str()], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(!columns.is_empty(), "{table} has no columns?");
+            for column in columns {
+                for forbidden in ["body", "html", "raw", "eml", "snippet", "content", "text"] {
+                    assert!(
+                        !column.contains(forbidden),
+                        "{table}.{column} sounds like stored message text",
+                    );
+                }
+            }
+        }
+
+        // The original check on `processed`, kept as is.
         let columns: Vec<String> = s
             .conn
             .prepare("SELECT name FROM pragma_table_info('processed')")

@@ -81,9 +81,8 @@ const clockOptions = () => ({
 });
 
 // Whether the live engine is the one this app spawned. A fresh `status` that reports `running`
-// while this is false means something else started it (a launchd agent or a terminal). There is no
-// single-instance lock yet, so the popup must not offer to start a second watcher over the same
-// mailbox; the real fix is increment 2 (docs/DESKTOP.md, risk "No single-instance lock yet").
+// while this is false means something else started it (a launchd agent or a terminal). The engine's
+// own lock would refuse a second watcher anyway; this guard just keeps the popup from offering one.
 const appOwnsEngine = (): boolean => {
 	const state = engine.getState().state;
 	return state === 'running' || state === 'starting';
@@ -279,7 +278,11 @@ app.on('before-quit', (event) => {
 	if (quitInFlight) return; // a second quit request while stopping is ignored
 	quitInFlight = true;
 	event.preventDefault(); // halt here; quit for real once the engine is down
-	void engine.stop().then(() => app.quit());
+	void engine.stop().then(() => {
+		app.quit();
+		// Safety net: if Electron swallows the re-entrant quit (seen with SIGTERM), still exit 0.
+		setTimeout(() => app.exit(0), 3000).unref();
+	});
 });
 
 if (!app.requestSingleInstanceLock()) {
@@ -324,7 +327,11 @@ function boot(): void {
 	app.dock?.hide(); // menu-bar companion: no dock icon until a window is shown
 	app.on('window-all-closed', () => ctl.handleWindowAllClosed());
 
+	// On by default ("closing the window leaves triage running"); performStart skips it when an
+	// engine the app did not spawn is already live. LTM_AUTOSTART=0 is the dev escape hatch;
+	// =1 starts without that check (the smoke test's fake engine reports a running one).
 	if (process.env.LTM_AUTOSTART === '1') engine.start();
+	else if (process.env.LTM_AUTOSTART !== '0') void performStart();
 
 	ipcMain.handle(CHANNEL.getState, (event) => (fromUs(event.senderFrame) ? engine.getState() : null));
 	ipcMain.handle(CHANNEL.getSettings, (event) => (fromUs(event.senderFrame) ? settingsPayload() : null));
@@ -407,7 +414,7 @@ function runSmoke(): void {
 		clearTimeout(deadline);
 		console.error(`SMOKE FAIL: ${message}`);
 		app.exit(1);
-		throw new Error(message);
+		process.exit(1); // typed `never`; never throw here, an uncaught error pops a modal dialog
 	};
 
 	// 1. The engine (autostart on) must be running.

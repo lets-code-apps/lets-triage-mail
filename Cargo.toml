@@ -2,7 +2,7 @@
 name = "lets-triage-mail"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Local-first email triage for any IMAP account, powered by a local LLM"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lets-code-apps/lets-triage-mail"
@@ -45,3 +45,8 @@ tempfile = "3.27.0"
 # `test-util` adds a pausable clock, so tests of long delays take no real time.
 tokio = { version = "1.54.1", features = ["test-util"] }
 wiremock = "0.6.5"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

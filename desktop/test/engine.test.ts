@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { EngineController, type EngineProcess } from '../src/engine.ts';
+import { EngineController, backoffMs, type Clock, type EngineProcess } from '../src/engine.ts';
 
 // The engine is driven with a fake child so no real process, signal or timer is involved: `spawn`
 // and the stop timeout are injected. This mirrors how the Rust supervisor tests inject a closure.
@@ -129,7 +129,7 @@ test('the ring buffer keeps the last 500 log lines', () => {
 	assert.equal(e.logCount(), 500);
 });
 
-test('an unexpected exit code moves the engine to failed, with no restart', () => {
+test('an unexpected exit code moves the engine to failed, and a restart is scheduled', () => {
 	const s = makeSpawn();
 	const e = controller(s);
 	e.start();
@@ -138,7 +138,7 @@ test('an unexpected exit code moves the engine to failed, with no restart', () =
 	c.child.emit('exit', 1, null);
 	assert.equal(e.getState().state, 'failed');
 	assert.equal(e.getState().exitCode, 1);
-	assert.equal(s.state.long.length, 1);
+	assert.equal(s.state.long.length, 1); // the restart waits for the timer
 });
 
 test('failed carries the last stderr lines; a fresh start clears the tail', () => {
@@ -293,4 +293,123 @@ test('the next poll starts a fresh spawn once the previous one settled', async (
 	await e.status();
 	await e.status();
 	assert.equal(s.state.statusSpawns, 2);
+});
+
+// --- restart policy: a hand-driven clock, so nothing waits ---------------------------------
+
+function makeClock() {
+	const timers = new Map<number, { fn: () => void; ms: number }>();
+	let next = 1;
+	const clock = {
+		time: 0,
+		delays: [] as number[],
+		now: () => clock.time,
+		setTimeout: (fn: () => void, ms: number) => {
+			clock.delays.push(ms);
+			timers.set(next, { fn, ms });
+			return next++;
+		},
+		clearTimeout: (h: unknown) => void timers.delete(h as number),
+		pending: () => timers.size,
+		fire: () => {
+			const [id, t] = [...timers][0];
+			timers.delete(id);
+			t.fn();
+		},
+	};
+	return clock satisfies Clock & Record<string, unknown>;
+}
+
+const withClock = (s: ReturnType<typeof makeSpawn>, clock: Clock) =>
+	new EngineController(ENV, '/unused', s.spawn, 5, 5, undefined, clock);
+
+// Crash the newest engine process, then run the restart timer if one is pending.
+const crash = (s: ReturnType<typeof makeSpawn>, code = 1) => s.state.long[s.state.long.length - 1].child.emit('exit', code, null);
+
+test('backoff doubles from 1 s and is capped at 60 s', () => {
+	assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(backoffMs), [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+});
+
+test('a crash schedules restarts at 1, 2, 4, 8, 16 s, then gives up after 5', () => {
+	const s = makeSpawn();
+	const clock = makeClock();
+	const e = withClock(s, clock);
+	e.start();
+	for (let i = 0; i < 5; i += 1) {
+		crash(s);
+		assert.equal(e.getState().state, 'failed');
+		assert.equal(e.getState().restartInSeconds, [1, 2, 4, 8, 16][i]);
+		clock.fire();
+		assert.equal(e.getState().state, 'starting');
+	}
+	crash(s); // the 6th failure: out of restarts
+	assert.equal(clock.pending(), 0);
+	assert.equal(e.getState().state, 'failed');
+	assert.equal(e.getState().restartInSeconds, null);
+	assert.deepEqual(clock.delays, [1000, 2000, 4000, 8000, 16000]);
+	assert.equal(s.state.long.length, 6);
+});
+
+test('a run that stayed up 10 minutes resets the backoff', () => {
+	const s = makeSpawn();
+	const clock = makeClock();
+	const e = withClock(s, clock);
+	e.start();
+	crash(s);
+	clock.fire(); // restart 1
+	clock.time += 10 * 60_000;
+	crash(s);
+	assert.deepEqual(clock.delays, [1000, 1000]);
+});
+
+test('the already-running exit code is not restarted and says so', () => {
+	const s = makeSpawn();
+	const clock = makeClock();
+	const e = withClock(s, clock);
+	e.start();
+	crash(s, 75);
+	assert.equal(clock.pending(), 0);
+	assert.equal(e.getState().state, 'failed');
+	assert.match(e.getState().failureTail[0], /already running/);
+});
+
+test('stop cancels a pending restart; start by hand also does', async () => {
+	const s = makeSpawn();
+	const clock = makeClock();
+	const e = withClock(s, clock);
+	e.start();
+	crash(s);
+	assert.equal(clock.pending(), 1);
+	await e.stop(); // also what quit calls
+	assert.equal(clock.pending(), 0);
+	assert.equal(e.getState().state, 'stopped');
+	crash(s);
+	e.start();
+	crash(s);
+	assert.equal(clock.pending(), 1);
+	e.start(); // user start while a restart waits: the old timer goes
+	assert.equal(clock.pending(), 0);
+	assert.equal(s.state.long.length, 3);
+});
+
+test('a stop-requested exit is never restarted', async () => {
+	const s = makeSpawn();
+	const clock = makeClock();
+	const e = withClock(s, clock);
+	e.start();
+	s.state.long[0].child.emit('spawn');
+	await e.stop();
+	assert.equal(clock.pending(), 0);
+});
+
+test('the engine is spawned with --exit-on-stdin-close and a stdin pipe', () => {
+	const calls: { args: readonly string[]; stdio: unknown }[] = [];
+	const s = makeSpawn();
+	const spy = (f: string, args: readonly string[], o?: { stdio?: unknown }) => {
+		calls.push({ args, stdio: o?.stdio });
+		return s.spawn(f, args, o);
+	};
+	new EngineController(ENV, '/unused', spy).start();
+	assert.deepEqual(calls[0].args.slice(-2), ['run', '--exit-on-stdin-close']);
+	assert.deepEqual(calls[0].stdio, ['pipe', 'pipe', 'pipe']);
 });
