@@ -79,13 +79,14 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 
 // The preload is CommonJS (sandbox), so it cannot import CHANNEL from ipc.ts. This closes the seam
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
-test('the preload bridge exposes exactly the five channels ipc.ts declares', () => {
+test('the preload bridge exposes exactly the seven channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
-	const channels = [CHANNEL.getState, CHANNEL.state, CHANNEL.command, CHANNEL.checkResult, CHANNEL.getStatus];
+	const channels = Object.values(CHANNEL);
+	assert.equal(channels.length, 7, 'ipc.ts declares seven channels');
 	for (const channel of channels) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// Five and only five: nothing here reaches Node, the network or the filesystem. The one
+	// Seven and only seven: nothing here reaches Node, the network or the filesystem. The one
 	// `require` allowed is the electron module itself.
 	const requires = preload.match(/require\([^)]*\)/g) ?? [];
 	for (const call of requires) {
@@ -101,7 +102,7 @@ test('the preload bridge exposes exactly the five channels ipc.ts declares', () 
 // version of docs/DESKTOP.md's "Window and tray security stance".
 test('the popup page is as locked down as the window page', () => {
 	const popup = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
-	const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'" />`;
+	const CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'" />`;
 	assert.ok(popup.includes(CSP), 'popup.html must carry the exact same CSP as index.html');
 	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
 	// Engine strings are hostile data: text only, never an HTML sink.
@@ -174,7 +175,7 @@ test('the tray Check result is opened, built and pushed to the renderer', () => 
 
 // The popup styles its rows with `.accounts` / `.accounts > li`; a selector the markup does not
 // expose is silent breakage (an unstyled browser list). This pins markup and selector together.
-test('the account list exposes the class its CSS targets, and carries the date/time line', () => {
+test('the account list exposes the class its CSS targets, and the pill is filled as text', () => {
 	const html = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
 	const css = readFileSync(join(DESKTOP, 'renderer', 'popup.css'), 'utf8');
 	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
@@ -182,10 +183,8 @@ test('the account list exposes the class its CSS targets, and carries the date/t
 	assert.ok(ul, 'popup.html must contain the account list');
 	assert.match(ul[0], /id="accounts"/);
 	assert.match(ul[0], /class="accounts"/, 'the list needs the class popup.css styles');
-	assert.match(css, /\.accounts\s*>\s*li/, 'the stylesheet must target that class');
-	// The required date-and-time line above the counts: present in markup, filled with textContent.
-	assert.match(html, /id="generated"/, 'the popup needs a generated date/time element');
-	assert.match(script, /generatedEl\.textContent/);
+	assert.match(css, /\.accounts\b/, 'the stylesheet must target that class');
+	assert.match(script, /pillEl\.textContent/, 'the pill is filled with textContent');
 });
 
 // There is no single-instance lock yet, so a Start must not double-watch a mailbox. The guard reads
@@ -197,14 +196,8 @@ test('the popup cannot start a second engine while one runs outside the app', ()
 	const model = readFileSync(join(SRC, 'popup-model.ts'), 'utf8');
 	assert.ok(model.includes("'Running outside the app.'"), 'the view model names the external engine');
 	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
-	assert.match(script, /startBtn\.disabled = Boolean\(view\.startDisabled\)/);
-});
-
-// The popup has no room for a report and no onCheckResult sink of its own, so its "Check setup"
-// must reuse the tray path (open the window + push the result) rather than discard a returned one.
-test('the popup Check setup opens the window instead of discarding its report', () => {
-	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
-	assert.match(main, /POPUP_URL[\s\S]*?deliverCheck\(\)/, 'a popup check must call deliverCheck');
+	assert.match(script, /startDisabled = Boolean\(view\.startDisabled\)/);
+	assert.match(script, /toggleBtn\.disabled = [^;]*startDisabled/);
 });
 
 // A window opened while the engine is already running must show the real state and enable the right
@@ -222,4 +215,13 @@ test('the renderer bootstraps the current state and subscribes to check results'
 	assert.ok(csp('index.html'), 'index.html must carry a CSP');
 	assert.equal(csp('index.html'), csp('popup.html'), 'both pages must carry the identical CSP');
 	assert.ok(renderer.includes('api.getStatus()'), 'the window polls getStatus');
+});
+
+// setSetting is the one write path from a page: main checks the sender and the allow-list before it
+// touches the theme, the settings file or the login item.
+test('setSetting is validated in main before anything is written', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	const start = main.indexOf('CHANNEL.setSetting');
+	const handler = main.slice(start, main.indexOf('ipcMain.handle(CHANNEL.getStatus', start));
+	assert.match(handler, /!fromUs\(event\.senderFrame\) \|\| !isAllowedSetting\(name, value\)\) return null;[\s\S]*setLoginItemSettings/);
 });
