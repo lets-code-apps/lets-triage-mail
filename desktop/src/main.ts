@@ -7,7 +7,8 @@
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, ipcMain, screen } from 'electron';
+import { app, BrowserWindow, Menu, Tray, ipcMain, nativeTheme, screen, systemPreferences } from 'electron';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,6 +18,7 @@ import { buildPopupView } from './popup-model.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
+import { DEFAULT_SETTINGS, isAllowedSetting, parseSettings, type Settings } from './settings.ts';
 import {
 	CHANNEL,
 	IDLE_PAYLOAD,
@@ -24,6 +26,7 @@ import {
 	statusPayload,
 	type CommandResult,
 	type EngineCommand,
+	type SettingsPayload,
 	type StatusPayload,
 } from './ipc.ts';
 
@@ -45,6 +48,25 @@ const ctl = new WindowController(() => makeWindow(), {
 });
 let tray: Tray | undefined;
 let quitInFlight = false;
+
+// The app's own settings (appearance only): one small JSON file in userData. `nativeTheme` makes
+// both pages follow it through prefers-color-scheme. Login-item state is macOS's, not ours.
+let settings: Settings = DEFAULT_SETTINGS;
+let settingsFile = '';
+// One-shot: the popup's settings button asks the window to open on settings; the window page picks
+// this up through getSettings (on focus) and main clears it.
+let pendingSection: 'settings' | null = null;
+
+function settingsPayload(): SettingsPayload {
+	const section = pendingSection;
+	pendingSection = null;
+	return {
+		appearance: settings.appearance,
+		openAtLogin: app.getLoginItemSettings().openAtLogin,
+		log: engine.getLog(),
+		section,
+	};
+}
 
 // Only messages from our own two pages are trusted; anything else is refused. The popup is the
 // second URL: `getStatus` and `command` both come from here or not at all.
@@ -69,8 +91,14 @@ const appOwnsEngine = (): boolean => {
 
 function makeWindow(): BrowserWindow {
 	const browser = new BrowserWindow({
-		width: 640,
-		height: 480,
+		width: 1100,
+		height: 760,
+		// nav 200 + list 420 + detail 420: the panes never stack, the window just stops shrinking.
+		minWidth: 1040,
+		minHeight: 640,
+		// The macOS buttons are ~14 px tall; centred in the 64 px app bar that is y = (64 - 14) / 2 = 25.
+		trafficLightPosition: { x: 20, y: 25 },
+		titleBarStyle: 'hiddenInset',
 		webPreferences: { preload: join(HERE, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false },
 	});
 	browser.webContents.on('will-navigate', (event: { preventDefault(): void }) => event.preventDefault());
@@ -93,6 +121,8 @@ function makePopupWindow(): BrowserWindow {
 		width: POPUP_WIDTH,
 		height: POPUP_FALLBACK_HEIGHT,
 		frame: false,
+		// Transparent so the card's rounded corners are not squared off by a window background.
+		transparent: true,
 		resizable: false,
 		movable: false,
 		show: false,
@@ -124,6 +154,7 @@ const asPopupHandle = (browser: BrowserWindow): PopupHandle => ({
 	show: () => browser.show(),
 	hide: () => browser.hide(),
 	setBounds: (bounds) => browser.setBounds(bounds),
+	focus: () => browser.focus(),
 	followCurrentSpace: () => {
 		if (browser.isVisibleOnAllWorkspaces()) return; // already claimed: claiming twice costs a flicker
 		browser.setVisibleOnAllWorkspaces(true);
@@ -208,6 +239,10 @@ function runAction(action: EngineCommand): void {
 		case 'openWindow':
 			ctl.open();
 			break;
+		case 'openSettings':
+			pendingSection = 'settings';
+			ctl.open();
+			break;
 		case 'quit':
 			app.quit();
 			break;
@@ -257,14 +292,33 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function boot(): void {
+	settingsFile = join(app.getPath('userData'), 'settings.json');
+	try {
+		settings = parseSettings(readFileSync(settingsFile, 'utf8'));
+	} catch {
+		// no file yet: defaults
+	}
+	nativeTheme.themeSource = settings.appearance;
 	tray = makeTray();
 	// Left-click toggles the popup; right-click shows the native menu. No persistent context
 	// menu, so the menu bar shows only the template glyph.
 	tray.on('click', () => popupCtl.trayClick(Date.now()));
-	tray.on('right-click', () => tray?.popUpContextMenu(trayMenu()));
+	tray.on('right-click', () => {
+		popupCtl.close(); // no grace period: the menu must not open on top of a lingering popup
+		tray?.popUpContextMenu(trayMenu());
+	});
+	// Our app stopped being the active one (a click on another app or the desktop): close like a menu.
+	app.on('did-resign-active', () => popupCtl.handleBlur());
+	// Another menu-bar item opened its menu (the clock, Wi-Fi, another app's tray menu). Those clicks
+	// don't activate their app, so neither blur nor did-resign-active fires; macOS broadcasts this
+	// distributed notification whenever any menu starts tracking, which is how native menus close
+	// each other. Items that open a popover window instead of a menu may still not send it.
+	systemPreferences.subscribeNotification('com.apple.HIToolbox.beginMenuTrackingNotification', () => popupCtl.handleBlur());
 	void engine.readVersion().then(() => {
+		// Both pages show the engine state (the popup's pause/start button and status line).
 		engine.onState((view) => {
 			currentWindow?.webContents.send(CHANNEL.state, view);
+			popupWindow?.webContents.send(CHANNEL.state, view);
 		});
 	});
 	app.dock?.hide(); // menu-bar companion: no dock icon until a window is shown
@@ -273,10 +327,29 @@ function boot(): void {
 	if (process.env.LTM_AUTOSTART === '1') engine.start();
 
 	ipcMain.handle(CHANNEL.getState, (event) => (fromUs(event.senderFrame) ? engine.getState() : null));
-	// The popup's poll. A hidden popup gets `idle` instead of an engine spawn: polling stops with
-	// the window rather than with a timer, and an invisible page never touches the database.
+	ipcMain.handle(CHANNEL.getSettings, (event) => (fromUs(event.senderFrame) ? settingsPayload() : null));
+	// Validated at the trust boundary: our own page, a known name, a value from the allow-list.
+	ipcMain.handle(CHANNEL.setSetting, (event, name: unknown, value: unknown) => {
+		if (!fromUs(event.senderFrame) || !isAllowedSetting(name, value)) return null;
+		if (name === 'openAtLogin') app.setLoginItemSettings({ openAtLogin: value as boolean });
+		else {
+			settings = { appearance: value as Settings['appearance'] };
+			nativeTheme.themeSource = settings.appearance;
+			try {
+				writeFileSync(settingsFile, JSON.stringify(settings));
+			} catch {
+				// not persisted this time; the choice still applies until quit
+			}
+		}
+		return settingsPayload();
+	});
+	// The popup's and the window's poll. A hidden page gets `idle` instead of an engine spawn:
+	// polling stops with the surface rather than with a timer, and an invisible page never touches
+	// the database. Each page is gated on its own surface being visible.
 	ipcMain.handle(CHANNEL.getStatus, async (event): Promise<StatusPayload> => {
-		if (!fromUs(event.senderFrame) || !popupCtl.isVisible()) return IDLE_PAYLOAD;
+		if (!fromUs(event.senderFrame)) return IDLE_PAYLOAD;
+		const fromPopup = event.senderFrame?.url === POPUP_URL;
+		if (!(fromPopup ? popupCtl.isVisible() : currentWindow?.isVisible())) return IDLE_PAYLOAD;
 		const result = await engine.status();
 		// Build the reply through `statusPayload` whether the engine returned a report or an error,
 		// so the typed handler can neither drop the view nor forget the error. Both are then re-measured
@@ -293,7 +366,7 @@ function boot(): void {
 		// Ask for a re-measure, deferred with `setImmediate` so this handler's return value reaches
 		// the page first; the two-frame wait inside POPUP_MEASURE then covers the paint. The page
 		// polls every 5 s while visible, so a missed measurement self-corrects within one poll.
-		setImmediate(() => void fitPopup());
+		if (fromPopup) setImmediate(() => void fitPopup());
 		return payload;
 	});
 	ipcMain.handle(CHANNEL.command, async (event, command: EngineCommand) => {
@@ -302,19 +375,18 @@ function boot(): void {
 		}
 		if (command === 'start') await performStart();
 		else if (command === 'stop') await engine.stop();
-		else if (command === 'openWindow') ctl.open();
+		else if (command === 'openWindow') {
+			popupCtl.close();
+			ctl.open();
+		} else if (command === 'openSettings') {
+			popupCtl.close();
+			runAction('openSettings');
+		}
 		else if (command === 'quit') {
 			// The popup's Quit button: the same path as the tray item and Cmd+Q.
 			app.quit();
 			return { command, view: engine.getState() } satisfies CommandResult;
 		} else if (command === 'check') {
-			// The popup has no room for a full report and no `onCheckResult` sink of its own, so
-			// its "Check setup" reuses the tray path: open the main window and push the finished
-			// check there through `deliverCheck`. Only the window page keeps the report inline.
-			if (event.senderFrame?.url === POPUP_URL) {
-				await deliverCheck();
-				return { command, view: engine.getState() } satisfies CommandResult;
-			}
 			const result = await engine.runCheck();
 			return checkPayload(command, engine.getState(), result) satisfies CommandResult;
 		}

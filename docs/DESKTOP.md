@@ -15,7 +15,7 @@ Cargo.toml            # the Rust crate (root). `exclude = ["desktop/"]` keeps th
 src/**                # the engine and CLI. Does not know the desktop exists.
 desktop/              # the Electron app: its own package.json, no Cargo involvement.
   src/                # main process + controllers (TypeScript, ESM)
-  renderer/           # two pages, no framework, no remote resources: the window and the popup
+  renderer/           # two pages, no framework, no remote resources: the window (app shell) and the popup
   assets/             # the menu-bar template icon (18 px + 36 px @2x)
   test/               # node --test unit tests + synthetic fixtures
 docs/DESKTOP.md       # this file
@@ -107,18 +107,44 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   centred under the glyph and clamped inside that display's work area — it opens on the display whose
   icon was clicked. It hides on blur, like a native menu. The user cannot resize or move it: no dock
   handling, and its strings are built in the **main** process (`desktop/src/popup-model.ts`), so the
-  page never formats or colours anything itself.
-- Window: one `BrowserWindow`, default native title bar (the `hiddenInset` treatment comes with the
-  design import, since design decisions stay with the board). Created on first open, then hidden/shown,
-  never destroyed. Content is a static placeholder: engine state, the `check` result list, and
-  Start/Stop/Check buttons, all through a tiny preload API. It is **not** the accounts/folders/settings
-  screens.
+  page never formats or colours anything itself. It is the design's tray card: lockup and "open app",
+  a summary box (count, pill, `N fyi · M done · since HH:MM`) that opens the window, the account rows,
+  and a footer with pause/start triage, a settings button (opens the window on settings) and quit. The
+  window is transparent so the card's rounded corners show. There is no tray highlight while it is open: Electron has no
+  API for macOS's native one (macOS shows it only while the mouse is down), and a hand-drawn one never
+  matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, another menu-bar
+  item opening its menu (`com.apple.HIToolbox.beginMenuTrackingNotification`), or opening the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
+  name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
+  Its pause/start button behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the
+  new state); there is no separate status line. Main pushes the engine state to both pages.
+- Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
+  lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
+  hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
+  the panes never stack, the window just has a minimum size. Two sections: accounts (rows from the same status
+  view as the popup, plus the selected account's detail) and settings (engine state, Start/Stop/Check
+  buttons, the setup check report). It only shows what the engine reports: no config writing, no
+  add-account form, no folders screen. It polls `getStatus` every 5 s while visible; main answers
+  `idle` while the window is hidden. A tray "Check setup" switches it to settings.
+  Settings is one article (the `TriageMailSettings` design): **general** (appearance system/dark/light,
+  stored in `userData/settings.json` and applied through `nativeTheme.themeSource`; open at login, kept
+  by macOS and read/written with `app.get/setLoginItemSettings`) and **triage** (engine pause/start,
+  setup check, and a log box with the engine's last 500 lines, in memory only). The window
+  scrolls per pane (the app bar never moves). The pause/start button shows a play or pause glyph (the
+  design set has no play glyph yet) and a pulsing dot while the engine is starting or stopping. A setup
+  check shows "checking…" with an elapsed-seconds counter, then "Checked at HH:MM · N warnings, M
+  failed", a "check again" button and a hide/show toggle for the results (per session). The engine's
+  `check` runs the model probe and every account probe at the same time and still prints and
+  reports them in the fixed order (config, model, accounts), so the report is the same, only sooner. The **notifications**
+  group is left out until the engine reports events. Poppins (400/500/600, latin) is bundled in
+  `desktop/renderer/fonts/` under the SIL OFL; the CSP therefore also allows `font-src 'self'`.
 - Security defaults, all required, on **both** pages: `contextIsolation: true`, `sandbox: true`,
-  `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'`, `will-navigate`
+  `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
   two files** (the window page and the popup page), and the preload (see `desktop/src/preload.cjs`)
-  exposes five functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
-  `command(start|stop|check|openWindow|quit)`). A `getStatus` call from a hidden popup is answered
+  exposes seven functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
+  `command(start|stop|check|openWindow|openSettings|quit)`, `getSettings`, `setSetting`). `setSetting`
+  is checked in main: our page, a known name (`appearance`, `openAtLogin`) and an allow-listed value.
+  `openSettings` sets a one-shot flag that `getSettings` hands to the window on its next focus. A `getStatus` call from a hidden popup is answered
   `idle`: an invisible page never spawns the engine. The renderer and the popup write engine text with
   `textContent`, never `innerHTML` (check messages carry server and folder names, and the popup shows
   config account names), and a pill's colour class can only be one of four allow-listed names.
@@ -163,12 +189,12 @@ Keeping these three apart is the point: it stops this document from reading like
 - The menu-bar **popup**: left-click opens it on the clicked display and on the macOS desktop (Space)
   the user is looking at, centred under the glyph and sized to its content (the main process measures
   the page), a blur closes it, and its content is
-  `status --json` turned into ready-to-print strings in the main process (a generated date/time line
-  above the counts, the big "to look at" number, `N fyi · M done · since HH:MM`, `X of Y connected`,
-  one row per account with a state pill). Its **Start** is disabled, with the note "Running outside the
+  `status --json` turned into ready-to-print strings in the main process (the big "to look at" number
+  with a "needs reply" / "all clear" / "not running" pill, `N fyi · M done · since HH:MM`, `X of Y
+  connected`, one row per account with initials and a state pill). Its **Start** is disabled, with the note "Running outside the
   app", when a fresh `status` shows a live engine the app did not start (there is no single-instance
-  lock yet); its **Check setup** opens the main window and pushes the report there through the same
-  path the tray uses, rather than discarding it.
+  lock yet). Setup check lives in the window's settings, and a tray "Check setup" opens it there.
+- The window's **settings screen**: appearance, open at login, engine pause/start, setup check, log.
 - Engine status for the UI: `status --json` (shape locked by a Rust test), fed by two SQLite tables the
   engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
 - A single window that hides on close and reopens by reuse (never destroyed); the dock hides when no
@@ -183,7 +209,7 @@ Keeping these three apart is the point: it stops this document from reading like
 - Accounts list and "add account" (`TriageMailAccounts`).
 - Per-account server folders with modes `off/report/classify/act` and actions (`TriageMailFolders`),
   matching `docs/SPEC.md` §5 and needing engine v1.1a/b first.
-- Settings: general, notifications, triage (`TriageMailSettings`).
+- Settings: the **notifications** group (the rest is built).
 - The desktop-controls decision (the Switch, gear/pause icons, `AppBar inset`, menu-bar emblem).
 
 The design files are named only; nothing here reproduces or links their contents.
@@ -202,7 +228,7 @@ Everything in the "Next increments" table and "Distribution and signing" section
 | 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
 | 6 | Accounts screen (add account, test sign-in via `check --account`, password to Keychain, pause/resume) | Needs 4. |
 | 7 | Folders screen | Needs engine v1.1a folder discovery and v1.1b modes first. |
-| 8 | Settings screen (general, notifications, triage) | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
+| 8 | **Mostly done** (general, triage). Settings notifications group | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
 | 9 | Packaging: bundle the engine into the app, locally signed (ad-hoc) dev build, launch at login | Packager choice recorded in `docs/DECISIONS.md`. |
 | 10 | Release pipeline and updates: Developer ID signing, notarization, DMG/zip on GitHub Releases, optional update check, Homebrew cask | Board: Apple Developer Program, CI secrets, public release. Adds the privacy statement. |
 

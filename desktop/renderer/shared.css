@@ -1,0 +1,220 @@
+/* Rules both pages share: reset bits, buttons, status pills, icons and the account row (the design
+   language's Button, StatusPill and ListRow). Colours and sizes come from tokens.css. */
+
+[hidden] {
+  display: none !important;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--fg);
+  outline-offset: 2px;
+}
+
+.icon {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.meta {
+  margin: 0;
+  font-size: var(--meta);
+  color: var(--muted);
+}
+
+/* Pill-shaped; primary is the one inverse action per view, icon is a 44px round button. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  box-sizing: border-box;
+  height: 44px;
+  min-width: 44px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: transparent;
+  font-size: var(--item);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: var(--inverse-bg);
+  color: var(--inverse-fg);
+}
+
+.btn.secondary {
+  border: 1.5px solid var(--line-strong);
+}
+
+.btn.icon-only {
+  padding: 0;
+  background: var(--raised);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* A coloured dot plus words on a quiet fill. `.pill` is coloured only by one of the four tone
+   classes below; the scripts add a class from an allow-list, so data can never reach a selector. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  background: var(--raised);
+  font-size: var(--label);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.pill::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.pill.positive::before {
+  background: var(--positive);
+}
+
+.pill.attention::before {
+  background: var(--attention);
+}
+
+.pill.danger::before {
+  background: var(--danger);
+}
+
+/* One account: initials circle, name + mode over the engine's note, state pill. Rows are split by
+   1px lines, never boxed. A row may be a <button> (the window) or an <li> (the popup). */
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 14px var(--s-4);
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+}
+
+.row[aria-pressed='true'] {
+  background: var(--raised);
+}
+
+.avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--raised);
+  font-size: var(--meta);
+  font-weight: 600;
+}
+
+.row[aria-pressed='true'] .avatar {
+  background: var(--surface);
+}
+
+.text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--item);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* What the account is doing matters more than its name: the mode and the pill are always shown
+   in full, only the name ellipsizes. */
+.line > .meta {
+  flex: none;
+  font-size: var(--label);
+}
+
+.text > .pill {
+  align-self: flex-start;
+  margin-top: 3px; /* 3px column gap + 3px = the design's 6px above the pill */
+}
+
+.row > .icon {
+  align-self: center;
+  color: var(--muted);
+}
+
+/* Engine sentences ("Connection timed out. Retrying in 5 s.") get two lines; the row's title
+   attribute carries the full text. */
+.text > .note {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* The inline icon sprite: a style attribute would break the CSP, so it is a class. */
+.sprite {
+  position: absolute;
+}
+
+/* A small pulsing dot for work in progress: fades only, and not at all when motion is reduced. */
+.busy-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: 5px; /* the footprint of an 18px icon */
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes pulse {
+  from {
+    opacity: 0.3;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy-dot {
+    animation: none;
+  }
+}

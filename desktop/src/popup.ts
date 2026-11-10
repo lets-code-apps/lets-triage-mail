@@ -18,12 +18,15 @@ export const HIDE_GRACE_MS = 250;
 export const POPUP_WIDTH = 360;
 export const POPUP_FALLBACK_HEIGHT = 260;
 
-// What the main process can do to the popup window. Kept to five methods so a test can watch
+// What the main process can do to the popup window. Kept to a few methods so a test can watch
 // exactly what happens. `setBounds` is the one resize/move path: this module alone calls it, and
 // it always places the window fully inside the display's work area.
 export interface PopupHandle {
 	isVisible(): boolean;
 	show(): void;
+	// Make the popup the key window, so a click elsewhere blurs it (the Space claim alone often
+	// leaves it non-key, and then nothing would close it).
+	focus(): void;
 	hide(): void;
 	setBounds(bounds: Bounds): void;
 	// macOS virtual desktops ("Spaces"): several desktops can share one monitor, and a window that
@@ -160,6 +163,7 @@ export class PopupController {
 			window.followCurrentSpace();
 			this.place(window);
 			window.show();
+			window.focus();
 		}
 	}
 
@@ -176,6 +180,12 @@ export class PopupController {
 		if (this.handle === null || !this.handle.isVisible()) return;
 		this.handle.hide();
 		this.lastHideAt = this.clock();
+	}
+
+	// Close with no grace period: for a right-click on the icon or an action that opens the window.
+	// The tray click that follows is then a normal click, not "the one that just blurred us".
+	close(): void {
+		if (this.handle !== null && this.handle.isVisible()) this.handle.hide();
 	}
 
 	// The tray icon's click, given the clock so the grace period is testable.

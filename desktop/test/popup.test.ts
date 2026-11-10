@@ -31,7 +31,7 @@ class FakeWindow {
 	// How many times the controller claimed the desktop it is opening on (`followCurrentSpace`).
 	spaceClaims = 0;
 	bounds: Bounds[] = [];
-	events: Array<'follow' | 'setBounds' | 'show'> = [];
+	events: Array<'follow' | 'setBounds' | 'show' | 'focus'> = [];
 
 	isVisible() {
 		return this.visible;
@@ -46,6 +46,13 @@ class FakeWindow {
 	hide() {
 		this.visible = false;
 		this.hid += 1;
+	}
+
+	focused = 0;
+
+	focus() {
+		this.focused += 1;
+		this.events.push('focus');
 	}
 
 	followCurrentSpace() {
@@ -148,7 +155,7 @@ test('placement on any secondary display keeps the whole popup inside its work a
 test('an open claims the current desktop before it shows, and re-claims on every open', () => {
 	const { popup, win } = opened();
 	popup.trayClick(0);
-	assert.deepEqual(win.events, ['follow', 'setBounds', 'show'], 'claim before place and show');
+	assert.deepEqual(win.events, ['follow', 'setBounds', 'show', 'focus'], 'claim, place, show, then take key focus');
 	assert.equal(win.spaceClaims, 1);
 	popup.handleBlur(); // macOS closes the popup on blur
 	popup.trayClick(HIDE_GRACE_MS + 10); // a later click: the current desktop may be a different one
@@ -197,7 +204,7 @@ test('a broken measurement keeps the fallback height, still capped', () => {
 test('opening claims the desktop, places the popup, then shows it', () => {
 	const { popup, win } = opened();
 	popup.trayClick(0);
-	assert.deepEqual(win.events, ['follow', 'setBounds', 'show']);
+	assert.deepEqual(win.events, ['follow', 'setBounds', 'show', 'focus']);
 	assert.deepEqual(win.bounds[0], { x: 729, y: 26, width: 360, height: 260 }); // fallback size
 });
 
@@ -299,5 +306,18 @@ test('the popup is created once and only ever hidden', () => {
 test('blur before the popup exists does nothing', () => {
 	const popup = new PopupController(makeFake, () => ANCHOR, () => 0);
 	popup.handleBlur();
+	assert.equal(popup.isVisible(), false);
+});
+
+test('close hides at once and leaves no grace period: the next tray click opens it', () => {
+	// A right-click on the icon (or "open app") closes the popup; a click right after is a new gesture.
+	const popup = new PopupController(makeFake, () => ANCHOR, () => 1_000);
+	popup.trayClick(1_000);
+	popup.close();
+	assert.equal(popup.isVisible(), false);
+	popup.trayClick(1_010);
+	assert.equal(popup.isVisible(), true);
+	popup.close();
+	popup.close(); // closing a closed popup is a no-op
 	assert.equal(popup.isVisible(), false);
 });

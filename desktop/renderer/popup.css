@@ -1,126 +1,127 @@
-/* The menu-bar popup: one number, one line per account, five actions. Framework-free, no
-   images, no network (the CSP in popup.html forbids it). Colours and sizes come from tokens.css,
-   so the light/dark switch happens there, not in selectors scattered through this file. */
+/* The menu-bar popup (the design's tray card): header, summary box, account rows, footer.
+   Framework-free, no images, no network (the CSP in popup.html forbids it). Colours and sizes
+   come from tokens.css; shared.css has the buttons, pills and rows. */
 
-main {
-  display: grid;
-  gap: var(--s-3);
-  padding: var(--s-4);
-  background: var(--bg);
+body {
+  margin: 0;
+  background: transparent;
   color: var(--fg);
   font-size: var(--meta);
 }
 
-header {
-  display: grid;
-  gap: var(--s-1);
+#popup {
+  box-sizing: border-box;
+  width: 360px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-4);
+}
+
+.lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lockup .words {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.lockup .small {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.lockup .big {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.summary-wrap {
+  padding: 0 var(--s-4) 20px;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 14px var(--s-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
 }
 
 .count {
-  margin: 0;
   font-size: var(--count);
   font-weight: 600;
   letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
   line-height: 1.1;
+  font-variant-numeric: tabular-nums;
 }
 
-.label {
+.summary .col {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.acc-head {
+  display: flex;
+  align-items: center; /* a long engine sentence wraps; it stays centred on the heading */
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: 0 var(--s-4) var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.acc-head #connected {
+  min-width: 0;
+  text-align: right;
+}
+
+.acc-head h2 {
+  flex: none;
   margin: 0;
-  font-size: var(--label);
-  font-weight: 500;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.meta,
-.summary {
-  margin: 0;
-  color: var(--muted);
-}
-
-.subhead {
   font-size: var(--subhead);
   font-weight: 600;
-  color: var(--fg);
+  letter-spacing: -0.01em;
 }
 
 .accounts {
-  display: grid;
-  gap: var(--s-2);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-/* One account: name + mode on the left, the engine's own note under it, a state pill right. */
-.accounts > li {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-3);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-}
-
-.name {
-  font-size: var(--item);
-  font-weight: 500;
-}
-
-.mode,
-.note {
-  font-size: var(--meta);
-  color: var(--muted);
-}
-
-.pill {
-  padding: var(--s-1) var(--s-2);
-  border-radius: var(--r-pill);
-  font-size: var(--label);
-  font-weight: 500;
-  /* Unknown tones land here: readable, uncoloured. `popup.js` only ever adds a class from the
-     four-name allow-list, so data can never reach a selector. */
-  background: var(--raised);
-  color: var(--muted);
-}
-
-.pill.positive {
-  background: color-mix(in srgb, var(--positive) 14%, var(--raised));
-  color: var(--positive);
-}
-
-.pill.attention {
-  background: color-mix(in srgb, var(--attention) 14%, var(--raised));
-  color: var(--attention);
-}
-
-.pill.danger {
-  background: color-mix(in srgb, var(--danger) 14%, var(--raised));
-  color: var(--danger);
-}
-
 footer {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: var(--s-2);
-  padding-top: var(--s-3);
-  border-top: 1px solid var(--line);
+  padding: var(--s-3) var(--s-4) var(--s-4);
 }
 
-footer > button {
-  padding: var(--s-2) var(--s-3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-  color: var(--fg);
-  font: inherit;
-  font-size: var(--meta);
-}
-
-footer > button:disabled {
-  color: var(--muted);
+.spacer {
+  flex: 1;
 }
