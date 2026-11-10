@@ -5,6 +5,7 @@
 
 pub mod check;
 pub mod config;
+pub mod config_edit;
 pub mod decider;
 pub mod digest;
 pub mod engine;
