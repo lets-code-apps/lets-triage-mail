@@ -110,11 +110,16 @@ orphaned. Fixed in a later increment (engine exits when its stdin closes).
   page never formats or colours anything itself. It is the design's tray card: lockup and "open app",
   a summary box (count, pill, `N fyi · M done · since HH:MM`) that opens the window, the account rows,
   and a footer with pause/start triage, a settings button (opens the window on settings) and quit. The
-  window is transparent so the card's rounded corners show.
-- Window: one `BrowserWindow` (1100x760, min 360x480), `hiddenInset` title bar with the traffic
+  window is transparent so the card's rounded corners show. While it is open the tray glyph is swapped
+  for a version with macOS's highlight pill behind it (`desktop/src/tray-image.ts` draws both from
+  the template icon at runtime, same canvas so the menu bar does not shift). It closes like a native
+  menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, or opening
+  the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
+  name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
+- Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
   lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
-  hidden/shown, never destroyed. Below the bar, a wrapping flex row of three panes (nav, list, detail)
-  that stack under each other below about 900 px. Two sections: accounts (rows from the same status
+  hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
+  the panes never stack, the window just has a minimum size. Two sections: accounts (rows from the same status
   view as the popup, plus the selected account's detail) and settings (engine state, Start/Stop/Check
   buttons, the setup check report). It only shows what the engine reports: no config writing, no
   add-account form, no folders screen. It polls `getStatus` every 5 s while visible; main answers

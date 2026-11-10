@@ -88,10 +88,10 @@ function render(payload) {
 		const line = document.createElement('div');
 		line.className = 'line';
 		line.append(span('name', account.name), span('meta', account.mode));
-		text.append(line, span('meta note', account.note));
+		text.append(line, span('meta note', account.note), span(pillClass(account.tone), account.state));
 
 		// Only a name from the allow-list may become a class; unknown tones get the neutral style.
-		row.append(span('avatar', account.initials), text, span(pillClass(account.tone), account.state));
+		row.append(span('avatar', account.initials), text);
 		accountsEl.appendChild(row);
 	}
 }

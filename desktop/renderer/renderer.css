@@ -1,5 +1,5 @@
 /* The desktop app shell: app bar, then nav | list | detail (accounts) or nav | article (settings)
-   in one wrapping flex row. Colours and sizes come from tokens.css; buttons, pills and account
+   in one non-wrapping flex row (the window has a minimum size instead). Colours and sizes come from tokens.css; buttons, pills and account
    rows are in shared.css. No remote fonts, images or network (see the CSP). */
 
 body {
@@ -27,7 +27,7 @@ body {
 
 .panes {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-height: calc(100vh - 65px); /* app bar 64px + its 1px border */
 }
 
@@ -68,8 +68,7 @@ h2 {
 
 .list {
   box-sizing: border-box;
-  flex: 1 1 420px; /* design range 360–460; 420 leaves the account name room next to pill + chevron */
-  max-width: 460px;
+  flex: 0 0 420px;
   min-width: 0;
   padding: var(--s-6) 0 0;
   border-right: 1px solid var(--line);
@@ -94,14 +93,10 @@ h2 {
   cursor: pointer;
 }
 
-.row > .icon {
-  color: var(--muted);
-}
-
 .detail {
   box-sizing: border-box;
-  flex: 999 1 420px;
-  min-width: 0;
+  flex: 1 1 420px;
+  min-width: 420px;
   padding: var(--s-6) 20px 32px;
 }
 
@@ -123,10 +118,10 @@ h2 {
 .settings {
   box-sizing: border-box;
   display: flex;
-  flex: 999 1 420px;
+  flex: 1 1 420px;
   flex-direction: column;
   gap: 32px;
-  min-width: 0;
+  min-width: 420px;
   max-width: 720px;
   padding: var(--s-6) 20px 32px;
 }
@@ -272,28 +267,4 @@ h2 {
   font: 12px/1.5 ui-monospace, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-/* Stacked panes: the dividers move from the right edge to the bottom edge. The detail pane drops
-   under the list below about 1040px; the nav drops above the list below about 600px and becomes a
-   horizontal row. */
-@media (max-width: 1039px) {
-  .list {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
-}
-
-@media (max-width: 600px) {
-  .nav {
-    display: flex;
-    flex: 1 1 100%;
-    max-width: none;
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .nav button {
-    width: auto;
-  }
 }

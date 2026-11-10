@@ -122,8 +122,8 @@ function renderAccounts() {
 		const line = el('div', 'line');
 		line.append(el('span', 'name', account.name), el('span', 'meta', account.mode));
 		const text = el('div', 'text');
-		text.append(line, el('span', 'meta note', account.note));
-		row.append(el('span', 'avatar', account.initials), text, pill(account.tone, account.state), icon('chevron-right', 16));
+		text.append(line, el('span', 'meta note', account.note), pill(account.tone, account.state));
+		row.append(el('span', 'avatar', account.initials), text, icon('chevron-right', 16));
 		row.addEventListener('click', () => {
 			selected = account.name;
 			renderAccounts();

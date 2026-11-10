@@ -107,11 +107,11 @@ button {
    1px lines, never boxed. A row may be a <button> (the window) or an <li> (the popup). */
 .row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 14px;
   box-sizing: border-box;
   width: 100%;
-  padding: var(--s-3) var(--s-4);
+  padding: 14px var(--s-4);
   border: 0;
   border-bottom: 1px solid var(--line);
   background: transparent;
@@ -126,8 +126,8 @@ button {
   display: grid;
   flex: none;
   place-items: center;
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   background: var(--raised);
   font-size: var(--meta);
@@ -153,7 +153,7 @@ button {
 }
 
 .name {
-  flex: 0 1 auto;
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   font-size: var(--item);
@@ -162,15 +162,21 @@ button {
   white-space: nowrap;
 }
 
-/* The name wins the width: the mode shrinks (and ellipsizes) long before the name does. */
+/* What the account is doing matters more than its name: the mode and the pill are always shown
+   in full, only the name ellipsizes. */
 .line > .meta {
-  flex: 0 100 auto;
-  min-width: 0;
-  margin-left: auto;
-  overflow: hidden;
+  flex: none;
   font-size: var(--label);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.text > .pill {
+  align-self: flex-start;
+  margin-top: 3px; /* 3px column gap + 3px = the design's 6px above the pill */
+}
+
+.row > .icon {
+  align-self: center;
+  color: var(--muted);
 }
 
 /* Engine sentences ("Connection timed out. Retrying in 5 s.") get two lines; the row's title
