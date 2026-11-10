@@ -123,8 +123,9 @@ while the tray already says `failed`.
   hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
   the panes never stack, the window just has a minimum size. Two sections: accounts (rows from the same status
   view as the popup, plus the selected account's detail) and settings (engine state, Start/Stop/Check
-  buttons, the setup check report). It only shows what the engine reports: no config writing, no
-  add-account form, no folders screen. It polls `getStatus` every 5 s while visible; main answers
+  buttons, the setup check report). Accounts has the add form, per-account mode (dry run / classify only /
+  classify and sort), test connection, update password and remove, all through the engine's `config`
+  commands; no folders screen. It polls `getStatus` every 5 s while visible; main answers
   `idle` while the window is hidden. A tray "Check setup" switches it to settings.
   Settings is one article (the `TriageMailSettings` design): **general** (appearance system/dark/light,
   stored in `userData/settings.json` and applied through `nativeTheme.themeSource`; open at login, kept
@@ -142,9 +143,20 @@ while the tray already says `failed`.
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
   two files** (the window page and the popup page), and the preload (see `desktop/src/preload.cjs`)
-  exposes seven functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
-  `command(start|stop|check|openWindow|openSettings|quit)`, `getSettings`, `setSetting`). `setSetting`
+  exposes nine functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
+  `command(start|stop|check|openWindow|openSettings|quit)`, `getSettings`, `setSetting`, `getConfig`,
+  `editAccount(op, fields)`). `setSetting`
   is checked in main: our page, a known name (`appearance`, `openAtLogin`) and an allow-listed value.
+  `getConfig` and `editAccount` answer the **window page only** (the popup must not read or write the
+  config). `editAccount` ops are `add | set | remove | password | test`; main checks every field against a
+  per-op allow-list with types (`src/account-edit.ts`: name 1-64 engine-allowed characters starting with a
+  letter or digit, host <= 253 without spaces, port 1-65535, username <= 254, tls `tls|starttls|none`, set keys
+  = the engine's settable keys, password <= 1024 on one line, only for add/password/test), builds the argv
+  itself (`--flag=value` options, positionals after `--`) and writes a password to the child's **stdin** only:
+  never argv, env, log or the reply to the page. Going live (`dry_run false`) and removing an account first
+  show a native confirm in main (default button cancel). After a change that needs a restart, main restarts
+  the engine it owns (one SIGTERM rule unchanged); an engine running outside the app gets the reply
+  `restart: "external"` and the page says "restart triage to apply".
   `openSettings` sets a one-shot flag that `getSettings` hands to the window on its next focus. A `getStatus` call from a hidden popup is answered
   `idle`: an invisible page never spawns the engine. The renderer and the popup write engine text with
   `textContent`, never `innerHTML` (check messages carry server and folder names, and the popup shows
@@ -195,6 +207,11 @@ Keeping these three apart is the point: it stops this document from reading like
   connected`, one row per account with initials and a state pill). Its **Start** is disabled, with the note "Running outside the
   app", when a fresh `status` shows a live engine the app did not start (there is no single-instance
   lock yet). Setup check lives in the window's settings, and a tray "Check setup" opens it there.
+- The window's **accounts screen** (increment 6): list merged from `status` and `config show` (user line,
+  "not running" for a just-added account), add form with test connection, per-account mode, connection
+  test, password update and remove. Not done: per-account pause/resume (the config has no per-account
+  enabled key; the global pause exists), editing host or user in place (remove and add), and the folders
+  sentence of the design (increment 7).
 - The window's **settings screen**: appearance, open at login, engine pause/start, setup check, log.
 - Engine status for the UI: `status --json` (shape locked by a Rust test), fed by two SQLite tables the
   engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
@@ -207,7 +224,6 @@ Keeping these three apart is the point: it stops this document from reading like
 
 ### Mockup only (designed in the private design repo, nothing coded)
 
-- Accounts list and "add account" (`TriageMailAccounts`).
 - Per-account server folders with modes `off/report/classify/act` and actions (`TriageMailFolders`),
   matching `docs/SPEC.md` §5 and needing engine v1.1a/b first.
 - Settings: the **notifications** group (the rest is built).
@@ -227,7 +243,7 @@ Everything in the "Next increments" table and "Distribution and signing" section
 | 3 | **Done by this PR.** Engine status for the UI: `status --json` with per-account state and counts, from two SQLite tables the engine writes | No channel design needed after all: the database the engine already owns is the channel, so `node:net` stays out of the boundary test. A 0600 Unix socket remains available as a later increment. |
 | 4 | **Done by this PR.** Config through the engine: `config show/validate --json` and engine-owned `account add/set/remove/password` that keep comments and never log passwords; Keychain entry creation | `toml_edit` approved by the board (2026-11-10). Prerequisite for 5–7. The JSON contract is below the table. |
 | 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
-| 6 | Accounts screen (add account, test sign-in via `check --account`, password to Keychain, pause/resume) | Needs 4. |
+| 6 | **Done by this PR.** Accounts screen: add account, test sign-in (`config account test`), mode, password to Keychain, remove. **Not done:** per-account pause/resume (no per-account enabled key in the config; the global pause exists) | Needs 4. |
 | 7 | Folders screen | Needs engine v1.1a folder discovery and v1.1b modes first. |
 | 8 | **Mostly done** (general, triage). Settings notifications group | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
 | 9 | Packaging: bundle the engine into the app, locally signed (ad-hoc) dev build, launch at login | Packager choice recorded in `docs/DECISIONS.md`. |
@@ -249,6 +265,11 @@ password). Locked by tests in `src/cli/config.rs`.
   engine reads the config only at start, so the app restarts it.
 - `config account password NAME --password-stdin`: `{ok, restart_needed}` (true only when the config now
   points at the Keychain item).
+- `config account test NAME | --host H --username U [--port P] [--tls T] --password-stdin`: signs in and runs
+  the account's checks (no model), changing nothing: no config write, no Keychain access for typed-in values.
+  Output is the `check --json` shape (`{ok, failed, warnings, items}`, area `Account NAME`, or `test` for typed-in
+  values), exit 1 when something failed but stdout is still the JSON; an argument or config problem is
+  `{ok:false, error}`. Typed-in values go through the same validation as `add` (no `tls none` on a remote host).
 - Passwords are sent on **stdin, one line**, never in argv or env. The engine accepts printable ASCII only
   (no leading or trailing space); `security ... -w` prints anything else as hex.
 - Every write is validated first, keeps `config.toml.bak` (0600) and replaces the file atomically. No lock
