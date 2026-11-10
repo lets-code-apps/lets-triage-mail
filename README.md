@@ -223,6 +223,22 @@ lets-triage-mail digest --dry               # print today's digest, change nothi
 lets-triage-mail digest --account zoho      # write it now
 ```
 
+## Managing accounts from the command line
+
+`config` edits the config file without touching your comments, and keeps the previous version as
+`config.toml.bak`. Every command takes `--json`. Passwords go to the login Keychain, read from stdin
+so they never show up in `ps`:
+
+```sh
+printf '%s\n' "$APP_PASSWORD" | lets-triage-mail config account add \
+  --name personal --host imap.example.com --username me@example.com --password-stdin
+lets-triage-mail config show                       # accounts, modes, where each password comes from
+lets-triage-mail config account set personal dry_run false
+lets-triage-mail config account remove personal --forget-password
+```
+
+The running engine reads the config at start, so restart it after a change.
+
 ## Engine status
 
 `status` answers one question in one shot, with the engine either running or not: what the

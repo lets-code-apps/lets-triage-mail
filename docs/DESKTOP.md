@@ -225,13 +225,35 @@ Everything in the "Next increments" table and "Distribution and signing" section
 |---|---|---|
 | 2 | **Done.** Engine safe to embed: single-instance lock on `run`, exit when stdin closes, desktop restart policy with backoff, autostart on | MSRV raised to 1.89 for `File::lock` (board decision 2026-11-10) |
 | 3 | **Done by this PR.** Engine status for the UI: `status --json` with per-account state and counts, from two SQLite tables the engine writes | No channel design needed after all: the database the engine already owns is the channel, so `node:net` stays out of the boundary test. A 0600 Unix socket remains available as a later increment. |
-| 4 | Config through the engine: `config show/validate --json` and engine-owned set/add/remove that keep comments and never log passwords; Keychain entry creation | Needs a TOML-editing crate: **board approval**. Prerequisite for 5–7. |
+| 4 | **Done by this PR.** Config through the engine: `config show/validate --json` and engine-owned `account add/set/remove/password` that keep comments and never log passwords; Keychain entry creation | `toml_edit` approved by the board (2026-11-10). Prerequisite for 5–7. The JSON contract is below the table. |
 | 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
 | 6 | Accounts screen (add account, test sign-in via `check --account`, password to Keychain, pause/resume) | Needs 4. |
 | 7 | Folders screen | Needs engine v1.1a folder discovery and v1.1b modes first. |
 | 8 | **Mostly done** (general, triage). Settings notifications group | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
 | 9 | Packaging: bundle the engine into the app, locally signed (ad-hoc) dev build, launch at login | Packager choice recorded in `docs/DECISIONS.md`. |
 | 10 | Release pipeline and updates: Developer ID signing, notarization, DMG/zip on GitHub Releases, optional update check, Homebrew cask | Board: Apple Developer Program, CI secrets, public release. Adds the privacy statement. |
+
+### Config commands: the contract for the app (increment 4)
+
+All run as `lets-triage-mail --config PATH config ... --json`. Success is `{"ok":true, ...}` on stdout;
+failure is `{"ok":false,"error":"<sentence>"}` on stdout with a non-zero exit (the error never contains a
+password). Locked by tests in `src/cli/config.rs`.
+
+- `config show`: `{ok, path, dry_run, llm:{base_url, model}, accounts:[{name, host, port, username, tls,
+  inbox, flagging, watch_junk, dry_run, mode, password_source}]}`. `mode` is the word `status --json`
+  uses; `dry_run` and `port` are the effective values; `password_source` is `keychain` (the command this
+  tool writes), `command` (any other) or `env`. The `password_command` text is never output. A missing
+  file gives `{ok:false, error, missing:true}`.
+- `config validate`: `{ok, path, accounts}`; no network, no password lookup.
+- `config account add|set|remove`: `{ok, restart_needed:true}` (`remove` adds `password_forgotten`). The
+  engine reads the config only at start, so the app restarts it.
+- `config account password NAME --password-stdin`: `{ok, restart_needed}` (true only when the config now
+  points at the Keychain item).
+- Passwords are sent on **stdin, one line**, never in argv or env. The engine accepts printable ASCII only
+  (no leading or trailing space); `security ... -w` prints anything else as hex.
+- Every write is validated first, keeps `config.toml.bak` (0600) and replaces the file atomically. No lock
+  against two writers at once (`shortcut:` in `config_edit.rs`).
+- Test hook: `LTM_KEYCHAIN_SERVICE` replaces the Keychain service name; the app never sets it.
 
 ## Distribution and signing requirements (future)
 

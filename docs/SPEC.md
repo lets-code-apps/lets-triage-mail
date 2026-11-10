@@ -98,6 +98,11 @@ lets-triage-mail digest [--account X] [--dry]         # --dry: print the text, c
 lets-triage-mail stats [--days 7]
 lets-triage-mail status [--json]         # one snapshot: engine liveness (heartbeat), today's counts, per-account state; metadata only
 lets-triage-mail rules list|allow|block|remove PATTERN
+lets-triage-mail config show|validate [--json]        # the path and the settings a settings screen needs; never a password command
+lets-triage-mail config account add --name N --host H --username U [--port P] [--tls T] [--dry-run B] [--flagging B] [--password-stdin]
+lets-triage-mail config account set NAME KEY VALUE    # host, port, username, tls, inbox, flagging, watch_junk, dry_run (`default` removes it)
+lets-triage-mail config account remove NAME [--forget-password]
+lets-triage-mail config account password NAME --password-stdin   # replace the Keychain password
 ```
 
 Packaging: a single static binary, `cargo install`, a Homebrew tap, and a launchd plist
