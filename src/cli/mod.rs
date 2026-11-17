@@ -1,16 +1,18 @@
 //! The command-line interface: the argument types (parsed by `clap`) and the dispatch.
 //!
 //! Each subcommand lives in its own file and exposes one `async fn run` that returns
-//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `rules` and `backfill` work; the others are
-//! still stubs, see `docs/PLAN.md`.
+//! `anyhow::Result<()>`. `run`, `check`, `classify`, `stats`, `status`, `rules`, `config` and `backfill`
+//! work; the others are still stubs, see `docs/PLAN.md`.
 
 mod backfill;
 mod check;
 mod classify;
+mod config;
 mod digest;
 mod rules;
 mod run;
 mod stats;
+mod status;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -55,7 +57,12 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Watch the accounts, classify new mail, and set and clear flags (per account: live or dry-run)
-    Run,
+    Run {
+        /// Shut down gracefully when stdin reaches end-of-file (set by the desktop app, so the
+        /// engine never outlives it)
+        #[arg(long, hide = true)]
+        exit_on_stdin_close: bool,
+    },
     /// Test the model and each account; show server capabilities and folders
     Check {
         /// Only this account (by name)
@@ -105,9 +112,18 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Snapshot what the engine is doing now; `--json` is the shape the desktop app reads
+    Status {
+        /// Print machine-readable JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the sender allow and block rules
     #[command(subcommand)]
     Rules(rules::RulesCommand),
+    /// Show, validate and edit the config; accounts keep their comments
+    #[command(subcommand)]
+    Config(config::ConfigCommand),
 }
 
 /// Runs the chosen subcommand.
@@ -115,7 +131,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config_path();
     tracing::debug!(config = %config_path.display(), "using config file");
     match cli.command {
-        Command::Run => run::run(&config_path).await,
+        Command::Run {
+            exit_on_stdin_close,
+        } => run::run(&config_path, exit_on_stdin_close).await,
         Command::Check { account, json } => {
             check::run(&config_path, account.as_deref(), json).await
         }
@@ -131,7 +149,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             digest::run(&config_path, account.as_deref(), dry).await
         }
         Command::Stats { days, json } => stats::run(&config_path, days, json).await,
+        Command::Status { json } => status::run(&config_path, json).await,
         Command::Rules(command) => rules::run(&config_path, command).await,
+        Command::Config(command) => config::run(&config_path, command).await,
     }
 }
 
@@ -325,6 +345,18 @@ mod tests {
             }
             other => panic!("expected check, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_status_with_and_without_json() {
+        assert!(matches!(
+            parse(&["status"]).unwrap().command,
+            Command::Status { json: false }
+        ));
+        let cli = parse(&["status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { json: true }));
+        // The snapshot takes no account or days filter: it is always "now and today".
+        assert!(parse(&["status", "--account", "work"]).is_err());
     }
 
     #[test]

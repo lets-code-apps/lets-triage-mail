@@ -57,3 +57,29 @@ jobs:
       - name: Dovecot log
         if: failure()
         run: docker logs dovecot
+
+  # The Electron desktop in desktop/. Node only, no Cargo. macOS because the tray/dock and the
+  # smoke test are macOS. The two Rust jobs above install no Node: that is the standing proof the
+  # CLI builds and tests without Electron.
+  desktop:
+    name: desktop (typecheck, test, smoke)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      # Blocking: these two are the deterministic proof of the desktop/engine boundary and lifecycle.
+      - run: npm run typecheck
+      - run: npm test
+      # Non-blocking for now: the smoke test opens a real tray/window, which needs a GUI session.
+      # Kept so a broken lifecycle is visible, but not allowed to turn CI red until it is stable.
+      - name: Smoke (real Electron)
+        continue-on-error: true
+        run: npm run smoke

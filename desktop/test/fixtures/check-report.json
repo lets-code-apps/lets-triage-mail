@@ -1,0 +1,25 @@
+{
+	"ok": false,
+	"failed": 1,
+	"warnings": 1,
+	"items": [
+		{
+			"area": "Config",
+			"status": "ok",
+			"message": "/tmp/lets-triage-mail/config.toml loads and validates",
+			"hint": null
+		},
+		{
+			"area": "Model",
+			"status": "warn",
+			"message": "model endpoint http://127.0.0.1:1143/api/tags is not answering now",
+			"hint": "start your local model server (ollama / LM Studio / MLX) and run check again"
+		},
+		{
+			"area": "Account work",
+			"status": "fail",
+			"message": "sign-in failed on imap.example.com: connection refused",
+			"hint": "check the account's password_command in the config"
+		}
+	]
+}

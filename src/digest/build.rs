@@ -302,7 +302,8 @@ pub fn build(input: &DigestInput<'_>) -> Digest {
 }
 
 /// The flag a classify-only account's message would get. `None` when stored flags are used.
-fn would_be_flag(row: &DigestRow, policy: Option<&FlagPolicy>) -> Option<TriageFlag> {
+/// Shared with `status.rs` (one-word visibility change, no behaviour change).
+pub(crate) fn would_be_flag(row: &DigestRow, policy: Option<&FlagPolicy>) -> Option<TriageFlag> {
     let policy = policy?;
     let verdict = row.verdict.as_ref()?;
     choose_flag(Trust::Unknown, verdict, policy)

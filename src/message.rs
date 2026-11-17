@@ -544,10 +544,10 @@ fn apply_provider_headers(
 ) {
     match provider {
         ProviderHeaders::Wp => {
-            if out.auth.dkim == AuthVerdict::None {
-                if let Some(value) = header_text(headers, "X-WP-DKIM-Status") {
-                    out.auth.dkim = parse_wp_dkim(&value);
-                }
+            if out.auth.dkim == AuthVerdict::None
+                && let Some(value) = header_text(headers, "X-WP-DKIM-Status")
+            {
+                out.auth.dkim = parse_wp_dkim(&value);
             }
             out.provider_spam = header_text(headers, "X-WP-SPAM").and_then(|v| parse_wp_spam(&v));
         }

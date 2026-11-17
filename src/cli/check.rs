@@ -2,13 +2,15 @@
 //! anything on any mail server.
 //!
 //! The probes and the report formatting live in [`lets_triage_mail::check`]; this file decides
-//! what to run, in which order, and prints. Accounts are checked one after another, and a
-//! failing account never stops the others.
+//! what to run, in which order, and prints. The model probe and every account probe run at the
+//! same time (a slow login must not queue behind a slow model), but their sections are printed
+//! in the fixed order; a failing account never stops the others.
 
 use std::path::Path;
 
 use lets_triage_mail::check::{self, CheckItem, DigestCheck, Report};
 use lets_triage_mail::config::{AccountConfig, Config};
+use tokio::task::JoinHandle;
 
 /// Runs the checks and prints the report. Fails (non-zero exit code) if anything failed.
 pub async fn run(config_path: &Path, account: Option<&str>, json: bool) -> anyhow::Result<()> {
@@ -38,15 +40,31 @@ pub async fn run(config_path: &Path, account: Option<&str>, json: bool) -> anyho
     section.push(check::database_item(&config.db_path()));
     finish_section(&mut report, section, json);
 
-    finish_section(&mut report, check::probe_model(&config.llm).await, json);
-
+    // Start every probe first, then await the handles in the report's order. Only one model call
+    // is made, so the "one model request at a time" rule still holds.
+    let llm = config.llm.clone();
+    let mut probes: Vec<(String, JoinHandle<Vec<CheckItem>>)> = vec![(
+        check::MODEL.to_string(),
+        tokio::spawn(async move { check::probe_model(&llm).await }),
+    )];
     for account in accounts {
         let digest = DigestCheck::for_account(&config, account);
-        finish_section(
-            &mut report,
-            check::probe_account(account, &digest).await,
-            json,
-        );
+        let account = account.clone();
+        probes.push((
+            check::account_area(&account.name),
+            tokio::spawn(async move { check::probe_account(&account, &digest).await }),
+        ));
+    }
+    for (area, handle) in probes {
+        let section = handle.await.unwrap_or_else(|error| {
+            // A panicked probe is a failed section, not a crash of the whole check.
+            vec![CheckItem::fail(
+                &area,
+                format!("the check stopped unexpectedly: {error}"),
+                "run `check` again; if it keeps happening, report a bug",
+            )]
+        });
+        finish_section(&mut report, section, json);
     }
 
     conclude(&report, json)

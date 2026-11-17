@@ -2,13 +2,17 @@
 name = "lets-triage-mail"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Local-first email triage for any IMAP account, powered by a local LLM"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lets-code-apps/lets-triage-mail"
 readme = "README.md"
 keywords = ["email", "imap", "triage", "llm", "apple-mail"]
 categories = ["email", "command-line-utilities"]
+# The Electron desktop app in `desktop/` is not Rust and must never enter the published crate.
+# A directory with no `Cargo.toml` is invisible to `cargo build`; `exclude` also keeps it out of
+# `cargo package`/`cargo publish` (which would otherwise ship Node sources and `package-lock.json`).
+exclude = ["desktop/"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -33,6 +37,8 @@ tokio = { version = "1.54.1", features = ["io-util", "macros", "rt-multi-thread"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7.20", default-features = false }
 toml = "1.1.8"
+# Format-preserving edits of the config (comments stay); shares toml_parser with `toml`.
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 

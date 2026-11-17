@@ -1,0 +1,127 @@
+/* The menu-bar popup (the design's tray card): header, summary box, account rows, footer.
+   Framework-free, no images, no network (the CSP in popup.html forbids it). Colours and sizes
+   come from tokens.css; shared.css has the buttons, pills and rows. */
+
+body {
+  margin: 0;
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--meta);
+}
+
+#popup {
+  box-sizing: border-box;
+  width: 360px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-4);
+}
+
+.lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lockup .words {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.lockup .small {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.lockup .big {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.summary-wrap {
+  padding: 0 var(--s-4) 20px;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 14px var(--s-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+}
+
+.count {
+  font-size: var(--count);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary .col {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.acc-head {
+  display: flex;
+  align-items: center; /* a long engine sentence wraps; it stays centred on the heading */
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: 0 var(--s-4) var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.acc-head #connected {
+  min-width: 0;
+  text-align: right;
+}
+
+.acc-head h2 {
+  flex: none;
+  margin: 0;
+  font-size: var(--subhead);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.accounts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+footer {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-3) var(--s-4) var(--s-4);
+}
+
+.spacer {
+  flex: 1;
+}

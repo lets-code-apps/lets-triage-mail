@@ -37,6 +37,26 @@ cargo test --test imap_integration -- --ignored
 On Apple silicon the amd64 test image needs QEMU emulation; it crashes under Rosetta (Docker
 Desktop: turn off "Use Rosetta for x86/amd64 emulation").
 
+**Rust contributions need no Node or Electron.** The two Rust CI jobs install no Node at all, which
+is the standing proof that the CLI builds and tests without the desktop.
+
+### Building the desktop app
+
+The desktop lives in `desktop/` and is separate from the crate. It needs **Node 24** (Electron 45
+requires it) and nothing else beyond the built engine:
+
+```sh
+cargo build                    # engine the desktop spawns (or set LTM_ENGINE_PATH)
+cd desktop
+npm ci
+npm run typecheck              # tsc --noEmit
+npm test                       # node --test (unit tests, no GUI)
+npm run smoke                  # real Electron smoke (needs a GUI session; CI macOS has one)
+npm start                      # build, then open the app
+```
+
+See [docs/DESKTOP.md](docs/DESKTOP.md) for what it does and its boundary with the engine.
+
 ## Pull requests
 
 - Open an issue first for anything bigger than a fix, so we can agree on the approach.

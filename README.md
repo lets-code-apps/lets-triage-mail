@@ -23,10 +23,17 @@ mailbox.
 Flags are stored on the server, so they show in Apple Mail on the Mac and the iPhone, and in any
 client that shows flags, with nothing to install in the mail client.
 
+**Desktop app (in development).** A macOS menu-bar companion lives in `desktop/`. It is a second
+front end onto the same engine — it starts/stops the engine and shows its `check` results; it does
+not read mail or re-implement triage. It is not released, promises no dates, and the **CLI remains the
+supported way** to run the engine. Closing its window leaves triage running. See
+[docs/DESKTOP.md](docs/DESKTOP.md). Until the engine gains a single-instance lock, pick one way to run
+it (the LaunchAgent, a terminal `run`, or the desktop) so two engines never watch the same mailbox.
+
 ## Quickstart
 
 You need macOS or Linux, a local model server, and an IMAP account that allows app passwords.
-Rust 1.85 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
+Rust 1.89 or newer ([rustup.rs](https://rustup.rs)) is only needed for the install-from-source
 route below.
 
 ### 1. Install
@@ -216,6 +223,37 @@ lets-triage-mail digest --dry               # print today's digest, change nothi
 lets-triage-mail digest --account zoho      # write it now
 ```
 
+## Managing accounts from the command line
+
+`config` edits the config file without touching your comments, and keeps the previous version as
+`config.toml.bak`. Every command takes `--json`. Passwords go to the login Keychain, read from stdin
+so they never show up in `ps`:
+
+```sh
+printf '%s\n' "$APP_PASSWORD" | lets-triage-mail config account add \
+  --name personal --host imap.example.com --username me@example.com --password-stdin
+lets-triage-mail config show                       # accounts, modes, where each password comes from
+lets-triage-mail config account set personal dry_run false
+lets-triage-mail config account remove personal --forget-password
+```
+
+The running engine reads the config at start, so restart it after a change.
+
+## Engine status
+
+`status` answers one question in one shot, with the engine either running or not: what the
+engine has done today and how far each account got. It reads the state database the running engine
+already owns, so it works while `run` is stopped, and it prints metadata only — no senders, subjects
+or bodies.
+
+```sh
+lets-triage-mail status            # human-readable: engine liveness, today's counts, account states
+lets-triage-mail status --json     # the same snapshot for machines (the desktop popup parses this)
+```
+
+The JSON shape is locked by a test; changing a key or a value is a breaking change for the
+desktop app. See [docs/DESKTOP.md](docs/DESKTOP.md).
+
 ## Providers
 
 What has been tried so far. Reports for other providers are very welcome: open a
@@ -243,7 +281,8 @@ else leaves your machines; see [SECURITY.md](SECURITY.md) for the full threat mo
 ## Docs
 
 [docs/SPEC.md](docs/SPEC.md) has the full spec. The design notes are in [docs/](docs/): flags,
-classifier, architecture and the decision log.
+classifier, architecture and the decision log. [docs/DESKTOP.md](docs/DESKTOP.md) covers the
+in-development desktop app and its boundary with the engine.
 
 The design was proved first in an unpublished Python prototype (folder moves, training folders,
 unsubscribe queue, review UI). This repository is the Rust rewrite.
