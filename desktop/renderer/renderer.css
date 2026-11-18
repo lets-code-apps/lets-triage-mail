@@ -34,7 +34,7 @@ body {
    over, and 264px of slack (132px each side) keeps it clear of the traffic lights and the emblem. */
 .appbar-title {
   position: absolute;
-  left: 50%;
+  left: 53%;
   top: 50%;
   transform: translate(-50%, -50%);
   max-width: calc(100% - 264px);
