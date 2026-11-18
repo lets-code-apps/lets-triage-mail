@@ -119,7 +119,7 @@ while the tray already says `failed`.
   Its pause/start button behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the
   new state); there is no separate status line. Main pushes the engine state to both pages.
 - Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
-  lights over a 64 px draggable app bar and the emblem at its right end. Created on first open, then
+  lights over a 64 px draggable app bar; the bar carries the app name "triage mail" centred on the whole bar (one line, 15px/500, ellipsis, 132px clear on each side) and the emblem at its right end. Created on first open, then
   hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
   the panes never stack, the window just has a minimum size. Two sections: accounts (rows from the same status
   view as the popup, plus the selected account's detail) and settings (engine state, Start/Stop/Check
@@ -217,6 +217,8 @@ Keeping these three apart is the point: it stops this document from reading like
   engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
 - A single window that hides on close and reopens by reuse (never destroyed); the dock hides when no
   window is visible.
+- The app name in the window bar: "triage mail" centred on the whole app bar, one line, ellipsis, 132px
+  clear on each side, with the emblem staying at the right end.
 - The engine start/stop/quit lifecycle: one SIGTERM then SIGKILL after the deadline, single-instance
   lock, explicit quit through `before-quit`.
 - `check --json` parsing and rendering as data only (`textContent`), with a defensive shape check.
