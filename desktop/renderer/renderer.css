@@ -22,11 +22,30 @@ body {
   height: 64px;
   padding: 0 var(--s-6) 0 80px;
   border-bottom: 1px solid var(--line);
+  position: relative;
   -webkit-app-region: drag;
 }
 
 .appbar button {
   -webkit-app-region: no-drag;
+}
+
+/* The app name reads like a macOS window title: centred on the whole bar, not on the space left
+   over, and 264px of slack (132px each side) keeps it clear of the traffic lights and the emblem. */
+.appbar-title {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-width: calc(100% - 264px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--item);
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--fg);
+  pointer-events: none;
 }
 
 .panes {
