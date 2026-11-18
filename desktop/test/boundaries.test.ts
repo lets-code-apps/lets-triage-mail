@@ -254,3 +254,46 @@ test('getConfig and editAccount are window-only, validated in main, and the pass
 	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
 	assert.equal(/\.innerHTML\s*=/.test(renderer), false);
 });
+
+// The app bar carries the app name, so markup and CSS are pinned together: the window page says
+// the name exactly once, and the rule that centres it on the whole bar (with 132px clear on each
+// side) is the executable version of the design's AppBar title span. The popup keeps its own lockup.
+test('the app bar names the app once, and only the window has it', () => {
+	const index = readFileSync(join(DESKTOP, 'renderer', 'index.html'), 'utf8');
+	const bar = /<header class="appbar">[\s\S]*?<\/header>/.exec(index);
+	assert.ok(bar, 'index.html must keep the app bar header');
+	assert.equal((bar[0].match(/<span class="appbar-title">triage mail<\/span>/g) ?? []).length, 1, 'the bar names the app exactly once');
+	assert.match(bar[0], /<svg class="emblem"/, 'the emblem stays in the bar');
+	assert.equal(bar[0].includes('<h1>'), false, 'the bar carries no heading; each screen has its own h1');
+	const popup = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
+	assert.ok(!popup.includes('appbar-title'), 'the popup keeps its own lockup, not the app bar');
+});
+
+test('the app-bar title is centred on the whole bar and keeps 132px clear each side', () => {
+	const css = readFileSync(join(DESKTOP, 'renderer', 'renderer.css'), 'utf8');
+	const title = /\.appbar-title\s*\{([^}]*)\}/.exec(css);
+	assert.ok(title, 'renderer.css must style the app-bar title');
+	for (const decl of [
+		'position: absolute;',
+		'left: 50%;',
+		'top: 50%;',
+		'transform: translate(-50%, -50%);',
+		'max-width: calc(100% - 264px);',
+		'overflow: hidden;',
+		'text-overflow: ellipsis;',
+		'white-space: nowrap;',
+		'font-size: var(--item);',
+		'font-weight: 500;',
+		'line-height: 1.35;',
+		'color: var(--fg);',
+		'pointer-events: none;',
+	]) {
+		assert.ok(title[1].includes(decl), `.appbar-title must declare ${decl}`);
+	}
+	const bar = /\.appbar\s*\{([^}]*)\}/.exec(css);
+	assert.ok(bar, 'renderer.css must style the app bar');
+	assert.ok(bar[1].includes('position: relative;'), 'the bar anchors the absolutely positioned title');
+	assert.ok(bar[1].includes('justify-content: flex-end;'), 'the emblem stays at the right end');
+	const tokens = readFileSync(join(DESKTOP, 'renderer', 'tokens.css'), 'utf8');
+	assert.ok(tokens.includes('--item: 15px;'), 'tokens.css defines the item size the title uses');
+});
