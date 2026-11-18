@@ -27,3 +27,6 @@ CLAUDE.local.md
 desktop/node_modules/
 desktop/dist/
 desktop/out/
+
+# Rendered shots the CI job writes for comparison (actual/diff/report). Never committed.
+desktop/shots-out/
