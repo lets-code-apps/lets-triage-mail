@@ -17,7 +17,8 @@ desktop/              # the Electron app: its own package.json, no Cargo involve
   src/                # main process + controllers (TypeScript, ESM)
   renderer/           # two pages, no framework, no remote resources: the window (app shell) and the popup
   assets/             # the menu-bar template icon (18 px + 36 px @2x) and the app icon (icon.png, 1024 px)
-  test/               # node --test unit tests + synthetic fixtures
+  test/               # node --test unit tests + synthetic fixtures; test/shots/ renders the window shots
+  screenshots/        # approved baseline PNGs (synthetic data) for the CI window shots
 docs/DESKTOP.md       # this file
 ```
 
@@ -189,6 +190,35 @@ that returns one number after each status paint, then applied with `setBounds`. 
 script is not subject to the page's CSP, so this adds no preload function and no IPC channel; if a
 measurement ever fails the popup just keeps its last size (the next 5 s poll retries).
 
+### Screenshots and layout checks
+
+`npm run shots` (run by the `desktop-shots` CI job) renders the real window page eight times — accounts
+and settings, at 1100px and 360px, light and dark — with **synthetic data only**, measures the design
+layout, captures a PNG, and diffs it against the committed baseline in `desktop/screenshots/`. It loads
+the real `src/preload.cjs` and answers the IPC channels with `ipcMain.handle` in the main process (so
+the bridge is exercised, not stubbed), and reads `src/` and `renderer/` directly (no build step). No
+engine, no config file, no `~/.config`, no network, and no setup-check clock ever enters a shot. Captures
+are normalised to CSS pixels (a Retina Mac is 2×, a runner may be 1×), then compared with two named
+constants at the top of `test/shots/compare.ts` (`PIXEL_DELTA = 16`, `MAX_CHANGED_RATIO = 0.001`, about
+840 px at 1100×760). It prints one line per shot (`OK`/`CHANGED`/`MISSING`/`SIZE`) plus any layout
+violations, and writes `desktop/shots-out/` (the actual PNGs, a red diff per changed shot, and
+`report.json`), which the job uploads as an artifact.
+
+The layout assertions are the pure `checkLayout` in `test/shots/layout.ts`: the app-bar title centred
+on the whole bar with 132px of clear and on one line, the emblem at the bar's right end (the 24px
+token inset), the settings rows sharing one column, and every control meeting the design's 44px
+touch target. Four controls are not yet 44px tall (nav 41, the mode/appearance segment 38, the switch 24
+tall — its row is ≥44), so they carry `KNOWN_BELOW_44` floors: a **ratchet** that may grow but turns
+CI red the moment one shrinks. Raising them to 44 would change the look, which is out of scope for this
+change; it would be its own design increment with its own baseline.
+
+Updating the baseline **on purpose**: a change that is meant to alter the look turns `desktop-shots`
+red. The author downloads that run's artifact (`gh run download <run-id> -n desktop-shots`), reviews
+the `diff/` images, copies the changed `actual/*.png` into `desktop/screenshots/` and commits them in
+their own commit (`desktop: update screenshot baseline (<why>)`). The PNG change is then part of the
+PR diff, so the Reviewer and the board approve the new look there. CI never writes the baseline
+(`npm run shots -- --update` refuses when `CI` is set).
+
 ## Implemented, mockup only, future
 
 Keeping these three apart is the point: it stops this document from reading like a wish list, and
@@ -219,6 +249,11 @@ Keeping these three apart is the point: it stops this document from reading like
   window is visible.
 - The app name in the window bar: "triage mail" centred on the whole app bar, one line, ellipsis, 132px
   clear on each side, with the emblem staying at the right end.
+- The CI screenshot baseline and design layout checks (`desktop-shots` job): the window rendered in
+  eight synthetic states, a committed PNG baseline under `desktop/screenshots/`, and assertions that
+  the app-bar title is centred with 132px clear, the emblem sits at the right end, the settings rows
+  align, and the controls meet the design's 44px touch target (with a ratchet on the four controls the
+  app does not yet size to 44).
 - The engine start/stop/quit lifecycle: one SIGTERM then SIGKILL after the deadline, single-instance
   lock, explicit quit through `before-quit`.
 - `check --json` parsing and rendering as data only (`textContent`), with a defensive shape check.

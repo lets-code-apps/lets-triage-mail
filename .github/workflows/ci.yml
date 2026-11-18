@@ -83,3 +83,37 @@ jobs:
       - name: Smoke (real Electron)
         continue-on-error: true
         run: npm run smoke
+
+  # The desktop screenshot baseline + design layout assertions. A SEPARATE job so a red shot is
+  # never hidden behind the non-blocking smoke, and so the board can mark it required. It renders the
+  # real window page (synthetic data only) in eight states, measures the layout, and diffs each PNG
+  # against desktop/screenshots/. It uploads shots-out/ (actual + diff + report.json) so a failing
+  # run shows exactly which shot moved and where. macOS for the same reason as the desktop job.
+  desktop-shots:
+    name: desktop (layout + screenshots)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      # Blocking: a shot that differs beyond the threshold, a missing baseline, or a broken layout
+      # assertion turns this job red and the step summary lists them.
+      - run: npm run shots
+      # Upload even on failure: the artifact is how the baseline is made on purpose and how a reviewer
+      # sees a change. actions/upload-artifact is first-party (like checkout/setup-node above), not an
+      # npm dependency.
+      - name: Upload rendered shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-shots
+          path: desktop/shots-out
+          if-no-files-found: warn
