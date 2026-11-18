@@ -71,6 +71,17 @@ const SETTINGS = {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Wait until the page has really painted this section, not just until `load` fired. The first state
+// rendered in a run is otherwise captured mid-bootstrap: its account rows or settings rows are not
+// built yet, so its panes are a different height and a scrollbar appears only in one run -> the shot
+// differs run-to-run. The probe names the settled shape for each section; `renderOne` polls it.
+const SETTLED: Record<'accounts' | 'settings', string> = {
+	accounts: `(()=>{ const rows=document.querySelector('#rows'); const detail=document.querySelector('#detail');
+		return rows && rows.children.length>=2 && detail && detail.children.length>=1 && document.querySelector('#settings').hidden===true; })()`,
+	settings: `(()=>{ const s=document.querySelector('#settings');
+		return s && s.hidden===false && document.querySelectorAll('#settings .srow').length>=5; })()`,
+};
+
 // A stuck capturePage or loadFile must fail fast with a message, never hang the whole 10-minute job.
 async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -120,17 +131,29 @@ const bitmapOf = (image: Electron.NativeImage): { width: number; height: number;
 	return { width: size.width, height: size.height, data: image.toBitmap() };
 };
 
+// Poll the page until it has fully painted the requested section, then a short beat for fonts and the
+// section transition. Returns once the probe is true (or after ~3 s, so a broken page fails as an
+// empty shot rather than hanging).
+async function settle(win: BrowserWindow, section: 'accounts' | 'settings'): Promise<void> {
+	const probe = SETTLED[section];
+	for (let attempt = 0; attempt < 60; attempt += 1) {
+		const ready = await withTimeout(win.webContents.executeJavaScript(probe), 3000, `settle ${section}`);
+		if (ready) break;
+		await sleep(50);
+	}
+	await sleep(250);
+}
+
 async function renderOne(win: BrowserWindow, section: string, width: number, theme: string): Promise<{ name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer }> {
 	const name = `${section}-${width}-${theme}`;
 	nativeTheme.themeSource = theme as 'light' | 'dark';
 	win.setContentSize(width, HEIGHT);
 	await win.loadFile(RENDERER_HTML);
-	// Switch to the requested section, let the fonts load, then wait out the first paint and the
-	// section transition so the page has settled (and the 5 s poll's first round-trip has answered)
-	// before we measure and capture.
+	// Switch to the requested section, then wait until the page has really painted it (not just `load`)
+	// so rows/settings exist and no pane is scrolling mid-bootstrap before we measure and capture.
 	await win.webContents.executeJavaScript(`document.querySelector('[data-section="${section}"]').click(); true;`);
 	await win.webContents.executeJavaScript('document.fonts.ready.then(() => true)');
-	await sleep(350);
+	await settle(win, section as 'accounts' | 'settings');
 
 	const measured = (await win.webContents.executeJavaScript(MEASURE)) as Parameters<typeof checkLayout>[1];
 	const layout = checkLayout(section as 'accounts' | 'settings', measured);
@@ -163,6 +186,14 @@ async function main(): Promise<number> {
 		useContentSize: true,
 		webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: true },
 	});
+
+	// Warm-up load: the FIRST page load in a run bootstraps slower (fonts, first IPC round-trips), so
+	// without this the first captured state is the least-settled one and drifts run-to-run. Discard it.
+	nativeTheme.themeSource = 'light';
+	await win.loadFile(RENDERER_HTML);
+	await win.webContents.executeJavaScript(`document.querySelector('[data-section="accounts"]').click(); true;`);
+	await win.webContents.executeJavaScript('document.fonts.ready.then(() => true)');
+	await settle(win, 'accounts');
 
 	const rows: { name: string; status: string; px: number; ratio: number }[] = [];
 	const violations: string[] = [];
