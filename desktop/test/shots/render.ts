@@ -11,9 +11,14 @@
 // check in a shot: it prints `new Date()` ("Checked at HH:MM") and the PNG would change every minute.
 //
 // It imports `src/popup-model.ts` and `src/status-report.ts` (electron-free) to build the status
-// payload the same way main does, and the two pure helpers in this folder (`compare.ts`,
-// `layout.ts`) for the diff and the layout rules. Electron 45's Node strips the TypeScript types,
-// so this file runs as `electron test/shots/render.ts` with no build step.
+// payload the same way main does, and the three pure helpers in this folder (`compare.ts`, `layout.ts`,
+// `report.ts`) for the diff, the layout rules and the pass/fail report. Electron 45's Node strips the
+// TypeScript types, so this file runs as `electron test/shots/render.ts` with no build step.
+//
+// Failure handling: every page load and capture is time-bounded, a per-state failure is recorded as a
+// RENDER FAILED row, and any error is folded into `report.ts`'s report so a rejected render still writes
+// `report.json` and exits non-zero instead of escaping and skipping the write + exit (review round 1,
+// finding 1). `app.exit` always runs.
 
 import { app, BrowserWindow, ipcMain, nativeImage, nativeTheme } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -23,6 +28,8 @@ import { buildPopupView } from '../../src/popup-model.ts';
 import { parseStatusReport } from '../../src/status-report.ts';
 import { MAX_CHANGED_RATIO, PIXEL_DELTA, compareShots, makeDiffBitmap } from './compare.ts';
 import { checkLayout, MEASURE } from './layout.ts';
+import { finalize, exitCodeFor } from './report.ts';
+import type { Report, ShotRow } from './report.ts';
 
 const HERE = import.meta.dirname;
 const DESKTOP = join(HERE, '..', '..');
@@ -32,12 +39,15 @@ const FIXTURE = join(DESKTOP, 'test', 'fixtures', 'status-report.json');
 const SHOTS = join(DESKTOP, 'screenshots');
 const OUT_ACTUAL = join(DESKTOP, 'shots-out', 'actual');
 const OUT_DIFF = join(DESKTOP, 'shots-out', 'diff');
+const REPORT_JSON = join(DESKTOP, 'shots-out', 'report.json');
 
 const HEIGHT = 760;
 const WIDTHS = [1100, 360];
-const SECTIONS = ['accounts', 'settings'];
+const SECTIONS = ['accounts', 'settings'] as const;
 const THEMES = ['light', 'dark'];
+const LOAD_MS = 15_000; // a page load that never resolves is a failure, not a hang
 const CAPTURE_MS = 10_000;
+const SCRIPT_MS = 5_000; // in-page click / fonts.ready / probe
 // The LET-103 file names, so the committed baseline matches the shots already reviewed in history.
 // accounts-1100-light.png ... settings-360-dark.png (8 files).
 
@@ -71,18 +81,14 @@ const SETTINGS = {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Wait until the page has really painted this section, not just until `load` fired. The first state
-// rendered in a run is otherwise captured mid-bootstrap: its account rows or settings rows are not
-// built yet, so its panes are a different height and a scrollbar appears only in one run -> the shot
-// differs run-to-run. The probe names the settled shape for each section; `renderOne` polls it.
-const SETTLED: Record<'accounts' | 'settings', string> = {
-	accounts: `(()=>{ const rows=document.querySelector('#rows'); const detail=document.querySelector('#detail');
-		return rows && rows.children.length>=2 && detail && detail.children.length>=1 && document.querySelector('#settings').hidden===true; })()`,
-	settings: `(()=>{ const s=document.querySelector('#settings');
-		return s && s.hidden===false && document.querySelectorAll('#settings .srow').length>=5; })()`,
+// The message text for a thrown value (Error has stack; other throws may not).
+const asText = (thrown: unknown): string => {
+	if (thrown instanceof Error) return thrown.stack ?? thrown.message;
+	return String(thrown);
 };
 
-// A stuck capturePage or loadFile must fail fast with a message, never hang the whole 10-minute job.
+// A stuck loadFile, executeJavaScript or capturePage must fail fast with a message, never hang the
+// whole 10-minute job. Used for every page load and every in-page call.
 async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -93,6 +99,17 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 		if (timer !== undefined) clearTimeout(timer);
 	}
 }
+
+// Wait until the page has really painted this section, not just until `load` fired. The first state
+// rendered in a run is otherwise captured mid-bootstrap: its account rows or settings rows are not
+// built yet, so its panes are a different height and a scrollbar appears only in one run -> the shot
+// differs run-to-run. The probe names the settled shape for each section; `settle` polls it.
+const SETTLED: Record<'accounts' | 'settings', string> = {
+	accounts: `(()=>{ const rows=document.querySelector('#rows'); const detail=document.querySelector('#detail');
+		return rows && rows.children.length>=2 && detail && detail.children.length>=1 && document.querySelector('#settings').hidden===true; })()`,
+	settings: `(()=>{ const s=document.querySelector('#settings');
+		return s && s.hidden===false && document.querySelectorAll('#settings .srow').length>=5; })()`,
+};
 
 // The status payload for the accounts screen, built exactly like main does: parse the fixture, then
 // format it. Pinning locale/zone makes the "since HH:MM" text identical on every machine, so the
@@ -131,41 +148,114 @@ const bitmapOf = (image: Electron.NativeImage): { width: number; height: number;
 	return { width: size.width, height: size.height, data: image.toBitmap() };
 };
 
+// Load the window page and switch to a section, then wait until it has painted, so rows/settings exist
+// and no pane is scrolling mid-bootstrap before we measure and capture. Every step is time-bounded.
+async function loadAndSettle(win: BrowserWindow, section: 'accounts' | 'settings', label: string): Promise<void> {
+	await withTimeout(win.loadFile(RENDERER_HTML), LOAD_MS, `loadFile ${label}`);
+	await withTimeout(win.webContents.executeJavaScript(`document.querySelector('[data-section="${section}"]').click(); true;`), SCRIPT_MS, `click ${label}`);
+	await withTimeout(win.webContents.executeJavaScript('document.fonts.ready.then(() => true)'), SCRIPT_MS, `fonts ${label}`);
+	await settle(win, section);
+}
+
 // Poll the page until it has fully painted the requested section, then a short beat for fonts and the
-// section transition. Returns once the probe is true (or after ~3 s, so a broken page fails as an
-// empty shot rather than hanging).
+// section transition. Each probe call is time-bounded so a broken page fails rather than hangs.
 async function settle(win: BrowserWindow, section: 'accounts' | 'settings'): Promise<void> {
 	const probe = SETTLED[section];
 	for (let attempt = 0; attempt < 60; attempt += 1) {
-		const ready = await withTimeout(win.webContents.executeJavaScript(probe), 3000, `settle ${section}`);
+		const ready = await withTimeout(win.webContents.executeJavaScript(probe), SCRIPT_MS, `settle ${section}`);
 		if (ready) break;
 		await sleep(50);
 	}
 	await sleep(250);
 }
 
-async function renderOne(win: BrowserWindow, section: string, width: number, theme: string): Promise<{ name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer }> {
+// Render one state end-to-end: load, measure the layout, capture a CSS-pixel PNG. Throws (bounded) if
+// any step fails; `main` turns that into a RENDER FAILED row rather than aborting the whole pass.
+async function renderOne(win: BrowserWindow, section: 'accounts' | 'settings', width: number, theme: string): Promise<{ name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer }> {
 	const name = `${section}-${width}-${theme}`;
 	nativeTheme.themeSource = theme as 'light' | 'dark';
 	win.setContentSize(width, HEIGHT);
-	await win.loadFile(RENDERER_HTML);
-	// Switch to the requested section, then wait until the page has really painted it (not just `load`)
-	// so rows/settings exist and no pane is scrolling mid-bootstrap before we measure and capture.
-	await win.webContents.executeJavaScript(`document.querySelector('[data-section="${section}"]').click(); true;`);
-	await win.webContents.executeJavaScript('document.fonts.ready.then(() => true)');
-	await settle(win, section as 'accounts' | 'settings');
+	await loadAndSettle(win, section, name);
 
-	const measured = (await win.webContents.executeJavaScript(MEASURE)) as Parameters<typeof checkLayout>[1];
-	const layout = checkLayout(section as 'accounts' | 'settings', measured);
+	const measured = (await withTimeout(win.webContents.executeJavaScript(MEASURE), SCRIPT_MS, `measure ${name}`)) as Parameters<typeof checkLayout>[1];
+	const layout = checkLayout(section, measured);
 
 	const raw = await withTimeout(win.webContents.capturePage(), CAPTURE_MS, `capturePage ${name}`);
 	const image = normalise(raw, width);
 	return { name, layout, actual: bitmapOf(image), png: image.toPNG() };
 }
 
-async function main(): Promise<number> {
-	registerIpc();
+// Write the report (report.json) and print the human-readable pass. The step summary is appended when the
+// GitHub env var is present, including any error and the layout violations, so the run page lists them.
+function emitReport(report: Report, update: boolean): void {
+	writeFileSync(REPORT_JSON, JSON.stringify(report, null, 2));
 
+	for (const row of report.rows) {
+		if (row.status === 'OK') console.log(`OK      ${row.name} (${row.px} px)`);
+		else if (row.status === 'CHANGED') console.log(`CHANGED ${row.name}: ${row.px} px (${(row.ratio * 100).toFixed(2)}%)`);
+		else if (row.status === 'UPDATED') console.log(`UPDATED ${row.name}`);
+		else if (row.status === 'MISSING') console.log(`MISSING ${row.name}`);
+		else console.log(`SHOT    ${row.name}: ${row.status}`);
+	}
+	for (const violation of report.violations) console.log(`LAYOUT  ${violation}`);
+	if (report.error) console.log(`ERROR   ${report.error.split('\n')[0]}`);
+
+	const ok = report.ok;
+	console.log(`${ok ? 'ALL' : 'FAILED'} ${report.rows.length} shots, ${report.violations.length} layout violation(s), delta=${PIXEL_DELTA}, ratio<=${MAX_CHANGED_RATIO}`);
+
+	if (process.env.GITHUB_STEP_SUMMARY) {
+		const table = ['', '| shot | status | px | ratio |', '|---|---|---|---|'];
+		for (const row of report.rows) table.push(`| ${row.name} | ${row.status} | ${row.px} | ${(row.ratio * 100).toFixed(3)}% |`);
+		if (report.violations.length > 0) {
+			table.push('', '### layout violations', '');
+			for (const violation of report.violations) table.push(`- ${violation}`);
+		}
+		if (report.error) table.push('', '### error', '', `\`\`\`\n${report.error}\n\`\`\``);
+		writeFileSync(process.env.GITHUB_STEP_SUMMARY, table.join('\n') + '\n', { flag: 'a' });
+	}
+	void update;
+}
+
+// Run one state, then fold its outcome into the report rows. A throw here is recorded (RENDER FAILED) and
+// captured into `error` so the pass still produces a report; a per-state failure never aborts the rest.
+async function captureIntoReport(win: BrowserWindow, section: 'accounts' | 'settings', width: number, theme: string, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
+	const name = `${section}-${width}-${theme}`;
+	let rendered: { name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer };
+	try {
+		rendered = await renderOne(win, section, width, theme);
+	} catch (thrown) {
+		rows.push({ name, status: 'RENDER FAILED', px: 0, ratio: 0 });
+		throw Object.assign(new Error(`RENDER FAILED ${name}: ${asText(thrown)}`), { alreadyRecorded: true });
+	}
+	for (const violation of rendered.layout) violations.push(`${name}: ${violation}`);
+	writeFileSync(join(OUT_ACTUAL, `${name}.png`), rendered.png);
+
+	const baselinePath = join(SHOTS, `${name}.png`);
+	if (update) {
+		writeFileSync(baselinePath, rendered.png);
+		rows.push({ name, status: 'UPDATED', px: 0, ratio: 0 });
+		return;
+	}
+	if (!existsSync(baselinePath)) {
+		rows.push({ name, status: 'MISSING', px: 0, ratio: 0 });
+		return;
+	}
+	const baseline = bitmapOf(nativeImage.createFromBuffer(readFileSync(baselinePath)));
+	const shot = compareShots(rendered.actual, baseline, { delta: PIXEL_DELTA, maxRatio: MAX_CHANGED_RATIO });
+	if (shot.kind === 'size') {
+		rows.push({ name, status: `SIZE ${rendered.actual.width}x${rendered.actual.height} vs ${baseline.width}x${baseline.height}`, px: 0, ratio: 0 });
+		return;
+	}
+	if (shot.kind === 'changed') {
+		rows.push({ name, status: 'CHANGED', px: shot.changed, ratio: shot.ratio });
+		const diff = makeDiffBitmap(baseline.data, rendered.actual.data, baseline.width, baseline.height, PIXEL_DELTA);
+		writeFileSync(join(OUT_DIFF, `${name}.png`), nativeImage.createFromBitmap(Buffer.from(diff), { width: baseline.width, height: baseline.height }).toPNG());
+		return;
+	}
+	rows.push({ name, status: 'OK', px: shot.changed, ratio: shot.ratio });
+}
+
+async function main(): Promise<number> {
 	const update = process.argv.includes('--update');
 	if (update && process.env.CI) {
 		// Never let CI write the baseline: that is out of scope. A baseline is a reviewed commit.
@@ -173,100 +263,76 @@ async function main(): Promise<number> {
 		return 2;
 	}
 
-	mkdirSync(OUT_ACTUAL, { recursive: true });
-	if (update) mkdirSync(SHOTS, { recursive: true });
-	else mkdirSync(OUT_DIFF, { recursive: true });
-
-	// One window, reused for all eight states. A reload re-paints the fresh page at the new size and
-	// theme; destroying it and creating the next made the second load fail with ERR_FAILED.
-	const win = new BrowserWindow({
-		show: false,
-		width: WIDTHS[0],
-		height: HEIGHT,
-		useContentSize: true,
-		webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: true },
-	});
-
-	// Warm-up load: the FIRST page load in a run bootstraps slower (fonts, first IPC round-trips), so
-	// without this the first captured state is the least-settled one and drifts run-to-run. Discard it.
-	nativeTheme.themeSource = 'light';
-	await win.loadFile(RENDERER_HTML);
-	await win.webContents.executeJavaScript(`document.querySelector('[data-section="accounts"]').click(); true;`);
-	await win.webContents.executeJavaScript('document.fonts.ready.then(() => true)');
-	await settle(win, 'accounts');
-
-	const rows: { name: string; status: string; px: number; ratio: number }[] = [];
+	const rows: ShotRow[] = [];
 	const violations: string[] = [];
-	let failing = false;
+	let error: string | undefined;
 
-	for (const section of SECTIONS) {
-		for (const width of WIDTHS) {
-			for (const theme of THEMES) {
-				const rendered = await renderOne(win, section, width, theme);
-				const name = rendered.name;
-				for (const violation of rendered.layout) violations.push(`${name}: ${violation}`);
-				writeFileSync(join(OUT_ACTUAL, `${name}.png`), rendered.png);
+	// Every step below is bounded, but this catch is the last line of defence: an unexpected throw still
+	// records the error into the report so the job writes report.json and exits non-zero (never hangs,
+	// never silently skips the write + exit).
+	try {
+		registerIpc();
+		mkdirSync(OUT_ACTUAL, { recursive: true });
+		if (update) mkdirSync(SHOTS, { recursive: true });
+		else mkdirSync(OUT_DIFF, { recursive: true });
 
-				const baselinePath = join(SHOTS, `${name}.png`);
-				if (update) {
-					writeFileSync(baselinePath, rendered.png);
-					rows.push({ name, status: 'UPDATED', px: 0, ratio: 0 });
-					continue;
+		// One window, reused for all eight states. A reload re-paints the fresh page at the new size and
+		// theme; destroying it and creating the next made the second load fail with ERR_FAILED.
+		const win = new BrowserWindow({
+			show: false,
+			width: WIDTHS[0],
+			height: HEIGHT,
+			useContentSize: true,
+			webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: true },
+		});
+
+		// Warm-up load: the FIRST page load in a run bootstraps slower (fonts, first IPC round-trips), so
+		// without this the first captured state is the least-settled one and drifts run-to-run. It is best-
+		// effort: if it fails we let each state report its own bounded failure rather than aborting here.
+		try {
+			await loadAndSettle(win, 'accounts', 'warm-up');
+		} catch (thrown) {
+			console.warn(`warm-up load failed (states will report their own): ${asText(thrown).split('\n')[0]}`);
+		}
+
+		for (const section of SECTIONS) {
+			for (const width of WIDTHS) {
+				for (const theme of THEMES) {
+					try {
+						await captureIntoReport(win, section, width, theme, update, rows, violations);
+					} catch (thrown) {
+						// captureIntoReport already added a RENDER FAILED row; keep the first error text.
+						if (error === undefined) error = asText(thrown);
+					}
 				}
-				if (!existsSync(baselinePath)) {
-					rows.push({ name, status: 'MISSING', px: 0, ratio: 0 });
-					failing = true;
-					continue;
-				}
-				const baseline = bitmapOf(nativeImage.createFromBuffer(readFileSync(baselinePath)));
-				const shot = compareShots(rendered.actual, baseline, { delta: PIXEL_DELTA, maxRatio: MAX_CHANGED_RATIO });
-				if (shot.kind === 'size') {
-					rows.push({ name, status: `SIZE ${rendered.actual.width}x${rendered.actual.height} vs ${baseline.width}x${baseline.height}`, px: 0, ratio: 0 });
-					failing = true;
-					continue;
-				}
-				if (shot.kind === 'changed') {
-					rows.push({ name, status: 'CHANGED', px: shot.changed, ratio: shot.ratio });
-					failing = true;
-					const diff = makeDiffBitmap(baseline.data, rendered.actual.data, baseline.width, baseline.height, PIXEL_DELTA);
-					writeFileSync(join(OUT_DIFF, `${name}.png`), nativeImage.createFromBitmap(Buffer.from(diff), { width: baseline.width, height: baseline.height }).toPNG());
-					continue;
-				}
-				rows.push({ name, status: 'OK', px: shot.changed, ratio: shot.ratio });
 			}
 		}
+	} catch (thrown) {
+		if (error === undefined) error = asText(thrown);
 	}
 
-	// One line per shot is the "list the changed shots" requirement; the summary table then lands on
-	// the GitHub run page when the step-summary env var is present.
-	for (const row of rows) {
-		if (row.status === 'OK') console.log(`OK      ${row.name} (${row.px} px)`);
-		else if (row.status === 'CHANGED') console.log(`CHANGED ${row.name}: ${row.px} px (${(row.ratio * 100).toFixed(2)}%)`);
-		else if (row.status === 'UPDATED') console.log(`UPDATED ${row.name}`);
-		else if (row.status === 'MISSING') console.log(`MISSING ${row.name}`);
-		else console.log(`SIZE    ${row.name}: ${row.status}`);
-	}
-	for (const violation of violations) console.log(`LAYOUT  ${violation}`);
-
-	const ok = !failing && violations.length === 0;
-	console.log(`${ok ? 'ALL' : 'FAILED'} ${rows.length} shots, ${violations.length} layout violation(s), delta=${PIXEL_DELTA}, ratio<=${MAX_CHANGED_RATIO}`);
-
-	if (process.env.GITHUB_STEP_SUMMARY) {
-		const table = ['', '| shot | status | px | ratio |', '|---|---|---|---|'];
-		for (const row of rows) table.push(`| ${row.name} | ${row.status} | ${row.px} | ${(row.ratio * 100).toFixed(3)}% |`);
-		if (violations.length > 0) {
-			table.push('', '### layout violations', '');
-			for (const violation of violations) table.push(`- ${violation}`);
-		}
-		writeFileSync(process.env.GITHUB_STEP_SUMMARY, table.join('\n') + '\n', { flag: 'a' });
-	}
-
-	writeFileSync(join(OUT_ACTUAL, '..', 'report.json'), JSON.stringify({ ok, rows, violations }, null, 2));
-	return ok ? 0 : 1;
+	const report = finalize({ rows, violations, error });
+	emitReport(report, update);
+	return exitCodeFor(report);
 }
 
-// Electron's real entry point: when the app is ready, run the pass and quit with its status code.
-app.whenReady().then(async () => {
-	const code = await main();
-	app.exit(code);
-});
+// Electron's real entry point: when the app is ready, run the pass and quit with its status code. The
+// catch guards the whole chain so `app.exit` always runs even if `whenReady` or `main` somehow throws --
+// a stuck CI job is the exact failure finding 1 was about.
+app.whenReady()
+	.then(async () => {
+		let code = 1;
+		try {
+			code = await main();
+		} catch (thrown) {
+			console.error(`shots harness failed after main: ${asText(thrown)}`);
+			const report = finalize({ rows: [], violations: [], error: asText(thrown) });
+			writeFileSync(REPORT_JSON, JSON.stringify(report, null, 2));
+			code = exitCodeFor(report);
+		}
+		app.exit(code);
+	})
+	.catch((thrown) => {
+		console.error(`shots harness could not start: ${asText(thrown)}`);
+		app.exit(1);
+	});
