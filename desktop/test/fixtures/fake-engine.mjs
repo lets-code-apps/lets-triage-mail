@@ -9,6 +9,7 @@
 //   run --emit-logs         floods stdout with 600 lines (ring-buffer cap check)
 //   check --json            prints fixtures/check-report.json
 //   status --json           prints fixtures/status-report.json
+//   status --calm           prints fixtures/status-report-calm.json (needs reply 0 everywhere)
 //   status --exit-1         prints nothing and exits 1 (the popup shows the engine's own reason)
 //   --version               prints `lets-triage-mail 0.1.0`
 //

@@ -16,6 +16,7 @@ import { EngineController, CONFIG_TEST_TIMEOUT_MS, defaultSpawn } from './engine
 import { buildEditRequests, parseConfigShow, toEditResult, type AccountOp, type EditResult } from './account-edit.ts';
 import { WindowController } from './window.ts';
 import { buildPopupView } from './popup-model.ts';
+import { openMail } from './open-mail.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
@@ -52,6 +53,11 @@ const ctl = new WindowController(() => makeWindow(), {
 });
 let tray: Tray | undefined;
 let quitInFlight = false;
+// When the user pressed Stop in this session (epoch seconds), so the popup can say "paused at HH:MM"
+// rather than a bare "not running". In memory only (board decision): after an app restart this is null,
+// and the popup uses the time-free "Paused." sentence. `null` while the engine is running or has never
+// been stopped here is what keeps a crash (`failed`) and "never started" reading as not paused.
+let pausedAt: number | null = null;
 
 // The app's own settings (appearance only): one small JSON file in userData. `nativeTheme` makes
 // both pages follow it through prefers-color-scheme. Login-item state is macOS's, not ours.
@@ -237,7 +243,7 @@ function runAction(action: EngineCommand): void {
 			void performStart();
 			break;
 		case 'stop':
-			void engine.stop();
+			void pauseEngine();
 			break;
 		case 'check':
 			void deliverCheck();
@@ -262,8 +268,28 @@ function runAction(action: EngineCommand): void {
 async function performStart(): Promise<void> {
 	const result = await engine.status();
 	const external = result.kind === 'status' && result.report.engine.running && !appOwnsEngine();
-	if (!external) engine.start();
+	if (!external) {
+		// A Start this session clears the pause marker: the engine is live again, so "paused" is gone.
+		pausedAt = null;
+		engine.start();
+	}
 }
+
+// The Stop/Press-pause action, shared by the tray menu, the window button and the popup button. It
+// records the moment (memory only) so the popup can read "paused at HH:MM", then stops the engine
+// exactly as before (one SIGTERM then SIGKILL). Only Stop goes through here; the quit path (before-quit)
+// stops without marking a pause, because the app is ending, not pausing.
+async function pauseEngine(): Promise<void> {
+	pausedAt = Math.floor(Date.now() / 1000);
+	await engine.stop();
+}
+
+// The `paused` argument for both `buildPopupView` calls: only this app's own `stopped` state is a pause
+// (a crash is `failed`, a live engine is `running`, and `starting`/`stopping` are in-between). `at` is
+// the moment we saw the Stop, or null after a restart, which the view model turns into the time-free
+// sentence. `buildPopupView` also ignores it while the report says the engine is running.
+const pausedOption = (): { at: number | null } | null =>
+	engine.getState().state === 'stopped' ? { at: pausedAt } : null;
 
 // One accounts-screen action: validate, confirm if it is consequential, run, then restart the engine
 // the app owns so a change takes effect (the engine reads its config only at start).
@@ -419,6 +445,7 @@ function boot(): void {
 			? statusPayload(result, buildPopupView(result.report, {
 				...clockOptions(),
 				ownsEngine: appOwnsEngine(),
+				paused: pausedOption(),
 			}))
 			: { kind: 'error', message: result.message };
 		// Ask for a re-measure, deferred with `setImmediate` so this handler's return value reaches
@@ -452,13 +479,19 @@ function boot(): void {
 			return { command, view: engine.getState(), error: 'sender not allowed' } satisfies CommandResult;
 		}
 		if (command === 'start') await performStart();
-		else if (command === 'stop') await engine.stop();
+		else if (command === 'stop') await pauseEngine();
 		else if (command === 'openWindow') {
 			popupCtl.close();
 			ctl.open();
 		} else if (command === 'openSettings') {
 			popupCtl.close();
 			runAction('openSettings');
+		} else if (command === 'openMail') {
+			// One of the popup's three count buttons: open Apple Mail itself (no folder). The argv is
+			// fixed in open-mail.ts and this command carries no argument, so nothing from the page is
+			// ever interpolated; the handler already refused any sender that is not one of our two pages.
+			popupCtl.close();
+			void openMail();
 		}
 		else if (command === 'quit') {
 			// The popup's Quit button: the same path as the tray item and Cmd+Q.
@@ -509,9 +542,12 @@ function runSmoke(): void {
 					fail('status --json did not produce a report');
 					return; // unreachable: `fail` exits; the return only keeps the type narrow
 				}
-				const view = buildPopupView(result.report, clockOptions());
-				if (view.headline.length === 0 || view.accounts.length === 0) fail('the popup view is empty');
-				console.error(`SMOKE STATUS OK: ${view.summary} · ${view.subline}`);
+				const view = buildPopupView(result.report, { ...clockOptions(), paused: pausedOption() });
+				// The counts strip is the whole point of this surface: exactly three cells (needs reply,
+				// fyi, done), plus at least one account row and a non-empty note line.
+				if (view.strip.length !== 3 || view.accounts.length === 0 || view.note === '') fail('the popup view is empty');
+				const cells = view.strip.map((cell) => `${cell.label} ${cell.count}`).join(' · ');
+				console.error(`SMOKE STATUS OK: ${view.summary} · ${cells} · ${view.note}`);
 				// 3. Quit must stop the engine and end the app within the 5s deadline (exit 0).
 				app.on('will-quit', () => {
 					clearTimeout(deadline);

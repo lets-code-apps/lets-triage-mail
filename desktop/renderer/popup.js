@@ -16,16 +16,20 @@ const TONES = ['positive', 'attention', 'danger', 'muted'];
 // process answers `idle` and spawns nothing at all.
 const REFRESH_MS = 5_000;
 
-const countEl = document.getElementById('count');
-const pillEl = document.getElementById('pill');
-const sublineEl = document.getElementById('subline');
+const stripEl = document.getElementById('strip');
+const cells = [...stripEl.querySelectorAll('.cell')];
 const connectedEl = document.getElementById('connected');
 const accountsEl = document.getElementById('accounts');
+const pausedPillEl = document.getElementById('pausedPill');
+const noteEl = document.getElementById('note');
 const toggleBtn = document.getElementById('toggle');
 const toggleLabel = document.getElementById('toggleLabel');
 
 let engineView = { state: 'stopped', failureTail: [] };
 let startDisabled = false;
+// Whether the app considers the engine paused (Stop pressed this session): shows the "paused" pill and
+// makes the footer button read "resume triage". main decides it; the page only reflects it.
+let paused = false;
 
 const pillClass = (tone) => (TONES.includes(tone) ? 'pill ' + tone : 'pill');
 
@@ -47,7 +51,9 @@ function renderEngine() {
 	const state = engineView.state;
 	const busy = state === 'starting' || state === 'stopping';
 	const running = state === 'running';
-	toggleLabel.textContent = busy ? (state === 'starting' ? 'starting…' : 'pausing…') : running ? 'pause triage' : 'start triage';
+	// "resume triage" is the paused copy: the engine is down because Stop was pressed here, so the next
+	// press resumes rather than cold-starts. Anything else that is not running still says "start triage".
+	toggleLabel.textContent = busy ? (state === 'starting' ? 'starting…' : 'pausing…') : running ? 'pause triage' : paused ? 'resume triage' : 'start triage';
 	toggleBtn.querySelector('use').setAttribute('href', running ? '#i-pause' : '#i-play');
 	toggleBtn.querySelector('.icon').toggleAttribute('hidden', busy); // SVG elements have no .hidden property
 	toggleBtn.querySelector('.busy-dot').hidden = !busy;
@@ -61,21 +67,34 @@ function render(payload) {
 	if (!payload || payload.kind === 'idle') return; // hidden: nothing to paint
 
 	if (payload.kind === 'error') {
-		// The engine's own reason, as one line of text.
-		countEl.textContent = '—';
-		pillEl.className = pillClass('muted');
-		pillEl.textContent = 'not running';
-		sublineEl.textContent = String(payload.message);
+		// No trustworthy numbers: hide the whole strip and the paused pill, keep the engine's reason on
+		// the note line (the old subline's job), and drop the account rows.
+		stripEl.hidden = true;
+		pausedPillEl.hidden = true;
+		noteEl.textContent = String(payload.message);
 		connectedEl.textContent = '';
 		clear();
 		return;
 	}
+	stripEl.hidden = false;
 
 	const view = payload.view;
-	countEl.textContent = view.headline;
-	pillEl.className = pillClass(view.pillTone);
-	pillEl.textContent = view.pill;
-	sublineEl.textContent = view.subline;
+	// Paint the three cells from the strip main already built: the number, the label, the needs-reply
+	// dot (shown only for the allow-listed 'attention' tone), and the accessible name that repeats the
+	// count. The page formats nothing itself.
+	for (let i = 0; i < cells.length && i < view.strip.length; i += 1) {
+		const cell = view.strip[i];
+		const button = cells[i];
+		button.querySelector('.num').textContent = cell.count;
+		button.querySelector('.lbl').textContent = cell.label;
+		const dot = button.querySelector('.dot');
+		if (dot) dot.hidden = cell.tone !== 'attention';
+		button.setAttribute('aria-label', cell.aria);
+	}
+	// The paused pill and the note line are main's words; the page only shows/hides and assigns text.
+	paused = Boolean(view.paused);
+	pausedPillEl.hidden = !paused;
+	noteEl.textContent = view.note;
 	connectedEl.textContent = view.summary;
 	// main already decided whether Start is safe (a fresh status may show an engine this app did
 	// not start); the page only reflects that, it never decides it.
@@ -122,7 +141,9 @@ const run = (command) => () => {
 
 toggleBtn.addEventListener('click', () => run(engineView.state === 'running' ? 'stop' : 'start')());
 document.getElementById('open').addEventListener('click', run('openWindow'));
-document.getElementById('summary').addEventListener('click', run('openWindow'));
+// All three count buttons do the same thing: open Apple Mail itself via the fixed `openMail` command.
+// The cell is not identified to main — there is no folder or per-message target, by design.
+for (const cell of cells) cell.addEventListener('click', run('openMail'));
 document.getElementById('settings').addEventListener('click', run('openSettings'));
 // Quit ends the app (and stops the engine); the popup closes with it.
 document.getElementById('quit').addEventListener('click', () => {
