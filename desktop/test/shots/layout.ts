@@ -167,3 +167,92 @@ export const MEASURE = `
   };
 })()
 `;
+
+// --- the popup counts strip -----------------------------------------------------------
+// The window measures the app bar and settings rows; the popup measures its counts strip. The rules
+// are the design's: three equal cells that meet the 44px touch target, each a real button reachable by
+// keyboard, each named with its count (so a screen reader hears "needs reply, 4, open Apple Mail"), and
+// the decorative dot and corner arrow hidden from assistive tech. `render.ts` runs MEASURE_POPUP in the
+// live page and feeds the same pure function the six real popup states.
+export type PopupCell = {
+	tag: string; // tagName of the cell element
+	width: number;
+	height: number;
+	ariaLabel: string; // the whole cell's accessible name
+	dotHidden: boolean; // the dot, when the cell has one, is aria-hidden (true when there is no dot)
+	iconHidden: boolean; // the corner arrow is aria-hidden
+};
+
+export type PopupMeasure = {
+	cells: PopupCell[];
+	noteFilled: boolean; // the strip-note line has text (normal/calm/paused all fill it)
+};
+
+// Returns the list of violations; empty means every rule holds. Messages name the rule, so a red job
+// points at the exact assertion.
+export function checkPopupLayout(m: PopupMeasure): string[] {
+	const v: string[] = [];
+
+	if (m.cells.length !== 3) {
+		v.push(`popup strip must have 3 cells, saw ${m.cells.length}`);
+		return v; // nothing else is meaningful with the wrong cell count
+	}
+
+	const firstWidth = m.cells[0].width;
+	for (let i = 0; i < m.cells.length; i += 1) {
+		const c = m.cells[i];
+		if (c.tag !== 'BUTTON') {
+			v.push(`cell ${i} is <${c.tag.toLowerCase()}>, expected a <button> for keyboard reach`);
+		}
+		if (c.height < 44) {
+			v.push(`cell ${i} height ${r2(c.height)} below the 44px touch target`);
+		}
+		if (!/, \d+, open Apple Mail$/.test(c.ariaLabel)) {
+			v.push(`cell ${i} aria-label must name the count and the action, saw "${c.ariaLabel}"`);
+		}
+		if (!c.dotHidden) {
+			v.push(`cell ${i} dot must be aria-hidden`);
+		}
+		if (!c.iconHidden) {
+			v.push(`cell ${i} icon must be aria-hidden`);
+		}
+	}
+
+	// The three cells share the strip equally: equal widths (within 1px of a rounding gap).
+	for (const c of m.cells) {
+		if (Math.abs(c.width - firstWidth) > 1) {
+			v.push(`cells not equal width: ${r2(c.width)} vs first ${r2(firstWidth)}`);
+			break;
+		}
+	}
+
+	if (!m.noteFilled) {
+		v.push('the strip note line is empty');
+	}
+
+	return v;
+}
+
+// The in-page measuring snippet for the popup (a string, so `render.ts` can pass it to executeJavaScript
+// and the unit test can assert on its text without running it). Reads only getBoundingClientRect and the
+// aria/hidden attributes; changes nothing and reads no engine data.
+export const MEASURE_POPUP = `
+(() => {
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const cells = [...document.querySelectorAll('#strip .cell')].filter(visible).map((el) => {
+    const r = el.getBoundingClientRect();
+    const dot = el.querySelector('.dot');
+    const icon = el.querySelector('svg.icon');
+    return {
+      tag: el.tagName,
+      width: r.width,
+      height: r.height,
+      ariaLabel: el.getAttribute('aria-label') ?? '',
+      dotHidden: dot ? dot.getAttribute('aria-hidden') === 'true' : true,
+      iconHidden: icon ? icon.getAttribute('aria-hidden') === 'true' : true,
+    };
+  });
+  const note = document.querySelector('#note');
+  return { cells, noteFilled: !!note && note.textContent.trim() !== '' };
+})()
+`;

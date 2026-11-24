@@ -54,7 +54,7 @@ body {
 
 #strip {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0 var(--s-4) var(--s-2);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -66,7 +66,7 @@ body {
    corner-arrow, label); neighbours split by a 1px line, never a gap. Fills `raised` on hover. */
 .cell {
   display: grid;
-  grid-template-columns: auto auto 1fr;
+  grid-template-columns: auto auto minmax(0, 1fr);
   grid-template-rows: auto auto;
   align-items: center;
   justify-items: start;
