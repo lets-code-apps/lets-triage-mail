@@ -15,7 +15,7 @@ import { pathToFileURL } from 'node:url';
 import { EngineController, CONFIG_TEST_TIMEOUT_MS, defaultSpawn } from './engine.ts';
 import { buildEditRequests, parseConfigShow, toEditResult, type AccountOp, type EditResult } from './account-edit.ts';
 import { WindowController } from './window.ts';
-import { buildPopupView } from './popup-model.ts';
+import { buildPopupView, type PopupView } from './popup-model.ts';
 import { openMail } from './open-mail.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
@@ -28,6 +28,7 @@ import {
 	statusPayload,
 	type CommandResult,
 	type EngineCommand,
+	type StatusResult,
 	type SettingsPayload,
 	type StatusPayload,
 } from './ipc.ts';
@@ -533,25 +534,47 @@ function runSmoke(): void {
 		browser.close(); // red button / Cmd+W
 		if (browser.isVisible()) fail('window still visible after close');
 		if (engine.getState().state !== 'running') fail('engine stopped when the window closed');
-		// 2. The popup's data path: one status read, parsed, and turned into ready-to-print strings.
-		//    No window rendering is needed to prove the engine round-trip works end to end.
+		// 2. The popup's data path in all three states — normal, calm and paused — so the smoke exercises
+		//    the same three the screenshots do. `status` is parsed and turned into ready-to-print strings
+		//    without rendering a window: that proves the engine round-trip and the view model, not the pixels.
+		//    The desktop always runs `status --json`, so the fake engine is told which state to report through
+		//    LTM_FAKE_STATUS (the child inherits the parent environment; see EngineController's spawn).
+		const expect = (view: PopupView, label: string, needles: string[]): void => {
+			// The counts strip is the whole point of this surface: exactly three cells (needs reply, fyi,
+			// done), at least one account row, and a non-empty note line — in every state.
+			if (view.strip.length !== 3) fail(`${label}: strip is not three cells: ${view.strip.length}`);
+			if (view.accounts.length === 0 && view.summary !== 'No accounts configured.') fail(`${label}: no rows`);
+			if (view.note === '') fail(`${label}: empty note`);
+			const line = `${view.strip.map((cell) => `${cell.label} ${cell.count}`).join(' · ')} · paused=${view.paused} · ${view.note}`;
+			for (const needle of needles) if (!line.includes(needle)) fail(`${label}: missing "${needle}" in ${line}`);
+			console.error(`SMOKE POPUP OK: ${label}: ${line}`);
+		};
+		const asView = (result: StatusResult, label: string): PopupView => {
+			if (result.kind !== 'status') return fail(`${label}: status --json did not produce a report`);
+			return buildPopupView(result.report, { ...clockOptions(), paused: pausedOption() });
+		};
 		void engine
-			.status()
-			.then((result) => {
-				if (result.kind !== 'status') {
-					fail('status --json did not produce a report');
-					return; // unreachable: `fail` exits; the return only keeps the type narrow
-				}
-				const view = buildPopupView(result.report, { ...clockOptions(), paused: pausedOption() });
-				// The counts strip is the whole point of this surface: exactly three cells (needs reply,
-				// fyi, done), plus at least one account row and a non-empty note line.
-				if (view.strip.length !== 3 || view.accounts.length === 0 || view.note === '') fail('the popup view is empty');
-				const cells = view.strip.map((cell) => `${cell.label} ${cell.count}`).join(' · ');
-				console.error(`SMOKE STATUS OK: ${view.summary} · ${cells} · ${view.note}`);
+			.status() // normal: needs reply 4, engine running, not paused
+			.then((normal) => {
+				expect(asView(normal, 'normal'), 'normal', ['needs reply 4', 'paused=false']);
+				process.env.LTM_FAKE_STATUS = 'calm';
+				return engine.status(); // calm: needs reply 0 everywhere, engine running, not paused
+			})
+			.then((calm) => {
+				expect(asView(calm, 'calm'), 'calm', ['needs reply 0', 'paused=false']);
+				return pauseEngine(); // this app presses pause: pausedAt recorded in memory, engine stops
+			})
+			.then(() => {
+				process.env.LTM_FAKE_STATUS = 'paused';
+				return engine.status(); // paused: engine stopped AND this app saw the Stop -> the paused note
+			})
+			.then((paused) => {
+				delete process.env.LTM_FAKE_STATUS; // back to the plain report for any later caller
+				expect(asView(paused, 'paused'), 'paused', ['paused=true', 'Paused']);
 				// 3. Quit must stop the engine and end the app within the 5s deadline (exit 0).
 				app.on('will-quit', () => {
 					clearTimeout(deadline);
-					console.error('SMOKE OK: window hid, engine ran, status parsed, quit sent SIGTERM, exit 0');
+					console.error('SMOKE OK: window hid, engine ran, popup covered normal/calm/paused, quit sent SIGTERM, exit 0');
 				});
 				app.quit();
 			})

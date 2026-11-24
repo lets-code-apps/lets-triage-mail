@@ -8,9 +8,12 @@
 //   run --ignore-sigterm    ignores SIGTERM forever (simulates the SIGKILL-after-deadline path)
 //   run --emit-logs         floods stdout with 600 lines (ring-buffer cap check)
 //   check --json            prints fixtures/check-report.json
-//   status --json           prints fixtures/status-report.json
+//   status --json           prints fixtures/status-report.json (needs reply 4)
 //   status --calm           prints fixtures/status-report-calm.json (needs reply 0 everywhere)
+//   status --paused         prints today's counts with engine.running false (a stopped engine)
 //   status --exit-1         prints nothing and exits 1 (the popup shows the engine's own reason)
+//   (--calm / --paused also honoured by env LTM_FAKE_STATUS=calm|paused, so the smoke test can pick
+//    a state without changing the argv it passes.)
 //   --version               prints `lets-triage-mail 0.1.0`
 //
 // Real engine behaviour it mirrors: first SIGTERM is a clean cancel (exit 0); the process never
@@ -41,6 +44,30 @@ if (args[0] === 'status') {
 		// The engine refusing to answer: no stdout, a reason on stderr, non-zero exit.
 		process.stderr.write('status: cannot open the state database\n');
 		process.exit(1);
+	}
+	// Which popup state to report: a flag wins, else the smoke test may set LTM_FAKE_STATUS (the desktop
+	// always runs `status --json`, so an env var is the only way it can ask for a different state).
+	const mode = args.includes('--calm')
+		? 'calm'
+		: args.includes('--paused')
+			? 'paused'
+			: process.env.LTM_FAKE_STATUS === 'calm' || process.env.LTM_FAKE_STATUS === 'paused'
+				? process.env.LTM_FAKE_STATUS
+				: 'normal';
+
+	if (mode === 'calm') {
+		process.stdout.write(fixture('status-report-calm.json'));
+		process.exit(0);
+	}
+	if (mode === 'paused') {
+		// Same day's counts, but the engine is stopped: the popup's paused copy depends on this and on
+		// the desktop remembering the Stop (in-memory pausedAt).
+		const report = JSON.parse(fixture('status-report.json'));
+		report.engine.running = false;
+		report.engine.started_at = null;
+		report.engine.heartbeat_at = null;
+		process.stdout.write(JSON.stringify(report));
+		process.exit(0);
 	}
 	process.stdout.write(fixture('status-report.json'));
 	process.exit(0);
