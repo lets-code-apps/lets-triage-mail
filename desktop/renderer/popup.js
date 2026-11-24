@@ -44,6 +44,18 @@ function span(className, text) {
 	return node;
 }
 
+// A status that could not be answered: with no trustworthy numbers, hide the strip and the paused pill,
+// keep the reason on the note line (the old subline's job), and drop the account rows. Both the engine's
+// own error payload (`kind === 'error'`) and a rejected `getStatus` round-trip go through here, so neither
+// can leave the error invisible or reference an element the summary box used to own.
+function showError(message) {
+	stripEl.hidden = true;
+	pausedPillEl.hidden = true;
+	noteEl.textContent = message;
+	connectedEl.textContent = '';
+	clear();
+}
+
 // The footer's one engine button, the same as the window's: "pause triage" while the app's engine
 // runs, otherwise "start triage"; busy while starting or stopping; disabled when main says an
 // outside engine is live (a second one would double-watch the mailbox).
@@ -67,13 +79,8 @@ function render(payload) {
 	if (!payload || payload.kind === 'idle') return; // hidden: nothing to paint
 
 	if (payload.kind === 'error') {
-		// No trustworthy numbers: hide the whole strip and the paused pill, keep the engine's reason on
-		// the note line (the old subline's job), and drop the account rows.
-		stripEl.hidden = true;
-		pausedPillEl.hidden = true;
-		noteEl.textContent = String(payload.message);
-		connectedEl.textContent = '';
-		clear();
+		// The engine's own reason, on the note line.
+		showError(String(payload.message));
 		return;
 	}
 	stripEl.hidden = false;
@@ -121,10 +128,11 @@ function render(payload) {
 	}
 }
 
-// One round-trip: ask, paint. The `void` keeps the unhandled-rejection rule honest.
+// One round-trip: ask, paint. The `void` keeps the unhandled-rejection rule honest; a rejected request
+// shows its reason on the note line (never silently, and never via a removed element).
 function refresh() {
 	void Promise.resolve(api.getStatus()).then(render, (failed) => {
-		sublineEl.textContent = `Status unavailable: ${String(failed)}`;
+		showError(`Status unavailable: ${String(failed)}`);
 	});
 }
 

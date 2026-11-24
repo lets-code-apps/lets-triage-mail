@@ -127,6 +127,19 @@ test('the popup page is as locked down as the window page', () => {
 	assert.ok(script.includes('textContent'), 'popup.js must render with textContent');
 });
 
+test('a status that cannot be answered paints its reason on the new note line, never a removed element', () => {
+	// The summary box is gone; a rejected `getStatus` used to write into the removed `sublineEl`, which
+	// threw and left the reason invisible. The new layout must route both the engine error payload and a
+	// rejected round-trip through the note line, and must not reference any element the old box owned.
+	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	for (const gone of ['sublineEl', 'pillEl', 'countEl']) {
+		assert.equal(script.includes(gone), false, `popup.js must not reference the removed ${gone}`);
+	}
+	assert.ok(/function showError\(/.test(script), 'the popup needs one shared error paint path');
+	assert.match(script, /showError\(String\(payload\.message\)\)/, 'an engine error payload is shown');
+	assert.match(script, /showError\(`Status unavailable: \$\{String\(failed\)\}`\)/, 'a rejected status request is shown');
+});
+
 test('main trusts only the two pages it loads, and answers getStatus behind that guard', () => {
 	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
 	// Two known files, spelled out; anything else is refused.
