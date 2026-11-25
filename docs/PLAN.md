@@ -359,6 +359,11 @@ the two prompt-injection gaps and the digest escaping path are now covered by te
 one real finding (redirects from the model endpoint) is fixed. The release work in 6.3 still
 has to be shipped.**
 
+**Status (2026-11-24): shared model setting (#23, engine only): `src/shared_model.rs` reads and
+atomically writes `~/.config/lets-code/model.toml`, `load_with_shared` applies it at start
+(the app's own `[llm] base_url`/`model` beat it entirely), `docs/MODEL.md` documents it; no
+UI and no `write` caller yet (onboarding and settings are LET-136/137).**
+
 | # | Task |
 |---|---|
 | 6.1 | `contrib/` launchd plist with KeepAlive; install notes in the README (done: LaunchAgent, restart only on failure, README section "Run in the background") |

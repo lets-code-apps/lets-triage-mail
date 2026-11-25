@@ -21,8 +21,13 @@ use lets_triage_mail::store::Store;
 /// `account` limits the run to one configured account.
 ///
 /// A failing account does not stop the others; the command then exits non-zero.
-pub async fn run(config_path: &Path, account: Option<&str>, dry: bool) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    account: Option<&str>,
+    dry: bool,
+) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
     let accounts = super::check::select_accounts(&config, account)?;
     if accounts.is_empty() {
         anyhow::bail!("the config has no accounts");

@@ -23,6 +23,7 @@ use crate::engine::{FlagColours, FlagPolicy, TriageFlag};
 use crate::flags::FlagColour;
 use crate::imap::{ImapSettings, TlsMode, is_loopback_host};
 use crate::message::ProviderHeaders;
+use crate::shared_model::SharedModel;
 
 /// Everything that can go wrong while loading the config or looking up a password.
 ///
@@ -589,6 +590,22 @@ impl AccountConfig {
     }
 }
 
+/// What the user wrote under `[llm]`; `Config` cannot say, because serde fills the
+/// defaults in and a missing key looks like a written default. This second, throwaway
+/// parse of the same text records only presence: the keys are `Option`s, so `None`
+/// means "not in the file". Other sections are ignored (no `deny_unknown_fields` here).
+#[derive(Deserialize, Default)]
+struct Written {
+    #[serde(default)]
+    llm: WrittenLlm,
+}
+
+#[derive(Deserialize, Default)]
+struct WrittenLlm {
+    base_url: Option<String>,
+    model: Option<String>,
+}
+
 impl Config {
     /// Reads, parses and validates the config file at `path`.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -599,18 +616,63 @@ impl Config {
         Config::parse_named(&text, &path.display().to_string())
     }
 
+    /// Like [`load`](Self::load), but with the shared model file (`~/.config/lets-code/
+    /// model.toml`, see `docs/MODEL.md`) applied: its `url`/`model` fill `[llm]` unless
+    /// the app's own config wrote `base_url` or `model`. The CLI entry point passes the
+    /// file it read; tests pass a `SharedModel` built in code, so nothing reads `$HOME`.
+    pub fn load_with_shared(path: &Path, shared: &SharedModel) -> Result<Config, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Config::parse_with_shared(&text, &path.display().to_string(), shared)
+    }
+
     /// Parses and validates config text.
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse_named(text, "<text>")
     }
 
     fn parse_named(text: &str, origin: &str) -> Result<Config, ConfigError> {
-        let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        Config::parse_with_shared(text, origin, &SharedModel::default())
+    }
+
+    /// Parse `text`, apply `shared`, then validate — in that order, so
+    /// [`validate_llm_host`](Self::validate_llm_host) sees the final URL and the privacy
+    /// rule covers a shared non-local address just like a written one.
+    pub fn parse_with_shared(
+        text: &str,
+        origin: &str,
+        shared: &SharedModel,
+    ) -> Result<Config, ConfigError> {
+        let mut config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
             origin: origin.to_string(),
             source,
         })?;
+        config.apply_shared(text, shared);
         config.validate()?;
         Ok(config)
+    }
+
+    /// Fills `[llm]` from the shared file, or not at all.
+    ///
+    /// The app's own config wins as one decision, not per key: a second `toml::from_str`
+    /// of the same text into a tiny struct shows what the user actually wrote (in `Config`
+    /// a missing key and a written default look the same, because serde fills defaults in).
+    /// If either key was written, the shared file is ignored entirely — one server's URL is
+    /// never paired with another server's model name, and existing configs keep working
+    /// unchanged.
+    fn apply_shared(&mut self, text: &str, shared: &SharedModel) {
+        let written: Written = toml::from_str(text).unwrap_or_default();
+        if written.llm.base_url.is_some() || written.llm.model.is_some() {
+            return;
+        }
+        if let Some(url) = shared.chat_base_url() {
+            self.llm.base_url = url;
+        }
+        if let Some(model) = shared.chat_model() {
+            self.llm.model = model.to_string();
+        }
     }
 
     /// Checks every rule `serde` cannot. Called by [`load`](Self::load) and
@@ -1380,5 +1442,109 @@ mod tests {
         let mut remote = plain;
         remote.host = "imap.example.com".into();
         assert!(remote.validate().is_err());
+    }
+
+    // The shared model file (docs/MODEL.md), applied through `parse_with_shared`/
+    // `load_with_shared`. A `SharedModel` built in code, or read from a temp file; nothing
+    // here touches `$HOME`.
+
+    /// Both keys set, as a real shared file would have them.
+    fn shared(url: &str, model: &str) -> SharedModel {
+        SharedModel {
+            runtime: Some(String::from("ollama")),
+            url: Some(String::from(url)),
+            model: Some(String::from(model)),
+            set_by: Some(String::from("rag docs")),
+            updated: Some(String::from("2026-11-24T09:00:00+01:00")),
+        }
+    }
+
+    #[test]
+    fn shared_model_replaces_the_llm_defaults() {
+        let config =
+            Config::parse_with_shared("", "<text>", &shared("http://127.0.0.1:11434", "qwen3:8b"))
+                .unwrap();
+        assert_eq!(config.llm.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.llm.model, "qwen3:8b");
+    }
+
+    #[test]
+    fn no_shared_file_keeps_the_defaults() {
+        let config = Config::parse_with_shared("", "<text>", &SharedModel::default()).unwrap();
+        assert_eq!(config.llm.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.llm.model, "qwen3:14b");
+    }
+
+    #[test]
+    fn shared_file_with_only_a_model_keeps_the_default_url() {
+        let model_only = SharedModel {
+            url: None,
+            model: Some(String::from("qwen3:8b")),
+            runtime: None,
+            set_by: None,
+            updated: None,
+        };
+        let config = Config::parse_with_shared("", "<text>", &model_only).unwrap();
+        assert_eq!(config.llm.model, "qwen3:8b");
+        assert_eq!(config.llm.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn unknown_key_in_the_shared_file_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.toml");
+        std::fs::write(
+            &path,
+            "model = \"qwen3:8b\"\nurl = \"http://127.0.0.1:11434\"\nnewer_key = \"x\"\n[extra]\nn = 1\n",
+        )
+        .unwrap();
+        let shared = crate::shared_model::read(&path);
+        let config = Config::parse_with_shared("", "<text>", &shared).unwrap();
+        assert_eq!(config.llm.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.llm.model, "qwen3:8b");
+    }
+
+    #[test]
+    fn app_config_model_wins_over_the_shared_file() {
+        let config = Config::parse_with_shared(
+            "[llm]\nmodel = \"x\"\n",
+            "<text>",
+            &shared("http://127.0.0.1:11434", "qwen3:8b"),
+        )
+        .unwrap();
+        assert_eq!(config.llm.model, "x", "what the user wrote wins");
+        assert_eq!(
+            config.llm.base_url, "http://127.0.0.1:11434/v1",
+            "the shared url is ignored entirely, not merged"
+        );
+    }
+
+    #[test]
+    fn app_config_base_url_wins_over_the_shared_file() {
+        let config = Config::parse_with_shared(
+            "[llm]\nbase_url = \"http://localhost:1234/v1\"\n",
+            "<text>",
+            &shared("http://127.0.0.1:11434", "qwen3:8b"),
+        )
+        .unwrap();
+        assert_eq!(config.llm.base_url, "http://localhost:1234/v1");
+        assert_eq!(
+            config.llm.model, "qwen3:14b",
+            "the shared model is ignored, the default stays"
+        );
+    }
+
+    #[test]
+    fn shared_non_local_url_is_still_refused() {
+        let remote = shared("http://example.com", "qwen3:8b");
+        let message = Config::parse_with_shared("", "<text>", &remote)
+            .expect_err("a shared address must still respect the privacy rule")
+            .to_string();
+        assert!(message.contains("allow_remote"), "{message}");
+
+        // The app's own opt-in covers the shared value too.
+        let config =
+            Config::parse_with_shared("[llm]\nallow_remote = true\n", "<text>", &remote).unwrap();
+        assert_eq!(config.llm.base_url, "http://example.com/v1");
     }
 }

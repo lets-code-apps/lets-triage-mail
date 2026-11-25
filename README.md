@@ -97,7 +97,10 @@ cp config.example.toml ~/.config/lets-triage-mail/config.toml
 ```
 
 Edit `[llm]` to point at your model and add one `[[accounts]]` block per mailbox. Every option is
-explained in [config.example.toml](config.example.toml). Passwords never go in the file. On
+explained in [config.example.toml](config.example.toml). The model itself can also come from the
+file both Let's Code apps share, `~/.config/lets-code/model.toml` ([docs/MODEL.md](docs/MODEL.md)):
+leave `[llm] base_url` and `model` out and this app reads that file, write either one and this
+config ignores the shared file completely. Passwords never go in the file. On
 macOS, store each one in the Keychain once (you are asked to type it):
 
 ```sh

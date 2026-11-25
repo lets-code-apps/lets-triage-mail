@@ -13,10 +13,15 @@ use lets_triage_mail::config::{AccountConfig, Config};
 use tokio::task::JoinHandle;
 
 /// Runs the checks and prints the report. Fails (non-zero exit code) if anything failed.
-pub async fn run(config_path: &Path, account: Option<&str>, json: bool) -> anyhow::Result<()> {
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    account: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
     let mut report = Report::default();
 
-    let config = match super::load_config(config_path) {
+    let config = match super::load_config(config_path, shared_path) {
         Ok(config) => config,
         Err(error) => {
             // A config that does not load is itself a check result, not a crash.

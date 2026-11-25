@@ -66,8 +66,13 @@ struct RawStats {
 }
 
 /// Shows what the service did in the last `days` days.
-pub async fn run(config_path: &Path, days: u32, json: bool) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    days: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
     let db_path = config.db_path();
     // `Store` blocks the thread, so it runs on tokio's blocking pool (see `store.rs`).
     let output = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {

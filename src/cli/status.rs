@@ -13,8 +13,8 @@ use lets_triage_mail::status::{RawStatus, build_report, format_text, start_of_da
 use lets_triage_mail::store::Store;
 
 /// Prints the engine's liveness, today's counts and every account's state.
-pub async fn run(config_path: &Path, json: bool) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(config_path: &Path, shared_path: &Path, json: bool) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
     let db_path = config.db_path();
     // `Store` blocks the thread, so it runs on tokio's blocking pool (see `store.rs`).
     let output = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {

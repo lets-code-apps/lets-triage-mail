@@ -23,8 +23,13 @@ use tokio_util::sync::CancellationToken;
 ///
 /// `account` limits the run to one configured account; `None` means all of them, one after
 /// the other. A failing account does not stop the others; the command then exits non-zero.
-pub async fn run(config_path: &Path, days: u32, account: Option<&str>) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    days: u32,
+    account: Option<&str>,
+) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
     let accounts = super::check::select_accounts(&config, account)?;
     let since = since_date(jiff::Zoned::now().date(), days)?;
 

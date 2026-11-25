@@ -25,11 +25,12 @@ use serde_json::{Value, json};
 /// `account` names the account the files came from, so that its `provider_headers` apply.
 pub async fn run(
     config_path: &Path,
+    shared_path: &Path,
     files: &[PathBuf],
     json: bool,
     account: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+    let config = super::load_config(config_path, shared_path)?;
     let provider = provider_for(&config, account)?;
     let decider = LlmDecider::new(LlmSettings::from(&config.llm))
         .context("could not set up the model client")?;
@@ -457,11 +458,20 @@ mod tests {
             format!("[llm]\nbase_url = \"{}/v1\"\n", server.uri()),
         )
         .unwrap();
+        // Injected shared path inside the temp folder: it does not exist, so `[llm]`
+        // stays as written and the real home is never read.
+        let shared_path = dir.path().join("model.toml");
 
         let files = [fixture("friend.eml"), PathBuf::from("/nonexistent/x.eml")];
-        let error = run(&config_path, &files, true, None).await.unwrap_err();
+        let error = run(&config_path, &shared_path, &files, true, None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("1 of 2"), "{error}");
-        assert!(run(&config_path, &files[..1], false, None).await.is_ok());
+        assert!(
+            run(&config_path, &shared_path, &files[..1], false, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -483,9 +493,15 @@ mod tests {
     #[tokio::test]
     async fn a_missing_config_points_at_the_example() {
         let missing = Path::new("/nonexistent/config.toml");
-        let error = run(missing, &[fixture("friend.eml")], false, None)
-            .await
-            .unwrap_err();
+        let error = run(
+            missing,
+            Path::new("/nonexistent/model.toml"),
+            &[fixture("friend.eml")],
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("config.example.toml"), "{error}");
     }
 

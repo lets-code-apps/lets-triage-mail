@@ -52,8 +52,12 @@ fn lock_instance(db_path: &Path) -> anyhow::Result<Result<File, ()>> {
 }
 
 /// Watches the accounts until Ctrl-C or SIGTERM (or, with `exit_on_stdin_close`, stdin EOF).
-pub async fn run(config_path: &Path, exit_on_stdin_close: bool) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    exit_on_stdin_close: bool,
+) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
 
     // Held until `run` returns. Only `run` locks, so `status`, `check` and `digest` keep working.
     let _instance_lock = match lock_instance(&config.db_path())? {
