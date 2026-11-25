@@ -181,6 +181,10 @@ export type PopupCell = {
 	ariaLabel: string; // the whole cell's accessible name
 	dotHidden: boolean; // the dot, when the cell has one, is aria-hidden (true when there is no dot)
 	iconHidden: boolean; // the corner arrow is aria-hidden
+	num?: Box | null; // boxes of the parts, null when absent or hidden
+	dot?: Box | null;
+	icon?: Box | null;
+	lbl?: Box | null;
 };
 
 export type PopupMeasure = {
@@ -216,6 +220,20 @@ export function checkPopupLayout(m: PopupMeasure): string[] {
 		if (!c.iconHidden) {
 			v.push(`cell ${i} icon must be aria-hidden`);
 		}
+		// CountStrip: number, dot and arrow share the top line (arrow at the right edge); label below.
+		const mid = (b: Box) => b.top + b.height / 2;
+		if (c.num && c.icon && Math.abs(mid(c.icon) - mid(c.num)) > 4) {
+			v.push(`cell ${i} arrow is not on the number's line`);
+		}
+		if (c.num && c.dot && Math.abs(mid(c.dot) - mid(c.num)) > 4) {
+			v.push(`cell ${i} dot is not on the number's line`);
+		}
+		if (c.num && c.dot && c.dot.left < c.num.left + c.num.width) {
+			v.push(`cell ${i} dot must come after the number`);
+		}
+		if (c.num && c.lbl && c.lbl.top < c.num.top + c.num.height - 1) {
+			v.push(`cell ${i} label must sit below the number`);
+		}
 	}
 
 	// The three cells share the strip equally: equal widths (within 1px of a rounding gap).
@@ -236,6 +254,8 @@ export function checkPopupLayout(m: PopupMeasure): string[] {
 // The in-page measuring snippet for the popup (a string, so `render.ts` can pass it to executeJavaScript
 // and the unit test can assert on its text without running it). Reads only getBoundingClientRect and the
 // aria/hidden attributes; changes nothing and reads no engine data.
+type Box = { left: number; top: number; width: number; height: number };
+
 export const MEASURE_POPUP = `
 (() => {
   const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -243,7 +263,12 @@ export const MEASURE_POPUP = `
     const r = el.getBoundingClientRect();
     const dot = el.querySelector('.dot');
     const icon = el.querySelector('svg.icon');
+    const box = (n) => { if (!n || !visible(n)) return null; const b = n.getBoundingClientRect(); return { left: b.left, top: b.top, width: b.width, height: b.height }; };
     return {
+      num: box(el.querySelector('.num')),
+      dot: box(dot),
+      icon: box(icon),
+      lbl: box(el.querySelector('.lbl')),
       tag: el.tagName,
       width: r.width,
       height: r.height,
