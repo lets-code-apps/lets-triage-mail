@@ -17,8 +17,8 @@ desktop/              # the Electron app: its own package.json, no Cargo involve
   src/                # main process + controllers (TypeScript, ESM)
   renderer/           # two pages, no framework, no remote resources: the window (app shell) and the popup
   assets/             # the menu-bar template icon (18 px + 36 px @2x) and the app icon (icon.png, 1024 px)
-  test/               # node --test unit tests + synthetic fixtures; test/shots/ renders the window shots
-  screenshots/        # approved baseline PNGs (synthetic data) for the CI window shots
+  test/               # node --test unit tests + synthetic fixtures; test/shots/ renders the window + popup shots
+  screenshots/        # approved baseline PNGs (synthetic data) for the CI window and popup shots
 docs/DESKTOP.md       # this file
 ```
 
@@ -81,6 +81,10 @@ while the tray already says `failed`.
 - `stop()`: send **SIGTERM once**, wait up to **30 s**, then SIGKILL. 30 s matches `ExitTimeOut` in
   `contrib/launchd/*.plist` (grace 10 s plus margin). **Never a second SIGTERM or any SIGINT**:
   `src/cli/run.rs::watch_for_signals` treats a second signal as "exit now with 130, skip cleanup".
+  When the user pauses the engine (Stop / the pause button, not Quit) the app remembers the moment in
+  memory (`pausedAt`, seconds): the popup then reads "paused at HH:MM" and its button says "resume triage".
+  It is not persisted — after a restart the moment is unknown, so the popup uses the time-free "Paused."
+  line, and only this app's own `stopped` state counts as paused (a crash reads `failed`, not paused).
 - **Closing the window (red button, Cmd+W) only hides it.** Tray, engine and app keep running.
   The dock icon is hidden whenever no window is visible and shown while one is. `window-all-closed`
   does nothing.
@@ -105,20 +109,32 @@ while the tray already says `failed`.
   (status line; Start/Stop triage enabled by engine state; Check setup; Open window; disabled app-name
   and Engine version lines; Quit with Cmd+Q) — no persistent context menu.
 - Popup: a second page, opened by that left-click, frameless, 360 px wide, its height sized to its
-  content (measured by the main process, capped to the work area of the display that holds the icon),
-  centred under the glyph and clamped inside that display's work area — it opens on the display whose
-  icon was clicked. It hides on blur, like a native menu. The user cannot resize or move it: no dock
-  handling, and its strings are built in the **main** process (`desktop/src/popup-model.ts`), so the
-  page never formats or colours anything itself. It is the design's tray card: lockup and "open app",
-  a summary box (count, pill, `N fyi · M done · since HH:MM`) that opens the window, the account rows,
-  and a footer with pause/start triage, a settings button (opens the window on settings) and quit. The
-  window is transparent so the card's rounded corners show. There is no tray highlight while it is open: Electron has no
-  API for macOS's native one (macOS shows it only while the mouse is down), and a hand-drawn one never
-  matched the system's size. It closes like a native menu: a blur, the app losing active status (`did-resign-active`), a right-click on the icon, another menu-bar
-  item opening its menu (`com.apple.HIToolbox.beginMenuTrackingNotification`), or opening the window from it. It takes key focus when it opens so those blurs actually fire. Account rows show
-  name and mode on one line, the engine's note under it (two lines at most) and the state pill below.
-  Its pause/start button behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the
-  new state); there is no separate status line. Main pushes the engine state to both pages.
+   content (measured by the main process, capped to the work area of the display that holds the icon),
+   centred under the glyph and clamped inside that display's work area — it opens on the display whose
+   icon was clicked. It hides on blur, like a native menu. The user cannot resize or move it: no dock
+   handling, and its strings are built in the **main** process (`desktop/src/popup-model.ts`), so the
+   page never formats or colours anything itself. It is the design's tray card: lockup and "open app",
+   then a **counts strip** — three equal cells (needs reply / fyi / done), each a real `<button>` that
+   opens **Apple Mail itself** through a fixed `open -a Mail` (no folder, no per-message target, so the
+   cell identity is never sent). Only the needs-reply cell gets a dot (the strip's sole colour), and each
+   cell's accessible name repeats its count ("needs reply, 4, open Apple Mail") so a screen reader hears
+   the number and the buttons are keyboard-reachable with a visible focus ring. Under the strip one note
+   line reads `${done} done since HH:MM`, or "Nothing needs a reply. …" when the needs-reply cell is 0, or
+   the paused copy (below); a "paused" pill appears on that line while paused. Then the account rows, and
+   a footer with pause/start triage (reading "resume triage" while paused), a settings button (opens the
+   window on settings) and quit. The window is transparent so the card's rounded corners show. There is no
+   tray highlight while it is open: Electron has no API for macOS's native one (macOS shows it only while
+   the mouse is down), and a hand-drawn one never matched the system's size. It closes like a native menu:
+   a blur, the app losing active status (`did-resign-active`), a right-click on the icon, another menu-bar
+   item opening its menu (`com.apple.HIToolbox.beginMenuTrackingNotification`), or opening the window from
+   it. It takes key focus when it opens so those blurs actually fire. Account rows show name and mode on
+   one line, the engine's note under it (two lines at most) and the state pill below. Its pause/start button
+   behaves exactly like the window's (pausing…/starting… with the pulsing dot, then the new state); there
+   is no separate status line. While the engine is paused (the app pressed Stop this session) the counts
+   stay visible but the note reads "Paused at HH:MM. New mail stays in the inbox until you resume." (or,
+   if the app restarted and the moment is unknown, "Paused. …"); a stopped engine the app never paused —
+   a crash, or never started — keeps the normal/calm note and the "Engine not running" summary. Main
+   pushes the engine state to both pages.
 - Window: one `BrowserWindow` (1100x760, minimum 1040x640: nav 200 + list 420 + detail 420), `hiddenInset` title bar with the traffic
   lights over a 64 px draggable app bar; the bar carries the app name "triage mail" centred on the whole bar (one line, 15px/500, ellipsis, 132px clear on each side) and the emblem at its right end. Created on first open, then
   hidden/shown, never destroyed. Below the bar, one non-wrapping flex row of three panes (nav, list, detail);
@@ -144,10 +160,12 @@ while the tray already says `failed`.
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
   two files** (the window page and the popup page), and the preload (see `desktop/src/preload.cjs`)
-  exposes nine functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
-  `command(start|stop|check|openWindow|openSettings|quit)`, `getSettings`, `setSetting`, `getConfig`,
-  `editAccount(op, fields)`). `setSetting`
-  is checked in main: our page, a known name (`appearance`, `openAtLogin`) and an allow-listed value.
+   exposes nine functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
+   `command(start|stop|check|openWindow|openSettings|openMail|quit)`, `getSettings`, `setSetting`, `getConfig`,
+   `editAccount(op, fields)`). `setSetting` is checked in main: our page, a known name (`appearance`,
+   `openAtLogin`) and an allow-listed value. `openMail` takes no argument and runs a fixed `open -a Mail`
+   (Apple Mail itself, never a folder or a message); it is the popup's three count buttons and adds no
+   channel, so the allowlist stays at nine.
   `getConfig` and `editAccount` answer the **window page only** (the popup must not read or write the
   config). `editAccount` ops are `add | set | remove | password | test`; main checks every field against a
   per-op allow-list with types (`src/account-edit.ts`: name 1-64 engine-allowed characters starting with a
@@ -193,24 +211,30 @@ measurement ever fails the popup just keeps its last size (the next 5 s poll ret
 ### Screenshots and layout checks
 
 `npm run shots` (run by the `desktop-shots` CI job) renders the real window page eight times — accounts
-and settings, at 1100px and 360px, light and dark — with **synthetic data only**, measures the design
-layout, captures a PNG, and diffs it against the committed baseline in `desktop/screenshots/`. It loads
+and settings, at 1100px and 360px, light and dark — and the real popup page six times — normal, calm and
+paused, light and dark — with **synthetic data only**, measures the design layout, captures a PNG, and diffs
+each against the committed baseline in `desktop/screenshots/` (fourteen in all). It loads
 the real `src/preload.cjs` and answers the IPC channels with `ipcMain.handle` in the main process (so
-the bridge is exercised, not stubbed), and reads `src/` and `renderer/` directly (no build step). No
-engine, no config file, no `~/.config`, no network, and no setup-check clock ever enters a shot. Captures
-are normalised to CSS pixels (a Retina Mac is 2×, a runner may be 1×), then compared with two named
-constants at the top of `test/shots/compare.ts` (`PIXEL_DELTA = 16`, `MAX_CHANGED_RATIO = 0.001`, about
-840 px at 1100×760). It prints one line per shot (`OK`/`CHANGED`/`MISSING`/`SIZE`) plus any layout
+the bridge is exercised, not stubbed), and reads `src/` and `renderer/` directly (no build step). The
+popup's three states differ only in what `getStatus` and `getState` answer (the calm fixture, and
+`engine.running:false` plus the app's paused marker for paused), so the same nine-channel bridge covers
+all fourteen. No engine, no config file, no `~/.config`, no network, and no setup-check clock ever enters a
+shot. Captures are normalised to CSS pixels (a Retina Mac is 2×, a runner may be 1×), then compared with
+two named constants at the top of `test/shots/compare.ts` (`PIXEL_DELTA = 16`, `MAX_CHANGED_RATIO = 0.001`,
+about 840 px at 1100×760). It prints one line per shot (`OK`/`CHANGED`/`MISSING`/`SIZE`) plus any layout
 violations, and writes `desktop/shots-out/` (the actual PNGs, a red diff per changed shot, and
 `report.json`), which the job uploads as an artifact.
 
 The layout assertions are the pure `checkLayout` in `test/shots/layout.ts`: the app-bar title centred
 on the whole bar with 132px of clear and on one line, the emblem at the bar's right end (the 24px
 token inset), the settings rows sharing one column, and every control meeting the design's 44px
-touch target. Four controls are not yet 44px tall (nav 41, the mode/appearance segment 38, the switch 24
-tall — its row is ≥44), so they carry `KNOWN_BELOW_44` floors: a **ratchet** that may grow but turns
-CI red the moment one shrinks. Raising them to 44 would change the look, which is out of scope for this
-change; it would be its own design increment with its own baseline.
+touch target. The popup's strip has its own pure `checkPopupLayout` and `MEASURE_POPUP` probe: three
+equal-width `BUTTON` cells at least 44px tall, each named with its count (the accessible name ends in
+"`N`, open Apple Mail"), and the decorative dot and corner arrow `aria-hidden`. Four controls are not
+yet 44px tall (nav 41, the mode/appearance segment 38, the switch 24 tall — its row is ≥44), so they
+carry `KNOWN_BELOW_44` floors: a **ratchet** that may grow but turns CI red the moment one shrinks.
+Raising them to 44 would change the look, which is out of scope for this change; it would be its own
+design increment with its own baseline.
 
 Updating the baseline **on purpose**: a change that is meant to alter the look turns `desktop-shots`
 red. The author downloads that run's artifact (`gh run download <run-id> -n desktop-shots`), reviews
@@ -231,12 +255,14 @@ Keeping these three apart is the point: it stops this document from reading like
   and Engine version lines; Quit with Cmd+Q).
 - The menu-bar **popup**: left-click opens it on the clicked display and on the macOS desktop (Space)
   the user is looking at, centred under the glyph and sized to its content (the main process measures
-  the page), a blur closes it, and its content is
-  `status --json` turned into ready-to-print strings in the main process (the big "to look at" number
-  with a "needs reply" / "all clear" / "not running" pill, `N fyi · M done · since HH:MM`, `X of Y
-  connected`, one row per account with initials and a state pill). Its **Start** is disabled, with the note "Running outside the
-  app", when a fresh `status` shows a live engine the app did not start (there is no single-instance
-  lock yet). Setup check lives in the window's settings, and a tray "Check setup" opens it there.
+  the page), a blur closes it, and its content is `status --json` turned into ready-to-print strings in the
+  main process: a **counts strip** of three equal `BUTTON` cells (needs reply / fyi / done, each opening
+  Apple Mail itself through a fixed `open -a Mail`), a note line (`N done since HH:MM`, the calm line, or
+  the paused line, with a "paused" pill while paused), then `X of Y connected` and one row per account with
+  initials and a state pill. Its **Start** is disabled, with the note "Running outside the app", when a
+  fresh `status` shows a live engine the app did not start (there is no single-instance lock yet); while the
+  app has paused the engine (Stop this session, an in-memory `pausedAt`) its footer button reads "resume
+  triage". Setup check lives in the window's settings, and a tray "Check setup" opens it there.
 - The window's **accounts screen** (increment 6): list merged from `status` and `config show` (user line,
   "not running" for a just-added account), add form with test connection, per-account mode, connection
   test, password update and remove. Not done: per-account pause/resume (the config has no per-account
@@ -250,10 +276,11 @@ Keeping these three apart is the point: it stops this document from reading like
 - The app name in the window bar: "triage mail" centred on the whole app bar, one line, ellipsis, 132px
   clear on each side, with the emblem staying at the right end.
 - The CI screenshot baseline and design layout checks (`desktop-shots` job): the window rendered in
-  eight synthetic states, a committed PNG baseline under `desktop/screenshots/`, and assertions that
-  the app-bar title is centred with 132px clear, the emblem sits at the right end, the settings rows
-  align, and the controls meet the design's 44px touch target (with a ratchet on the four controls the
-  app does not yet size to 44).
+  eight synthetic states and the popup in six (normal, calm and paused, light and dark), a committed PNG
+  baseline under `desktop/screenshots/`, and assertions that the app-bar title is centred with 132px clear,
+  the emblem sits at the right end, the settings rows align, the controls meet the design's 44px touch target
+  (with a ratchet on the four controls the app does not yet size to 44), and the popup's three count cells
+  are equal-width buttons that meet 44px and name their count.
 - The engine start/stop/quit lifecycle: one SIGTERM then SIGKILL after the deadline, single-instance
   lock, explicit quit through `before-quit`.
 - `check --json` parsing and rendering as data only (`textContent`), with a defensive shape check.

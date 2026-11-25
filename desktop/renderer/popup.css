@@ -1,4 +1,4 @@
-/* The menu-bar popup (the design's tray card): header, summary box, account rows, footer.
+/* The menu-bar popup (the design's tray card): header, counts strip, account rows, footer.
    Framework-free, no images, no network (the CSP in popup.html forbids it). Colours and sizes
    come from tokens.css; shared.css has the buttons, pills and rows. */
 
@@ -52,39 +52,93 @@ body {
   white-space: nowrap;
 }
 
-.summary-wrap {
-  padding: 0 var(--s-4) 20px;
-}
-
-.summary {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  box-sizing: border-box;
-  width: 100%;
-  padding: 14px var(--s-4);
+#strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0 var(--s-4) var(--s-2);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--surface);
+  overflow: hidden; /* clip a cell's hover fill to the rounded box */
+}
+
+/* One count: a native button so it is keyboard-reachable and takes a focus ring. As CountStrip:
+   (number, dot, arrow at the right edge) over the label; neighbours split by a 1px line, never a
+   gap. Fills `raised` on hover. */
+.cell {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: var(--s-2);
+  row-gap: var(--s-1);
+  align-items: center;
+  justify-items: start;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding: var(--s-3);
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
   text-align: left;
   cursor: pointer;
 }
 
-.count {
-  font-size: var(--count);
+.cell:first-child {
+  border-left: 0;
+}
+
+.cell:hover {
+  background: var(--raised);
+}
+
+/* The visible keyboard focus ring: 3px of the foreground, drawn inside the button so the shared
+   box never overflows the strip's rounded corner. */
+.cell:focus-visible {
+  outline: 3px solid var(--fg);
+  outline-offset: -3px;
+}
+
+.num {
+  grid-column: 1;
+  grid-row: 1;
+  font-size: 26px;
   font-weight: 600;
-  letter-spacing: -0.02em;
   line-height: 1.1;
+  letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
 }
 
-.summary .col {
+.dot {
+  grid-column: 2;
+  grid-row: 1;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--attention);
+}
+
+.cell .icon {
+  grid-column: 3;
+  grid-row: 1;
+  justify-self: end;
+  color: var(--muted);
+}
+
+.lbl {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  font-size: var(--label);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* One line under the strip: the calm/paused note, with a "paused" pill only while paused. */
+.strip-note {
   display: flex;
-  flex: 1;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  min-width: 0;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 0 var(--s-4) var(--s-4);
 }
 
 .acc-head {

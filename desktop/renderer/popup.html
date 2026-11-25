@@ -28,15 +28,33 @@
 				</div>
 				<button id="open" class="btn primary" type="button">open app <svg class="icon" width="18" height="18" aria-hidden="true"><use href="#i-arrow-up-right"></use></svg></button>
 			</div>
-			<div class="summary-wrap">
-				<button id="summary" class="summary" type="button" aria-label="open the app">
-					<span id="count" class="count">0</span>
-					<span class="col">
-						<span id="pill" class="pill"></span>
-						<span id="subline" class="meta"></span>
-					</span>
-					<svg class="icon" width="20" height="20" aria-hidden="true"><use href="#i-chevron-right"></use></svg>
+			<!-- The counts strip: three native buttons so each is keyboard-reachable and takes focus, in DOM
+			     order after "open app" and before the rows. The number and label are text filled by popup.js
+			     from the ready-to-print cells; the dot (needs reply only) and the corner arrow are decorative
+			     and aria-hidden. The button's own aria-label is the whole name ("needs reply, 4, open Apple
+			     Mail"), so a screen reader hears the count. Each opens Apple Mail itself; no key is sent. -->
+			<div id="strip" role="group" aria-label="today's counts">
+				<button type="button" class="cell" id="cell-look">
+					<span class="num">0</span>
+					<span class="dot" aria-hidden="true"></span>
+					<svg class="icon" width="16" height="16" aria-hidden="true"><use href="#i-arrow-up-right"></use></svg>
+					<span class="lbl">needs reply</span>
 				</button>
+				<button type="button" class="cell" id="cell-fyi">
+					<span class="num">0</span>
+					<svg class="icon" width="16" height="16" aria-hidden="true"><use href="#i-arrow-up-right"></use></svg>
+					<span class="lbl">fyi</span>
+				</button>
+				<button type="button" class="cell" id="cell-done">
+					<span class="num">0</span>
+					<svg class="icon" width="16" height="16" aria-hidden="true"><use href="#i-arrow-up-right"></use></svg>
+					<span class="lbl">done</span>
+				</button>
+			</div>
+			<!-- One line under the strip: the calm/paused note, with a "paused" pill only while paused. -->
+			<div class="strip-note">
+				<span id="pausedPill" class="pill muted" hidden>paused</span>
+				<span id="note" class="meta"></span>
 			</div>
 			<div class="acc-head">
 				<h2>accounts</h2>
