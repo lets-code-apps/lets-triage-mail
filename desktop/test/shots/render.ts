@@ -1,7 +1,8 @@
 // The desktop screenshot + layout harness. It renders the real window page eight times (accounts
-// and settings, at 1100px and 360px, in light and dark) with SYNTHETIC data, measures the design
-// layout, captures a PNG, and compares that PNG against the committed baseline in
-// `desktop/screenshots/`. It is run by the `desktop-shots` CI job (see .github/workflows/ci.yml);
+// and settings, at 1100px and 360px, in light and dark) AND the real popup page six times (normal,
+// calm and paused, in light and dark) with SYNTHETIC data, measures the design layout, captures a
+// PNG, and compares that PNG against the committed baseline in `desktop/screenshots/` — fourteen
+// shots in all. It is run by the `desktop-shots` CI job (see .github/workflows/ci.yml);
 // nothing here ships in the app.
 //
 // Why the real preload and IPC: the LET-103 shots used a stub bridge. Loading `src/preload.cjs` and
@@ -27,15 +28,17 @@ import { join } from 'node:path';
 import { buildPopupView } from '../../src/popup-model.ts';
 import { parseStatusReport } from '../../src/status-report.ts';
 import { MAX_CHANGED_RATIO, PIXEL_DELTA, compareShots, makeDiffBitmap } from './compare.ts';
-import { checkLayout, MEASURE } from './layout.ts';
+import { checkLayout, checkPopupLayout, MEASURE, MEASURE_POPUP } from './layout.ts';
 import { finalize, exitCodeFor } from './report.ts';
 import type { Report, ShotRow } from './report.ts';
 
 const HERE = import.meta.dirname;
 const DESKTOP = join(HERE, '..', '..');
 const RENDERER_HTML = join(DESKTOP, 'renderer', 'index.html');
+const POPUP_HTML = join(DESKTOP, 'renderer', 'popup.html');
 const PRELOAD = join(DESKTOP, 'src', 'preload.cjs');
 const FIXTURE = join(DESKTOP, 'test', 'fixtures', 'status-report.json');
+const CALM_FIXTURE = join(DESKTOP, 'test', 'fixtures', 'status-report-calm.json');
 const SHOTS = join(DESKTOP, 'screenshots');
 const OUT_ACTUAL = join(DESKTOP, 'shots-out', 'actual');
 const OUT_DIFF = join(DESKTOP, 'shots-out', 'diff');
@@ -45,6 +48,11 @@ const HEIGHT = 760;
 const WIDTHS = [1100, 360];
 const SECTIONS = ['accounts', 'settings'] as const;
 const THEMES = ['light', 'dark'];
+// The popup surface: its own page, a portrait content box, and the three states the board asked to
+// prove (normal, calm, paused), each in light and dark. Baselines are popup-<state>-<theme>.png.
+const POPUP_WIDTH = 360;
+const POPUP_HEIGHT = 640;
+const POPUP_STATES = ['normal', 'calm', 'paused'] as const;
 const LOAD_MS = 15_000; // a page load that never resolves is a failure, not a hang
 const CAPTURE_MS = 10_000;
 const SCRIPT_MS = 5_000; // in-page click / fonts.ready / probe
@@ -111,36 +119,77 @@ const SETTLED: Record<'accounts' | 'settings', string> = {
 		return s && s.hidden===false && document.querySelectorAll('#settings .srow').length>=5; })()`,
 };
 
-// The status payload for the accounts screen, built exactly like main does: parse the fixture, then
-// format it. Pinning locale/zone makes the "since HH:MM" text identical on every machine, so the
-// accounts PNGs do not depend on the runner's timezone.
-function buildStatus(): { kind: 'status'; view: ReturnType<typeof buildPopupView> } {
+// The popup is settled when the strip has its three cells painted and the note line has text. All three
+// states fill the note (normal "… done since …", calm "Nothing needs a reply…", paused "Paused…"), so
+// this probe holds for each; it never reads a wall clock.
+const POPUP_SETTLED = `(()=>{ const cells=document.querySelectorAll('#strip .cell'); const note=document.querySelector('#note');
+	return cells.length===3 && note && note.textContent.trim()!==''; })()`;
+
+// The status payload for the window's accounts screen, built exactly like main does: parse a fixture,
+// then format it. Pinning locale/zone makes the "since HH:MM" text identical on every machine, so the
+// PNGs do not depend on the runner's timezone.
+type StatusAnswer = { kind: 'status'; view: ReturnType<typeof buildPopupView> } | { kind: 'idle' };
+type EngineAnswer = { state: string; version: string; exitCode: number | null; signal: string | null; failureTail: readonly string[]; restartInSeconds: number | null };
+
+function buildStatus(): StatusAnswer {
 	const parsed = parseStatusReport(readFileSync(FIXTURE, 'utf8'));
 	if ('error' in parsed) throw new Error(`fixture is not a valid status report: ${parsed.error}`);
 	return { kind: 'status', view: buildPopupView(parsed.report, { locale: 'en-US', timeZone: 'UTC' }) };
 }
 
+// The popup's three states, built the way main builds a reply. normal and calm read a fixture with the
+// engine running (only the counts differ); paused reads the normal fixture with the engine not running
+// plus the app's in-memory paused marker (a pinned instant, so the "paused at HH:MM" note is deterministic
+// under the UTC pin).
+function buildPopupStatus(state: 'normal' | 'calm' | 'paused'): StatusAnswer {
+	if (state === 'calm') {
+		const parsed = parseStatusReport(readFileSync(CALM_FIXTURE, 'utf8'));
+		if ('error' in parsed) throw new Error(`calm fixture is not a valid status report: ${parsed.error}`);
+		return { kind: 'status', view: buildPopupView(parsed.report, { locale: 'en-US', timeZone: 'UTC' }) };
+	}
+	const parsed = parseStatusReport(readFileSync(FIXTURE, 'utf8'));
+	if ('error' in parsed) throw new Error(`fixture is not a valid status report: ${parsed.error}`);
+	if (state === 'paused') {
+		parsed.report.engine.running = false;
+		parsed.report.engine.started_at = null;
+		parsed.report.engine.heartbeat_at = null;
+		return { kind: 'status', view: buildPopupView(parsed.report, { locale: 'en-US', timeZone: 'UTC', paused: { at: 1794003300 } }) };
+	}
+	return { kind: 'status', view: buildPopupView(parsed.report, { locale: 'en-US', timeZone: 'UTC' }) };
+}
+
+// The engine view the popup reads via getState: running for normal/calm, stopped for paused (so the
+// footer button reads "resume triage", not "start triage"). Only the state field changes.
+function popupEngineView(state: 'normal' | 'calm' | 'paused'): EngineAnswer {
+	return state === 'paused' ? { ...ENGINE_VIEW, state: 'stopped' } : ENGINE_VIEW;
+}
+
+// What getStatus and getState answer right now. Swapped per shot: the popup's six states differ only in
+// these two answers, so one handler pair covers all fourteen shots. The window pass answers the normal
+// status; the popup pass swaps them before each popup load.
+let SHOT_STATUS: StatusAnswer = { kind: 'idle' };
+let SHOT_STATE: EngineAnswer = ENGINE_VIEW;
+
 // Answer the channels the page invokes on load and via its controls. onState/onCheckResult are
 // listeners, not invokes, so they need no handler; and we never push a check result, which would
 // paint a wall clock ("Checked at HH:MM") into a shot.
 function registerIpc(): void {
-	const status = buildStatus();
-	ipcMain.handle('ltm.getState', () => ENGINE_VIEW);
-	ipcMain.handle('ltm.getStatus', () => status);
+	ipcMain.handle('ltm.getState', () => SHOT_STATE);
+	ipcMain.handle('ltm.getStatus', () => SHOT_STATUS);
 	ipcMain.handle('ltm.getConfig', () => CONFIG_SHOW);
 	ipcMain.handle('ltm.getSettings', () => SETTINGS);
 	ipcMain.handle('ltm.setSetting', () => SETTINGS);
-	ipcMain.handle('ltm.command', (_event, command: string) => ({ command, view: ENGINE_VIEW }));
+	ipcMain.handle('ltm.command', (_event, command: string) => ({ command, view: SHOT_STATE }));
 	ipcMain.handle('ltm.editAccount', () => null);
 }
 
 // Bring one image to CSS pixels. A Retina Mac captures 2x; a CI runner may capture 1x. Resizing to
-// (width, HEIGHT) makes the baseline identical on every machine, which is the point of comparing
-// bytes here rather than eyeballing a shot.
-function normalise(image: Electron.NativeImage, width: number): Electron.NativeImage {
+// (width, height) makes the baseline identical on every machine, which is the point of comparing bytes
+// here rather than eyeballing a shot. Height is 760 for the window and 640 for the popup.
+function normalise(image: Electron.NativeImage, width: number, height: number = HEIGHT): Electron.NativeImage {
 	const size = image.getSize();
-	if (size.width === width && size.height === HEIGHT) return image;
-	return image.resize({ width, height: HEIGHT, quality: 'best' });
+	if (size.width === width && size.height === height) return image;
+	return image.resize({ width, height, quality: 'best' });
 }
 
 const bitmapOf = (image: Electron.NativeImage): { width: number; height: number; data: Uint8Array } => {
@@ -216,17 +265,12 @@ function emitReport(report: Report, update: boolean): void {
 	void update;
 }
 
-// Run one state, then fold its outcome into the report rows. A throw here is recorded (RENDER FAILED) and
-// captured into `error` so the pass still produces a report; a per-state failure never aborts the rest.
-async function captureIntoReport(win: BrowserWindow, section: 'accounts' | 'settings', width: number, theme: string, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
-	const name = `${section}-${width}-${theme}`;
-	let rendered: { name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer };
-	try {
-		rendered = await renderOne(win, section, width, theme);
-	} catch (thrown) {
-		rows.push({ name, status: 'RENDER FAILED', px: 0, ratio: 0 });
-		throw Object.assign(new Error(`RENDER FAILED ${name}: ${asText(thrown)}`), { alreadyRecorded: true });
-	}
+type Rendered = { name: string; layout: string[]; actual: { width: number; height: number; data: Uint8Array }; png: Buffer };
+
+// The compare-and-record half, shared by the window and popup passes: write the actual PNG, then either
+// update the baseline (--update), flag MISSING/SIZE/CHANGED, or record OK — with a red diff image for
+// any changed shot, so a reviewer sees WHERE a shot moved.
+async function storeShot(name: string, rendered: Rendered, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
 	for (const violation of rendered.layout) violations.push(`${name}: ${violation}`);
 	writeFileSync(join(OUT_ACTUAL, `${name}.png`), rendered.png);
 
@@ -255,6 +299,64 @@ async function captureIntoReport(win: BrowserWindow, section: 'accounts' | 'sett
 	rows.push({ name, status: 'OK', px: shot.changed, ratio: shot.ratio });
 }
 
+// Run one window state end-to-end, then fold its outcome into the rows. A throw is recorded (RENDER FAILED)
+// and captured into `error` so the pass still produces a report; one bad shot never aborts the rest.
+async function captureWindow(win: BrowserWindow, section: 'accounts' | 'settings', width: number, theme: string, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
+	const name = `${section}-${width}-${theme}`;
+	let rendered: Rendered;
+	try {
+		rendered = await renderOne(win, section, width, theme);
+	} catch (thrown) {
+		rows.push({ name, status: 'RENDER FAILED', px: 0, ratio: 0 });
+		throw Object.assign(new Error(`RENDER FAILED ${name}: ${asText(thrown)}`), { alreadyRecorded: true });
+	}
+	await storeShot(name, rendered, update, rows, violations);
+}
+
+// Load the popup page and wait until the strip and note have painted. The popup has no section switch, so
+// there is no click; the probe is POPUP_SETTLED (three cells present, note non-empty).
+async function loadAndSettlePopup(win: BrowserWindow, label: string): Promise<void> {
+	await withTimeout(win.loadFile(POPUP_HTML), LOAD_MS, `loadFile ${label}`);
+	await withTimeout(win.webContents.executeJavaScript('document.fonts.ready.then(() => true)'), SCRIPT_MS, `fonts ${label}`);
+	for (let attempt = 0; attempt < 60; attempt += 1) {
+		const ready = await withTimeout(win.webContents.executeJavaScript(POPUP_SETTLED), SCRIPT_MS, `settle ${label}`);
+		if (ready) break;
+		await sleep(50);
+	}
+	await sleep(250);
+}
+
+// Render one popup state: swap the getStatus/getState answers this state reads BEFORE loading (the page
+// invokes them on load), then measure the strip's layout and capture a CSS-pixel PNG.
+async function renderPopupOne(win: BrowserWindow, state: 'normal' | 'calm' | 'paused', theme: string): Promise<Rendered> {
+	const name = `popup-${state}-${theme}`;
+	nativeTheme.themeSource = theme as 'light' | 'dark';
+	win.setContentSize(POPUP_WIDTH, POPUP_HEIGHT);
+	SHOT_STATUS = buildPopupStatus(state);
+	SHOT_STATE = popupEngineView(state);
+	await loadAndSettlePopup(win, name);
+
+	const measured = (await withTimeout(win.webContents.executeJavaScript(MEASURE_POPUP), SCRIPT_MS, `measure ${name}`)) as Parameters<typeof checkPopupLayout>[0];
+	const layout = checkPopupLayout(measured);
+
+	const raw = await withTimeout(win.webContents.capturePage(), CAPTURE_MS, `capturePage ${name}`);
+	const image = normalise(raw, POPUP_WIDTH, POPUP_HEIGHT);
+	return { name, layout, actual: bitmapOf(image), png: image.toPNG() };
+}
+
+// Run one popup state, recording failures the same way the window pass does.
+async function capturePopup(win: BrowserWindow, state: 'normal' | 'calm' | 'paused', theme: string, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
+	const name = `popup-${state}-${theme}`;
+	let rendered: Rendered;
+	try {
+		rendered = await renderPopupOne(win, state, theme);
+	} catch (thrown) {
+		rows.push({ name, status: 'RENDER FAILED', px: 0, ratio: 0 });
+		throw Object.assign(new Error(`RENDER FAILED ${name}: ${asText(thrown)}`), { alreadyRecorded: true });
+	}
+	await storeShot(name, rendered, update, rows, violations);
+}
+
 async function main(): Promise<number> {
 	const update = process.argv.includes('--update');
 	if (update && process.env.CI) {
@@ -276,8 +378,9 @@ async function main(): Promise<number> {
 		if (update) mkdirSync(SHOTS, { recursive: true });
 		else mkdirSync(OUT_DIFF, { recursive: true });
 
-		// One window, reused for all eight states. A reload re-paints the fresh page at the new size and
-		// theme; destroying it and creating the next made the second load fail with ERR_FAILED.
+		// One window, reused for all fourteen states (eight window shots, six popup shots). A reload
+		// re-paints the fresh page at the new size and theme; destroying it and creating the next made
+		// the second load fail with ERR_FAILED.
 		const win = new BrowserWindow({
 			show: false,
 			width: WIDTHS[0],
@@ -286,9 +389,13 @@ async function main(): Promise<number> {
 			webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: true },
 		});
 
+		// The window answers are the normal status with the engine running; the popup pass swaps them per
+		// state inside renderPopupOne. Set them before the warm-up so the first load reads them.
+		SHOT_STATUS = buildStatus();
+		SHOT_STATE = ENGINE_VIEW;
+
 		// Warm-up load: the FIRST page load in a run bootstraps slower (fonts, first IPC round-trips), so
-		// without this the first captured state is the least-settled one and drifts run-to-run. It is best-
-		// effort: if it fails we let each state report its own bounded failure rather than aborting here.
+		// without this the first captured state is the least-settled one and drifts run-to-run. Best-effort.
 		try {
 			await loadAndSettle(win, 'accounts', 'warm-up');
 		} catch (thrown) {
@@ -299,11 +406,23 @@ async function main(): Promise<number> {
 			for (const width of WIDTHS) {
 				for (const theme of THEMES) {
 					try {
-						await captureIntoReport(win, section, width, theme, update, rows, violations);
+						await captureWindow(win, section, width, theme, update, rows, violations);
 					} catch (thrown) {
-						// captureIntoReport already added a RENDER FAILED row; keep the first error text.
+						// captureWindow already added a RENDER FAILED row; keep the first error text.
 						if (error === undefined) error = asText(thrown);
 					}
+				}
+			}
+		}
+
+		// The popup pass on the same reused window: three states, light and dark. renderPopupOne swaps the
+		// getStatus/getState answers and loads popup.html, so the same nine-channel bridge is exercised.
+		for (const state of POPUP_STATES) {
+			for (const theme of THEMES) {
+				try {
+					await capturePopup(win, state, theme, update, rows, violations);
+				} catch (thrown) {
+					if (error === undefined) error = asText(thrown);
 				}
 			}
 		}

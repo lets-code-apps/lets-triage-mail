@@ -5,8 +5,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { checkLayout, KNOWN_BELOW_44 } from './shots/layout.ts';
-import type { Measurements } from './shots/layout.ts';
+import { checkLayout, checkPopupLayout, KNOWN_BELOW_44 } from './shots/layout.ts';
+import type { Measurements, PopupMeasure, PopupCell } from './shots/layout.ts';
 
 // A state that satisfies every rule: the title centred with 132px of clear on one line, the emblem
 // at the bar's right end (24px inset), five aligned settings rows, and controls at or above their
@@ -89,4 +89,63 @@ test('a title wider than its box (scrollWidth > clientWidth) is a violation', ()
 	m.title.scrollWidth = m.title.clientWidth + 1;
 	const violations = checkLayout('settings', m);
 	assert.ok(violations.some((v) => v.includes('overflows its box')), JSON.stringify(violations));
+});
+
+// --- the popup counts strip ---------------------------------------------------------------
+// A good strip: three equal 116px-wide BUTTON cells at least 44 tall, each named with its count and the
+// action, dot and arrow hidden, and a non-empty note. Mirrors the numbers MEASURE_POPUP reads in the page.
+function goodPopup(): PopupMeasure {
+	const cell = (ariaLabel: string): PopupCell => ({
+		tag: 'BUTTON',
+		width: 116,
+		height: 84,
+		ariaLabel,
+		dotHidden: true,
+		iconHidden: true,
+	});
+	return {
+		cells: [cell('needs reply, 4, open Apple Mail'), cell('fyi, 6, open Apple Mail'), cell('done, 12, open Apple Mail')],
+		noteFilled: true,
+	};
+}
+
+test('a good popup strip passes with no violations', () => {
+	assert.deepEqual(checkPopupLayout(goodPopup()), []);
+});
+
+test('a strip that is not three cells is reported and stops there', () => {
+	const m = goodPopup();
+	m.cells = m.cells.slice(0, 2);
+	const violations = checkPopupLayout(m);
+	assert.deepEqual(violations, ['popup strip must have 3 cells, saw 2']);
+});
+
+test('a cell that is not a button breaks keyboard reachability', () => {
+	const m = goodPopup();
+	m.cells[1] = { ...m.cells[1], tag: 'DIV' };
+	assert.ok(checkPopupLayout(m).some((v) => v.includes('cell 1 is <div>')));
+});
+
+test('a cell under 44 tall misses the touch target', () => {
+	const m = goodPopup();
+	m.cells[0] = { ...m.cells[0], height: 40 };
+	assert.ok(checkPopupLayout(m).some((v) => v.includes('cell 0 height 40 below the 44px touch target')));
+});
+
+test('an accessible name that omits the count is a violation', () => {
+	const m = goodPopup();
+	m.cells[2] = { ...m.cells[2], ariaLabel: 'done, open Apple Mail' }; // the number is gone
+	assert.ok(checkPopupLayout(m).some((v) => v.includes('cell 2 aria-label must name the count')));
+});
+
+test('cells that are not equal width are reported', () => {
+	const m = goodPopup();
+	m.cells[2] = { ...m.cells[2], width: 90 };
+	assert.ok(checkPopupLayout(m).some((v) => v.includes('cells not equal width')));
+});
+
+test('an empty note line is a violation', () => {
+	const m = goodPopup();
+	m.noteFilled = false;
+	assert.ok(checkPopupLayout(m).some((v) => v.includes('the strip note line is empty')));
 });

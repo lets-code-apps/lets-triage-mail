@@ -17,7 +17,9 @@ export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'fai
 // A command the renderer can ask the main process to run. Nothing here reaches mail, the
 // model or the database: each maps to one engine subcommand, or to a window/app action main
 // owns. `openWindow` and `quit` exist so the popup's footer buttons need no extra channel.
-export type EngineCommand = 'start' | 'stop' | 'check' | 'openWindow' | 'openSettings' | 'quit';
+// `openMail` is the popup's three count buttons: it runs a fixed `open -a Mail` (Apple Mail
+// itself, no folder) and takes no argument, so it still needs no new channel or preload function.
+export type EngineCommand = 'start' | 'stop' | 'check' | 'openWindow' | 'openSettings' | 'openMail' | 'quit';
 
 // What the renderer shows about the engine. `exitCode`/`signal`/`failureTail` are filled only in
 // `failed`. `failureTail` is the last few stderr lines the engine printed before it died (bounded

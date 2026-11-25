@@ -63,11 +63,28 @@ test('no source file makes a network call or reads config/state', () => {
 	assert.deepEqual(violations, []);
 });
 
-test('the only child_process use is engine.ts', () => {
+test('the only child_process use is engine.ts and open-mail.ts', () => {
 	const files = walk(SRC).filter((f) => f.endsWith('.ts'));
 	const token = ['child', '_', 'process'].join('');
 	const offenders = files.filter((f) => readFileSync(f, 'utf8').includes(token));
-	assert.deepEqual(offenders.map((f) => f.slice(SRC.length + 1)), ['engine.ts']);
+	// engine.ts runs the engine child; open-mail.ts runs the fixed `open -a Mail` for the popup's
+	// count buttons. Both use a fixed argv with execFile/spawn, never a shell. Nothing else spawns.
+	assert.deepEqual(offenders.map((f) => f.slice(SRC.length + 1)), ['engine.ts', 'open-mail.ts']);
+});
+
+// open-mail.ts is the one place a popup button reaches the OS: it must run exactly `open -a Mail`,
+// with the argv spelled as literals and never through a shell, so nothing from the page is interpreted.
+test('open-mail.ts runs a fixed open -a Mail, never a shell', () => {
+	const openMail = readFileSync(join(SRC, 'open-mail.ts'), 'utf8');
+	for (const token of ["'open'", "'-a'", "'Mail'"]) {
+		assert.ok(openMail.includes(token), `open-mail.ts must pass the literal ${token}`);
+	}
+	assert.equal(/shell:\s*true/.test(openMail), false, 'open-mail.ts must not run a shell');
+	// execFile/spawn take an argv; exec would put one string through a shell. No exec call.
+	assert.equal(/[^F]exec\(/.test(openMail), false, 'open-mail.ts must use execFile, not exec');
+	// openMail is an allowed command but adds no channel and no preload function (the nine stay).
+	const ipc = readFileSync(join(SRC, 'ipc.ts'), 'utf8');
+	assert.ok(/EngineCommand =[^;]*'openMail'/.test(ipc), 'EngineCommand includes openMail');
 });
 
 test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
@@ -108,6 +125,19 @@ test('the popup page is as locked down as the window page', () => {
 	// Engine strings are hostile data: text only, never an HTML sink.
 	assert.equal(/\.innerHTML\s*=/.test(script), false, 'popup.js must not assign innerHTML');
 	assert.ok(script.includes('textContent'), 'popup.js must render with textContent');
+});
+
+test('a status that cannot be answered paints its reason on the new note line, never a removed element', () => {
+	// The summary box is gone; a rejected `getStatus` used to write into the removed `sublineEl`, which
+	// threw and left the reason invisible. The new layout must route both the engine error payload and a
+	// rejected round-trip through the note line, and must not reference any element the old box owned.
+	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
+	for (const gone of ['sublineEl', 'pillEl', 'countEl']) {
+		assert.equal(script.includes(gone), false, `popup.js must not reference the removed ${gone}`);
+	}
+	assert.ok(/function showError\(/.test(script), 'the popup needs one shared error paint path');
+	assert.match(script, /showError\(String\(payload\.message\)\)/, 'an engine error payload is shown');
+	assert.match(script, /showError\(`Status unavailable: \$\{String\(failed\)\}`\)/, 'a rejected status request is shown');
 });
 
 test('main trusts only the two pages it loads, and answers getStatus behind that guard', () => {
@@ -175,7 +205,7 @@ test('the tray Check result is opened, built and pushed to the renderer', () => 
 
 // The popup styles its rows with `.accounts` / `.accounts > li`; a selector the markup does not
 // expose is silent breakage (an unstyled browser list). This pins markup and selector together.
-test('the account list exposes the class its CSS targets, and the pill is filled as text', () => {
+test('the account list exposes the class its CSS targets, and the strip names its cells as text', () => {
 	const html = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
 	const css = readFileSync(join(DESKTOP, 'renderer', 'popup.css'), 'utf8');
 	const script = readFileSync(join(DESKTOP, 'renderer', 'popup.js'), 'utf8');
@@ -184,7 +214,10 @@ test('the account list exposes the class its CSS targets, and the pill is filled
 	assert.match(ul[0], /id="accounts"/);
 	assert.match(ul[0], /class="accounts"/, 'the list needs the class popup.css styles');
 	assert.match(css, /\.accounts\b/, 'the stylesheet must target that class');
-	assert.match(script, /pillEl\.textContent/, 'the pill is filled with textContent');
+	// The counts strip: three cells, each named by an aria string main already built, and the note
+	// line written as text.
+	assert.match(script, /button\.setAttribute\('aria-label', cell\.aria\)/, 'a cell name comes from the ready-to-print aria string');
+	assert.match(script, /noteEl\.textContent/, 'the note line is filled with textContent');
 });
 
 // There is no single-instance lock yet, so a Start must not double-watch a mailbox. The guard reads
@@ -296,4 +329,19 @@ test('the app-bar title is centred on the whole bar and keeps 132px clear each s
 	assert.ok(bar[1].includes('justify-content: flex-end;'), 'the emblem stays at the right end');
 	const tokens = readFileSync(join(DESKTOP, 'renderer', 'tokens.css'), 'utf8');
 	assert.ok(tokens.includes('--item: 15px;'), 'tokens.css defines the item size the title uses');
+});
+
+// The counts strip is a UI surface Piotr must be able to reach by keyboard and hear by name. The
+// executable statement: three native buttons (no tabindex tricks), a visible 3px focus ring on a cell,
+// and the decorative dot/arrow hidden from assistive tech (the count lives in the aria-label instead).
+test('the counts strip is three keyboard buttons with a focus ring and names that hold the count', () => {
+	const html = readFileSync(join(DESKTOP, 'renderer', 'popup.html'), 'utf8');
+	const css = readFileSync(join(DESKTOP, 'renderer', 'popup.css'), 'utf8');
+	const strip = /<div id="strip"[\s\S]*?<\/div>/.exec(html);
+	assert.ok(strip, 'popup.html must contain the counts strip');
+	assert.equal((strip[0].match(/<button[^>]*class="cell"/g) ?? []).length, 3, 'exactly three count buttons');
+	assert.equal(/tabindex/.test(strip[0]), false, 'no manual tab order: DOM order is the tab order');
+	assert.match(css, /\.cell:focus-visible\s*\{[^}]*outline:\s*3px solid/, 'a focused cell shows a 3px ring');
+	assert.ok(/<span class="dot" aria-hidden="true">/.test(html), 'the needs-reply dot is aria-hidden');
+	assert.match(html, /<svg class="icon"[^>]*aria-hidden="true"><use href="#i-arrow-up-right"/, 'the corner arrow is aria-hidden');
 });
