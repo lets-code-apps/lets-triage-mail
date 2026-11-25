@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand};
 use lets_triage_mail::config::Config;
+use lets_triage_mail::shared_model;
 
 /// Where the config lives when `--config` is not given (see `docs/SPEC.md` section 3).
 const DEFAULT_CONFIG_PATH: &str = "~/.config/lets-triage-mail/config.toml";
@@ -156,6 +157,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 }
 
 /// Loads the config for a command, with a pointer to the example file when it is missing.
+/// The shared model file (`~/.config/lets-code/model.toml`, see docs/MODEL.md) is read
+/// only here, at the entry point: the library itself stays pure so tests never touch `$HOME`.
 fn load_config(path: &Path) -> anyhow::Result<Config> {
     if !path.exists() {
         anyhow::bail!(
@@ -164,7 +167,12 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
             path.display()
         );
     }
-    Ok(Config::load(path)?)
+    let shared_path = expand_home(
+        PathBuf::from(shared_model::DEFAULT_PATH),
+        std::env::var_os("HOME"),
+    );
+    let shared = shared_model::read(&shared_path);
+    Ok(Config::load_with_shared(path, &shared)?)
 }
 
 /// Replaces a leading `~` with the home directory.
