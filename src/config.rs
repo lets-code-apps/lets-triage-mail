@@ -649,7 +649,7 @@ impl Config {
             origin: origin.to_string(),
             source,
         })?;
-        config.apply_shared(&text, shared);
+        config.apply_shared(text, shared);
         config.validate()?;
         Ok(config)
     }
