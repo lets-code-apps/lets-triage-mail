@@ -130,36 +130,45 @@ pub enum Command {
 /// Runs the chosen subcommand.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config_path();
+    // The shared model file (`~/.config/lets-code/model.toml`, see docs/MODEL.md) is resolved
+    // from `$HOME` exactly once, here at the production entry point; every command receives it
+    // as a parameter, so tests decide the path and the real home is never touched (LET-135's
+    // rule).
+    let shared_path = expand_home(
+        PathBuf::from(shared_model::DEFAULT_PATH),
+        std::env::var_os("HOME"),
+    );
     tracing::debug!(config = %config_path.display(), "using config file");
     match cli.command {
         Command::Run {
             exit_on_stdin_close,
-        } => run::run(&config_path, exit_on_stdin_close).await,
+        } => run::run(&config_path, &shared_path, exit_on_stdin_close).await,
         Command::Check { account, json } => {
-            check::run(&config_path, account.as_deref(), json).await
+            check::run(&config_path, &shared_path, account.as_deref(), json).await
         }
         Command::Classify {
             files,
             json,
             account,
-        } => classify::run(&config_path, &files, json, account.as_deref()).await,
+        } => classify::run(&config_path, &shared_path, &files, json, account.as_deref()).await,
         Command::Backfill { days, account } => {
-            backfill::run(&config_path, days, account.as_deref()).await
+            backfill::run(&config_path, &shared_path, days, account.as_deref()).await
         }
         Command::Digest { account, dry } => {
-            digest::run(&config_path, account.as_deref(), dry).await
+            digest::run(&config_path, &shared_path, account.as_deref(), dry).await
         }
-        Command::Stats { days, json } => stats::run(&config_path, days, json).await,
-        Command::Status { json } => status::run(&config_path, json).await,
-        Command::Rules(command) => rules::run(&config_path, command).await,
+        Command::Stats { days, json } => stats::run(&config_path, &shared_path, days, json).await,
+        Command::Status { json } => status::run(&config_path, &shared_path, json).await,
+        Command::Rules(command) => rules::run(&config_path, &shared_path, command).await,
         Command::Config(command) => config::run(&config_path, command).await,
     }
 }
 
 /// Loads the config for a command, with a pointer to the example file when it is missing.
-/// The shared model file (`~/.config/lets-code/model.toml`, see docs/MODEL.md) is read
-/// only here, at the entry point: the library itself stays pure so tests never touch `$HOME`.
-fn load_config(path: &Path) -> anyhow::Result<Config> {
+/// `shared_path` (the shared model file, `~/.config/lets-code/model.toml`, see docs/MODEL.md)
+/// is a parameter, never read from `$HOME` here: `dispatch` resolves it once for production,
+/// tests inject a temp path.
+fn load_config(path: &Path, shared_path: &Path) -> anyhow::Result<Config> {
     if !path.exists() {
         anyhow::bail!(
             "config file {} not found; copy config.example.toml there and adjust it, \
@@ -167,12 +176,10 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
             path.display()
         );
     }
-    let shared_path = expand_home(
-        PathBuf::from(shared_model::DEFAULT_PATH),
-        std::env::var_os("HOME"),
-    );
-    let shared = shared_model::read(&shared_path);
-    Ok(Config::load_with_shared(path, &shared)?)
+    Ok(Config::load_with_shared(
+        path,
+        &shared_model::read(shared_path),
+    )?)
 }
 
 /// Replaces a leading `~` with the home directory.
@@ -320,8 +327,53 @@ mod tests {
 
     #[test]
     fn missing_config_error_points_at_the_example() {
-        let err = load_config(Path::new("/nonexistent/config.toml")).unwrap_err();
+        let err = load_config(
+            Path::new("/nonexistent/config.toml"),
+            Path::new("/nonexistent/model.toml"),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("config.example.toml"), "{err}");
+    }
+
+    #[test]
+    fn injected_shared_file_reaches_the_llm_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[[accounts]]\nname = \"a\"\nhost = \"h\"\nusername = \"u\"\n",
+        )
+        .unwrap();
+        let shared_path = dir.path().join("model.toml");
+        std::fs::write(
+            &shared_path,
+            "url = \"http://127.0.0.1:11434\"\nmodel = \"qwen3:8b\"\n",
+        )
+        .unwrap();
+        let config = load_config(&config_path, &shared_path).unwrap();
+        assert_eq!(
+            config.llm.model, "qwen3:8b",
+            "the injected file fills [llm]"
+        );
+        assert_eq!(config.llm.base_url, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn a_missing_shared_path_keeps_the_llm_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[[accounts]]\nname = \"a\"\nhost = \"h\"\nusername = \"u\"\n",
+        )
+        .unwrap();
+        // The injected path does not exist: `read` returns the empty model and no real
+        // home is opened — the path came from the caller, not from `$HOME`.
+        let config = load_config(&config_path, &dir.path().join("model.toml")).unwrap();
+        assert_eq!(
+            config.llm.model, "qwen3:14b",
+            "nothing outside the temp folder is read"
+        );
     }
 
     #[test]

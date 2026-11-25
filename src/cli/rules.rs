@@ -47,8 +47,12 @@ pub enum RulesCommand {
 }
 
 /// Lists, adds or removes sender rules.
-pub async fn run(config_path: &Path, command: RulesCommand) -> anyhow::Result<()> {
-    let config = super::load_config(config_path)?;
+pub async fn run(
+    config_path: &Path,
+    shared_path: &Path,
+    command: RulesCommand,
+) -> anyhow::Result<()> {
+    let config = super::load_config(config_path, shared_path)?;
     let db_path = config.db_path();
     // `Store` is synchronous (SQLite blocks the thread), so it runs on tokio's blocking
     // thread pool instead of the async runtime. The first `?` handles a panicked or
