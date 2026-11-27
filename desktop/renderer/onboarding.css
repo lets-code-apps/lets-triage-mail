@@ -275,14 +275,16 @@
   min-width: 8px;
 }
 
-/* The back action is a quiet ghost button (no border/fill), distinct from the primary continue. */
-.btn.ghost {
+/* The back action is a quiet ghost button (no border/fill), distinct from the primary continue.
+   Scoped to the setup column on purpose: the existing panes' ghost buttons (cancel, remove account)
+   keep their current base .btn look, so no account/settings pixel moves in this issue. */
+.setup .btn.ghost {
   padding: 0 14px;
   border: 0;
   background: transparent;
   color: var(--fg);
 }
 
-.btn.ghost:hover {
+.setup .btn.ghost:hover {
   background: var(--raised);
 }
