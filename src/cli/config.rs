@@ -27,6 +27,15 @@ pub enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Change one global (section-level) setting, keeping the file's comments
+    Set {
+        /// One of policy.dry_run, digest.enabled, digest.time
+        key: String,
+        /// For a bool, `true` or `false`; for digest.time, `HH:MM`
+        value: String,
+        #[command(flatten)]
+        out: JsonFlag,
+    },
     /// Add, change or remove an account, keeping the file's comments
     #[command(subcommand)]
     Account(AccountCommand),
@@ -134,6 +143,7 @@ impl ConfigCommand {
     fn wants_json(&self) -> bool {
         match self {
             ConfigCommand::Show { json } | ConfigCommand::Validate { json } => *json,
+            ConfigCommand::Set { out, .. } => out.json,
             ConfigCommand::Account(
                 AccountCommand::Add { out, .. }
                 | AccountCommand::Set { out, .. }
@@ -230,6 +240,14 @@ fn execute(path: &Path, command: ConfigCommand) -> anyhow::Result<Outcome> {
             forget_password,
             ..
         }) => remove(path, &name, forget_password),
+        ConfigCommand::Set { key, value, .. } => {
+            // The global keys are `policy.dry_run`, `digest.enabled`, `digest.time`; `commit`
+            // validates the result, so a bad value or an unknown key is refused before the
+            // file is written.
+            let new = edit::set_global_key(&read(path)?, &key, &value)?;
+            commit(path, &new)?;
+            Ok(changed(format!("{key} updated")))
+        }
         ConfigCommand::Account(AccountCommand::Password { name, .. }) => password(path, &name),
         ConfigCommand::Account(AccountCommand::Test { .. }) => unreachable!("handled in run"),
     }
@@ -466,6 +484,7 @@ fn show_json(path: &Path, config: &Config) -> Value {
         "path": path,
         "dry_run": config.policy.dry_run,
         "llm": {"base_url": config.llm.base_url, "model": config.llm.model},
+        "digest": {"enabled": config.digest.enabled, "time": config.digest.time},
         "accounts": accounts,
     })
 }
@@ -495,6 +514,7 @@ mod tests {
                 "path": "/x/config.toml",
                 "dry_run": true,
                 "llm": {"base_url": "http://127.0.0.1:11434/v1", "model": "qwen3:14b"},
+                "digest": {"enabled": true, "time": "07:00"},
                 "accounts": [{
                     "name": "work",
                     "host": "imap.example.com",
@@ -605,6 +625,58 @@ mod tests {
         let o = changed("did it".into());
         assert_eq!(o.json, json!({"ok": true, "restart_needed": true}));
         assert_eq!(o.text, "did it; restart triage to apply");
+    }
+
+    #[test]
+    fn set_global_key_writes_through_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c/config.toml");
+        let acc = NewAccount {
+            name: "work".into(),
+            host: "imap.example.com".into(),
+            username: "me".into(),
+            ..Default::default()
+        };
+        add(&path, acc).unwrap();
+
+        let cmd = |key: String, value: String| ConfigCommand::Set {
+            key: key.into(),
+            value: value.into(),
+            out: JsonFlag { json: false },
+        };
+        execute(&path, cmd("digest.enabled".into(), "false".into())).unwrap();
+        assert!(
+            !load(&path).unwrap().digest.enabled,
+            "digest.enabled written false"
+        );
+        execute(&path, cmd("digest.time".into(), "08:30".into())).unwrap();
+        assert_eq!(load(&path).unwrap().digest.time, "08:30");
+
+        // A non-bool and an unknown key are refused; `commit` validated, so the file is untouched.
+        assert!(execute(&path, cmd("digest.enabled".into(), "maybe".into())).is_err());
+        assert!(execute(&path, cmd("policy.bogus".into(), "true".into())).is_err());
+        assert_eq!(
+            load(&path).unwrap().digest.time,
+            "08:30",
+            "a refusal writes nothing"
+        );
+    }
+
+    #[test]
+    fn config_set_parses_positional_key_and_value() {
+        use crate::cli::Command;
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from(
+            std::iter::once("lets-triage-mail")
+                .chain(["config", "set", "digest.enabled", "false"].iter().copied()),
+        )
+        .unwrap();
+        if let Command::Config(ConfigCommand::Set { key, value, .. }) = cli.command {
+            assert_eq!(key, "digest.enabled");
+            assert_eq!(value, "false");
+        } else {
+            panic!("expected config set");
+        }
     }
 
     #[test]
