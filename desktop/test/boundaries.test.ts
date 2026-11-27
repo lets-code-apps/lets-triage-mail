@@ -96,14 +96,14 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 
 // The preload is CommonJS (sandbox), so it cannot import CHANNEL from ipc.ts. This closes the seam
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
-test('the preload bridge exposes exactly the nine channels ipc.ts declares', () => {
+test('the preload bridge exposes exactly the ten channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
 	const channels = Object.values(CHANNEL);
-	assert.equal(channels.length, 9, 'ipc.ts declares nine channels');
+	assert.equal(channels.length, 10, 'ipc.ts declares ten channels');
 	for (const channel of channels) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// Nine and only nine: nothing here reaches Node, the network or the filesystem. The one
+	// Ten and only ten: nothing here reaches Node, the network or the filesystem. The one
 	// `require` allowed is the electron module itself.
 	const requires = preload.match(/require\([^)]*\)/g) ?? [];
 	for (const call of requires) {

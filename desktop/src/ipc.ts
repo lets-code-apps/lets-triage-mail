@@ -53,15 +53,84 @@ export const CHANNEL = {
 	setSetting: 'ltm.setSetting',
 	getConfig: 'ltm.getConfig',
 	editAccount: 'ltm.editAccount',
+	setup: 'ltm.setup',
 } as const;
 
+// First-run onboarding. One channel carries every step the window page drives; setup does not add
+// engine commands to `EngineCommand` (those ride `ltm.setup`), and no new channel is created for
+// the popup's `openMail`. Types live here so main and the tests agree on the shape by construction.
+
+// The four onboarding steps, in fixed order. The page owns the step number; main answers a view
+// for a step the page asks about.
+export type SetupStep = 'accounts' | 'mode' | 'model' | 'digest';
+
+// An operation the window page asks the main process to run during setup. Renderer strings never
+// become flags: this is a closed set, mapped to a fixed engine argv in main, and the password (when
+// there is one) goes to the child's stdin, never to argv.
+export type SetupOp =
+	| 'view'
+	| 'accounts'
+	| 'addAccount'
+	| 'mode'
+	| 'decline'
+	| 'detect'
+	| 'pull'
+	| 'save'
+	| 'modelRetry'
+	| 'open'
+	| 'cancelDownload'
+	| 'digest'
+	| 'settings'
+	| 'start'
+	| 'back';
+
+// One of the four-tone colours the popup allow-list already uses (popup-model.ts). Engine text only
+// ever carries these four; a fifth is a bug, not a style.
+export type Tone = 'positive' | 'attention' | 'danger' | 'muted';
+
+// A ready-to-print view for one onboarding step: strings and a tone, built in main so the sandboxed
+// page never formats or colours anything itself. Optional fields are simply absent for steps that do
+// not use them (fields/options/actions/progress). Continue is disabled by `nextOff`.
+export type SetupView = {
+	step: SetupStep;
+	index: number; // 0-based step number
+	title: string;
+	text: string;
+	pill?: string;
+	tone?: Tone;
+	body?: string;
+	muted?: string;
+	note?: string;
+	fields?: { label: string; kind: 'text' | 'password'; placeholder?: string; helper?: string; example?: string; value?: string }[];
+	options?: { value: string; label: string }[];
+	selected?: string;
+	actions?: { label: string; glyph?: string; variant?: 'primary' | 'secondary' }[];
+	progress?: { label: string; value: number; max: number; pct: number } | null;
+	nextLabel?: string;
+	nextVariant?: 'primary' | 'secondary';
+	nextOff?: boolean;
+};
+
+// What one setup op answers the page. `idle` is main's answer when the window is not the requester
+// (the popup must never drive setup). `done` marks the final "start triage".
+export type SetupResult =
+	| { kind: 'view'; view: SetupView }
+	| { kind: 'done' }
+	| { kind: 'error'; message: string }
+	| { kind: 'idle' };
+
 // What the window's settings screen shows. `section` is a one-shot hint: "settings" once after the
-// popup asked to open the window there (the window reads it on focus and main clears it), else null.
+// popup asked to open the window there (the window reads it on focus and main clears it). The three
+// setup keys are filled once onboarding is wired in main (they are optional so the settings screen
+// and its shot fixtures stay as they are until then).
 export type SettingsPayload = {
 	appearance: Appearance;
 	openAtLogin: boolean;
 	log: string[];
 	section: 'settings' | null;
+	setupDone?: boolean;
+	notifyReply?: boolean;
+	notifyOffline?: boolean;
 };
 
 // Result of a `command` invocation: the command echoed back plus the state it produced.

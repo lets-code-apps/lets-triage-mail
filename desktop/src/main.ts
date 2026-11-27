@@ -418,7 +418,7 @@ function boot(): void {
 		if (!fromUs(event.senderFrame) || !isAllowedSetting(name, value)) return null;
 		if (name === 'openAtLogin') app.setLoginItemSettings({ openAtLogin: value as boolean });
 		else {
-			settings = { appearance: value as Settings['appearance'] };
+			settings = { ...settings, appearance: value as Settings['appearance'] };
 			nativeTheme.themeSource = settings.appearance;
 			try {
 				writeFileSync(settingsFile, JSON.stringify(settings));
