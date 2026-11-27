@@ -38,11 +38,13 @@ const isRecord = (v: unknown): v is Fields => typeof v === 'object' && v !== nul
 
 // The engine's allowed name characters (check_account_name in src/config_edit.rs), at most 64, and
 // starting with a letter or digit so a name can never read as a flag (belt and braces with `--`).
-const NAME = /^[A-Za-z0-9][A-Za-z0-9 _.@-]{0,63}$/;
+// Exported so the mode step's own argv builder (setup.ts) reuses the same shape instead of inventing
+// a second one.
+export const ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9 _.@-]{0,63}$/;
 const HOST = /^[^\s\0]{1,253}$/;
 const PRINTABLE = /^[^\0\r\n]*$/;
 
-const name = (f: Fields): string | null => (typeof f.name === 'string' && NAME.test(f.name) ? f.name : null);
+const name = (f: Fields): string | null => (typeof f.name === 'string' && ACCOUNT_NAME.test(f.name) ? f.name : null);
 const host = (f: Fields): string | null =>
 	typeof f.host === 'string' && HOST.test(f.host) && !f.host.startsWith('-') ? f.host : null;
 const username = (f: Fields): string | null =>

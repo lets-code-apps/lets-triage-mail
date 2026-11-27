@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { modelView, pickRecommended, type ModelStepData } from '../src/setup-model.ts';
+import { modelView, pickRecommended, stepFromDetect, stepView, type ModelStepData } from '../src/setup-model.ts';
 
 const data = (over: Partial<ModelStepData> = {}): ModelStepData => ({
 	runtimeName: 'Ollama',
@@ -92,4 +92,75 @@ test('pickRecommended prefers the size-matched model, then a non-embedding model
 	assert.equal(pickRecommended(['nomic-embed-text', 'llama3:8b'], 16), 'llama3:8b');
 	assert.equal(pickRecommended(['nomic-embed-text'], 8), 'nomic-embed-text');
 	assert.equal(pickRecommended([], 16), '');
+});
+
+test('found with nothing usable offers the sized download and holds Continue', () => {
+	const view = modelView('found', data({ usable: [], memGb: 24 }));
+	assert.equal(view.tone, 'attention');
+	const actions = view.actions ?? [];
+	assert.ok(actions.some((a) => a.label === 'download qwen3:8b'));
+	assert.equal(view.nextOff, true, 'Continue waits until a model is chosen');
+	assert.equal(view.selected, undefined);
+});
+
+test('the accounts step: nothing to pre-fill, so Continue waits for one signed-in account', () => {
+	const view = stepView({ step: 'accounts', data: { accounts: [], missing: true, error: null } });
+	assert.equal(view.step, 'accounts');
+	assert.equal(view.title, 'accounts');
+	assert.ok((view.text ?? '').includes('signs in over IMAP'));
+	assert.equal(view.nextOff, true);
+	assert.ok((view.muted ?? '').includes('keychain'));
+});
+
+test('the accounts step with accounts: named note, add another account, Continue on', () => {
+	const view = stepView({ step: 'accounts', data: { accounts: ['work', 'home', 'ex'], missing: false, error: null } });
+	assert.equal(view.note, 'work signed in, and 2 more');
+	assert.ok((view.actions ?? []).some((a) => a.label === 'add another account'));
+	assert.equal(view.nextOff, false);
+});
+
+test('the mode step pre-selects classify and sort, in the design option order', () => {
+	const view = stepView({ step: 'mode', data: { choice: 'classify-and-sort' } });
+	assert.deepEqual((view.options ?? []).map((o) => o.value), ['classify-only', 'classify-and-sort']);
+	assert.equal(view.selected, 'classify-and-sort');
+	assert.ok((view.muted ?? '').includes('Classify only shows the results in the digest'));
+	assert.equal(view.nextOff, false);
+});
+
+test('the digest step carries both switches as rows, with send at and the macOS note', () => {
+	const view = stepView({ step: 'digest', data: { enabled: true, time: '08:00', accounts: ['alex@example.com'], notifyReply: true, notifyOffline: false } });
+	assert.equal(view.nextLabel, 'start triage');
+	const labels = (view.fields ?? []).map((f) => f.label);
+	assert.deepEqual(labels, ['daily digest', 'send at', 'mail that needs a reply', 'connection problems']);
+	const digestField = view.fields?.[0];
+	assert.equal(digestField?.kind, 'switch');
+	assert.ok((digestField?.note ?? '').includes('One email a day to alex@example.com'));
+	assert.equal(view.fields?.[3]?.checked, false, 'a switched-off notification row reads off');
+	assert.ok((view.muted ?? '').includes('macOS asks once'));
+});
+
+test('stepFromDetect: a shared block only wins when its server answers', () => {
+	const shared = { runtime: 'ollama', url: 'http://127.0.0.1:11434', model: 'qwen3:14b', setBy: 'rag docs', reachable: true };
+	const fromShared = stepFromDetect({ ok: true, runtimes: [], shared, error: null }, 24);
+	assert.equal(fromShared.state, 'shared');
+	assert.equal(fromShared.data.model, 'qwen3:14b');
+	assert.equal(fromShared.data.setBy, 'rag docs');
+
+	// The shared file is there but its server is off now: fall through to the probes.
+	const off = stepFromDetect({ ok: true, runtimes: [{ runtime: 'ollama', url: 'http://127.0.0.1:11434', reachable: false, usable: [], error: 'connection refused' }], shared: { ...shared, reachable: false }, error: null }, 24);
+	assert.equal(off.state, 'not-found');
+});
+
+test('stepFromDetect: a reachable runtime becomes found, none becomes not-found', () => {
+	const found = stepFromDetect({ ok: true, runtimes: [{ runtime: 'ollama', url: 'http://127.0.0.1:11434', reachable: true, usable: ['qwen3:8b'], error: null }], shared: null, error: null }, 24);
+	assert.equal(found.state, 'found');
+	assert.equal(found.data.runtimeName, 'Ollama');
+	const none = stepFromDetect({ ok: true, runtimes: [{ runtime: 'lmstudio', url: 'http://127.0.0.1:1234', reachable: false, usable: [], error: 'unreachable' }], shared: null, error: null }, 8);
+	assert.equal(none.state, 'not-found');
+});
+
+test('stepView dispatches the model step through modelView', () => {
+	const view = stepView({ step: 'model', state: 'ready', data: data({ checkAnswer: ANSWERED }) });
+	assert.equal(view.title, 'model');
+	assert.ok((view.body ?? '').includes('answered a test question'));
 });

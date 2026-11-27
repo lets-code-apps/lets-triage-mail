@@ -101,7 +101,18 @@ export type SetupView = {
 	body?: string;
 	muted?: string;
 	note?: string;
-	fields?: { label: string; kind: 'text' | 'password'; placeholder?: string; helper?: string; example?: string; value?: string }[];
+	fields?: {
+		label: string;
+		kind: 'text' | 'password' | 'switch';
+		placeholder?: string;
+		helper?: string;
+		example?: string;
+		value?: string;
+		glyph?: string;
+		// A switch's state, and the one-line sentence under it (the digest step's switches).
+		checked?: boolean;
+		note?: string;
+	}[];
 	options?: { value: string; label: string }[];
 	selected?: string;
 	actions?: { label: string; glyph?: string; variant?: 'primary' | 'secondary' }[];
