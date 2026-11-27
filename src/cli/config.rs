@@ -640,8 +640,8 @@ mod tests {
         add(&path, acc).unwrap();
 
         let cmd = |key: String, value: String| ConfigCommand::Set {
-            key: key.into(),
-            value: value.into(),
+            key,
+            value,
             out: JsonFlag { json: false },
         };
         execute(&path, cmd("digest.enabled".into(), "false".into())).unwrap();
