@@ -7,7 +7,7 @@
 // nothing here ships in the app.
 //
 // Why the real preload and IPC: the LET-103 shots used a stub bridge. Loading `src/preload.cjs` and
-// answering the nine channels with `ipcMain.handle` in the main process exercises the real bridge
+// answering the ten channels with `ipcMain.handle` in the main process exercises the real bridge
 // too, and lets the page render exactly as it does in the app. All answers are the committed fixtures
 // and literals below: NO real config, NO `~/.config`, NO engine, NO network. Do not trigger a setup
 // check in a shot: it prints `new Date()` ("Checked at HH:MM") and the PNG would change every minute.
@@ -134,6 +134,13 @@ const SETUP_SHOTS: { key: string; width: number }[] = [
 	{ key: 'model-shared', width: 360 },
 ];
 
+// Chromium picks its raster scale from the display: a Retina Mac paints the page at 2x, a CI runner at
+// 1x. The `shots` npm script therefore launches electron with `--force-device-scale-factor=1`, so a
+// baseline generated on a Retina laptop is the same image CI compares against. The switch has to be on
+// the command line: `app.commandLine.appendSwitch('force-device-scale-factor', '1')` reads back as "1"
+// inside this file but electron has already chosen the scale by then, so it changes nothing (verified:
+// capturePage is 800x600 for a 400px window with the switch appended in-process, 400x300 with the flag).
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The message text for a thrown value (Error has stack; other throws may not).
@@ -244,9 +251,10 @@ function registerIpc(): void {
 	});
 }
 
-// Bring one image to CSS pixels. A Retina Mac captures 2x; a CI runner may capture 1x. Resizing to
-// (width, height) makes the baseline identical on every machine, which is the point of comparing bytes
-// here rather than eyeballing a shot. Height is 760 for the window and 640 for the popup.
+// Bring one image to CSS pixels. Height is 760 for the window and 640 for the popup. This is the safety
+// net for a capture that is NOT already CSS-sized: it does not repair a 2x capture (a downsampled 2x shot
+// differs from a native 1x render on every text edge), which is why `shots` pins the scale factor to 1 at
+// launch instead (see the note above the sleep helper).
 function normalise(image: Electron.NativeImage, width: number, height: number = HEIGHT): Electron.NativeImage {
 	const size = image.getSize();
 	if (size.width === width && size.height === height) return image;
@@ -431,11 +439,11 @@ async function loadAndSettleSetup(win: BrowserWindow, label: string): Promise<vo
 	await sleep(250);
 }
 
-// Render one onboarding state in a FRESH window. A new webContents makes both page scripts (renderer.js
-// and onboarding.js) run exactly as in the app; the reused harness window re-uses a cached load and
-// re-runs only one script on repeated loads, which is a harness artifact, not app behaviour. Then set the
-// setup view this load reads, measure the design layout, and capture a CSS-pixel PNG at the state's width
-// (720 or 360). checkLayout uses the accounts branch (no settings-row alignment rule there).
+// Render one onboarding state in a FRESH window. A new webContents makes the page script run exactly as in
+// the app; the reused harness window re-uses a cached load and re-runs the script in a half-torn-down DOM on
+// repeated loads, which is a harness artifact, not app behaviour. Then set the setup view this load reads,
+// measure the design layout, and capture a CSS-pixel PNG at the state's width (720 or 360). checkLayout
+// uses the accounts branch (no settings-row alignment rule there).
 async function renderSetupOne(key: string, width: number, theme: string): Promise<Rendered> {
 	const name = `setup-${key}-${width}-${theme}`;
 	nativeTheme.themeSource = theme as 'light' | 'dark';
