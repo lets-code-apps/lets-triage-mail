@@ -9,6 +9,7 @@ mod check;
 mod classify;
 mod config;
 mod digest;
+mod model;
 mod rules;
 mod run;
 mod stats;
@@ -122,6 +123,9 @@ pub enum Command {
     /// Manage the sender allow and block rules
     #[command(subcommand)]
     Rules(rules::RulesCommand),
+    /// Detect model servers, pull a model, or save the choice to the shared model.toml
+    #[command(subcommand)]
+    Model(model::ModelCommand),
     /// Show, validate and edit the config; accounts keep their comments
     #[command(subcommand)]
     Config(config::ConfigCommand),
@@ -160,6 +164,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Stats { days, json } => stats::run(&config_path, &shared_path, days, json).await,
         Command::Status { json } => status::run(&config_path, &shared_path, json).await,
         Command::Rules(command) => rules::run(&config_path, &shared_path, command).await,
+        Command::Model(command) => model::run(&shared_path, command).await,
         Command::Config(command) => config::run(&config_path, command).await,
     }
 }

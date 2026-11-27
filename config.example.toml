@@ -82,6 +82,9 @@ name = "Unsure"
 # at the time, it is written on wake. An account in dry-run is never appended to: its digest is
 # saved as a file in a `digests` folder next to the database, so you can preview it.
 [digest]
+# Set to false to stop the automatic daily digest entirely (`check` reports it as off). A digest
+# asked for by hand (`lets-triage-mail digest`) still works when this is false.
+enabled = true
 # Local time of day (24 hours, HH:MM) when the daily digest email is written.
 time = "07:00"
 # The mailbox the digest is added to. INBOX makes sure you notice it. The folder must exist: the

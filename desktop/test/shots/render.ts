@@ -1,12 +1,13 @@
 // The desktop screenshot + layout harness. It renders the real window page eight times (accounts
-// and settings, at 1100px and 360px, in light and dark) AND the real popup page six times (normal,
-// calm and paused, in light and dark) with SYNTHETIC data, measures the design layout, captures a
-// PNG, and compares that PNG against the committed baseline in `desktop/screenshots/` — fourteen
-// shots in all. It is run by the `desktop-shots` CI job (see .github/workflows/ci.yml);
+// and settings, at 1100px and 360px, in light and dark), the real popup page six times (normal,
+// calm and paused, in light and dark), AND the first-run onboarding page twenty times (eight steps
+// at 720px and two at 360px, in light and dark), with SYNTHETIC data; it measures the design layout,
+// captures a PNG, and compares that PNG against the committed baseline in `desktop/screenshots/` —
+// thirty-four shots in all. It is run by the `desktop-shots` CI job (see .github/workflows/ci.yml);
 // nothing here ships in the app.
 //
 // Why the real preload and IPC: the LET-103 shots used a stub bridge. Loading `src/preload.cjs` and
-// answering the nine channels with `ipcMain.handle` in the main process exercises the real bridge
+// answering the ten channels with `ipcMain.handle` in the main process exercises the real bridge
 // too, and lets the page render exactly as it does in the app. All answers are the committed fixtures
 // and literals below: NO real config, NO `~/.config`, NO engine, NO network. Do not trigger a setup
 // check in a shot: it prints `new Date()` ("Checked at HH:MM") and the PNG would change every minute.
@@ -27,6 +28,8 @@ import { join } from 'node:path';
 
 import { buildPopupView } from '../../src/popup-model.ts';
 import { parseStatusReport } from '../../src/status-report.ts';
+import { stepView, modelView } from '../../src/setup-model.ts';
+import type { SetupView } from '../../src/ipc.ts';
 import { MAX_CHANGED_RATIO, PIXEL_DELTA, compareShots, makeDiffBitmap } from './compare.ts';
 import { checkLayout, checkPopupLayout, MEASURE, MEASURE_POPUP } from './layout.ts';
 import { finalize, exitCodeFor } from './report.ts';
@@ -87,6 +90,57 @@ const SETTINGS = {
 	section: null,
 } as const;
 
+// First-run onboarding: the setup column replaces the panes in the same window. Every state is a ready-
+// to-print SetupView built by the same pure stepView/modelView the app uses (setup-model.ts), so the shot
+// proves what the page paints from the real view model. All strings are the synthetic fixtures below: fixed
+// model ids, fixed times, fixed counts. No wall clock, no engine, no network. Baseline names are
+// setup-<state>-<width>-<theme>.png: eight states at 720px (the design's width) and two at 360px (the narrow
+// check), light and dark — twenty new shots. The fourteen existing window/popup shots must not move.
+const MODEL_BASE = { runtimeName: 'Ollama', url: 'http://localhost:11434', model: 'qwen3:8b', memGb: 16 } as const;
+
+function setupView(key: string): SetupView {
+	switch (key) {
+		case 'accounts':
+			return stepView({ step: 'accounts', data: { accounts: [], missing: true, error: null } });
+		case 'accounts-added':
+			return stepView({ step: 'accounts', data: { accounts: ['Example Work', 'Example Home'], missing: false, error: null } });
+		case 'mode':
+			return stepView({ step: 'mode', data: { choice: 'classify-and-sort' } });
+		case 'model-shared':
+			return modelView('shared', { ...MODEL_BASE, setBy: 'rag docs', sharedModel: true });
+		case 'model-found':
+			return modelView('found', { ...MODEL_BASE, usable: ['qwen3:8b', 'llama3.2:3b'] });
+		case 'model-not-found':
+			return modelView('not-found', { ...MODEL_BASE });
+		case 'model-downloading':
+			return modelView('downloading', { ...MODEL_BASE, pull: { model: 'qwen3:8b', done: 2.2, gb: 5.2, pct: 42 } });
+		case 'digest':
+			return stepView({ step: 'digest', data: { enabled: true, time: '08:00', accounts: ['Example Work'], notifyReply: true, notifyOffline: true } });
+	}
+	throw new Error(`unknown setup state ${key}`);
+}
+
+// Eight onboarding states at 720px, two at the narrow 360px, each light and dark.
+const SETUP_SHOTS: { key: string; width: number }[] = [
+	{ key: 'accounts', width: 720 },
+	{ key: 'accounts-added', width: 720 },
+	{ key: 'mode', width: 720 },
+	{ key: 'model-shared', width: 720 },
+	{ key: 'model-found', width: 720 },
+	{ key: 'model-not-found', width: 720 },
+	{ key: 'model-downloading', width: 720 },
+	{ key: 'digest', width: 720 },
+	{ key: 'accounts', width: 360 },
+	{ key: 'model-shared', width: 360 },
+];
+
+// Chromium picks its raster scale from the display: a Retina Mac paints the page at 2x, a CI runner at
+// 1x. The `shots` npm script therefore launches electron with `--force-device-scale-factor=1`, so a
+// baseline generated on a Retina laptop is the same image CI compares against. The switch has to be on
+// the command line: `app.commandLine.appendSwitch('force-device-scale-factor', '1')` reads back as "1"
+// inside this file but electron has already chosen the scale by then, so it changes nothing (verified:
+// capturePage is 800x600 for a 400px window with the switch appended in-process, 400x300 with the flag).
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The message text for a thrown value (Error has stack; other throws may not).
@@ -124,6 +178,12 @@ const SETTLED: Record<'accounts' | 'settings', string> = {
 // this probe holds for each; it never reads a wall clock.
 const POPUP_SETTLED = `(()=>{ const cells=document.querySelectorAll('#strip .cell'); const note=document.querySelector('#note');
 	return cells.length===3 && note && note.textContent.trim()!==''; })()`;
+
+// A setup shot is settled when the setup column has painted (its step title has text, the four step
+// bubbles are present) AND the panes are hidden (onboarding replaced them). This is the state the setup
+// pass waits for before measuring and capturing.
+const SETUP_SETTLED = `(()=>{ const s=document.querySelector('#setup'); const p=document.querySelector('.panes'); const t=document.querySelector('.step-title'); const l=document.querySelector('.step-list');
+	return s && s.hidden===false && p && p.hidden===true && t && t.textContent.trim()!=='' && l && l.children.length>=4; })()`;
 
 // The status payload for the window's accounts screen, built exactly like main does: parse a fixture,
 // then format it. Pinning locale/zone makes the "since HH:MM" text identical on every machine, so the
@@ -166,9 +226,11 @@ function popupEngineView(state: 'normal' | 'calm' | 'paused'): EngineAnswer {
 
 // What getStatus and getState answer right now. Swapped per shot: the popup's six states differ only in
 // these two answers, so one handler pair covers all fourteen shots. The window pass answers the normal
-// status; the popup pass swaps them before each popup load.
+// status; the popup pass swaps them before each popup load. `ltm.setup` answers SHOT_SETUP: the window and
+// popup passes leave it null (idle, so onboarding stays hidden); the setup pass answers one step's view.
 let SHOT_STATUS: StatusAnswer = { kind: 'idle' };
 let SHOT_STATE: EngineAnswer = ENGINE_VIEW;
+let SHOT_SETUP: SetupView | null = null;
 
 // Answer the channels the page invokes on load and via its controls. onState/onCheckResult are
 // listeners, not invokes, so they need no handler; and we never push a check result, which would
@@ -181,11 +243,18 @@ function registerIpc(): void {
 	ipcMain.handle('ltm.setSetting', () => SETTINGS);
 	ipcMain.handle('ltm.command', (_event, command: string) => ({ command, view: SHOT_STATE }));
 	ipcMain.handle('ltm.editAccount', () => null);
+	// Onboarding reads ltm.setup once on load. Null answers `idle` (the window and popup passes), so
+	// onboarding stays hidden; the setup pass answers SHOT_SETUP, which makes onboarding paint that step.
+	ipcMain.handle('ltm.setup', () => {
+		console.error(`SETUP-HANDLER step=${SHOT_SETUP === null ? 'null' : SHOT_SETUP.step}`);
+		return SHOT_SETUP === null ? { kind: 'idle' } : { kind: 'view', view: SHOT_SETUP };
+	});
 }
 
-// Bring one image to CSS pixels. A Retina Mac captures 2x; a CI runner may capture 1x. Resizing to
-// (width, height) makes the baseline identical on every machine, which is the point of comparing bytes
-// here rather than eyeballing a shot. Height is 760 for the window and 640 for the popup.
+// Bring one image to CSS pixels. Height is 760 for the window and 640 for the popup. This is the safety
+// net for a capture that is NOT already CSS-sized: it does not repair a 2x capture (a downsampled 2x shot
+// differs from a native 1x render on every text edge), which is why `shots` pins the scale factor to 1 at
+// launch instead (see the note above the sleep helper).
 function normalise(image: Electron.NativeImage, width: number, height: number = HEIGHT): Electron.NativeImage {
 	const size = image.getSize();
 	if (size.width === width && size.height === height) return image;
@@ -357,6 +426,60 @@ async function capturePopup(win: BrowserWindow, state: 'normal' | 'calm' | 'paus
 	await storeShot(name, rendered, update, rows, violations);
 }
 
+// Load the real window page for one onboarding state. No section click (setup is not a section): onboarding
+// auto-runs off ltm.setup, which answers SHOT_SETUP, so it paints that step and hides the panes.
+async function loadAndSettleSetup(win: BrowserWindow, label: string): Promise<void> {
+	await withTimeout(win.loadFile(RENDERER_HTML), LOAD_MS, `loadFile ${label}`);
+	await withTimeout(win.webContents.executeJavaScript('document.fonts.ready.then(() => true)'), SCRIPT_MS, `fonts ${label}`);
+	for (let attempt = 0; attempt < 60; attempt += 1) {
+		const ready = await withTimeout(win.webContents.executeJavaScript(SETUP_SETTLED), SCRIPT_MS, `settle ${label}`);
+		if (ready) break;
+		await sleep(50);
+	}
+	await sleep(250);
+}
+
+// Render one onboarding state in a FRESH window. A new webContents makes the page script run exactly as in
+// the app; the reused harness window re-uses a cached load and re-runs the script in a half-torn-down DOM on
+// repeated loads, which is a harness artifact, not app behaviour. Then set the setup view this load reads,
+// measure the design layout, and capture a CSS-pixel PNG at the state's width (720 or 360). checkLayout
+// uses the accounts branch (no settings-row alignment rule there).
+async function renderSetupOne(key: string, width: number, theme: string): Promise<Rendered> {
+	const name = `setup-${key}-${width}-${theme}`;
+	nativeTheme.themeSource = theme as 'light' | 'dark';
+	SHOT_SETUP = setupView(key);
+	const win = new BrowserWindow({
+		show: false,
+		width,
+		height: HEIGHT,
+		useContentSize: true,
+		webPreferences: { preload: PRELOAD, contextIsolation: true, sandbox: true },
+	});
+	try {
+		await loadAndSettleSetup(win, name);
+		const measured = (await withTimeout(win.webContents.executeJavaScript(MEASURE), SCRIPT_MS, `measure ${name}`)) as Parameters<typeof checkLayout>[1];
+		const layout = checkLayout('accounts', measured);
+		const raw = await withTimeout(win.webContents.capturePage(), CAPTURE_MS, `capturePage ${name}`);
+		const image = normalise(raw, width);
+		return { name, layout, actual: bitmapOf(image), png: image.toPNG() };
+	} finally {
+		win.destroy();
+	}
+}
+
+// Run one onboarding state (fresh window each), recording failures the same way the window and popup passes do.
+async function captureSetup(key: string, width: number, theme: string, update: boolean, rows: ShotRow[], violations: string[]): Promise<void> {
+	const name = `setup-${key}-${width}-${theme}`;
+	let rendered: Rendered;
+	try {
+		rendered = await renderSetupOne(key, width, theme);
+	} catch (thrown) {
+		rows.push({ name, status: 'RENDER FAILED', px: 0, ratio: 0 });
+		throw Object.assign(new Error(`RENDER FAILED ${name}: ${asText(thrown)}`), { alreadyRecorded: true });
+	}
+	await storeShot(name, rendered, update, rows, violations);
+}
+
 async function main(): Promise<number> {
 	const update = process.argv.includes('--update');
 	if (update && process.env.CI) {
@@ -421,6 +544,19 @@ async function main(): Promise<number> {
 			for (const theme of THEMES) {
 				try {
 					await capturePopup(win, state, theme, update, rows, violations);
+				} catch (thrown) {
+					if (error === undefined) error = asText(thrown);
+				}
+			}
+		}
+
+		// The onboarding pass: eight states at 720px and two at the narrow 360px, light and dark — twenty new
+		// shots. renderSetupOne creates a fresh window each time (so both page scripts run), sets SHOT_SETUP as
+		// the setup view ltm.setup answers, then onboarding.js paints that step and hides the panes.
+		for (const shot of SETUP_SHOTS) {
+			for (const theme of THEMES) {
+				try {
+					await captureSetup(shot.key, shot.width, theme, update, rows, violations);
 				} catch (thrown) {
 					if (error === undefined) error = asText(thrown);
 				}

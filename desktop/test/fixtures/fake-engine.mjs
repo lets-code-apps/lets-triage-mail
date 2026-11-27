@@ -73,6 +73,116 @@ if (args[0] === 'status') {
 	process.exit(0);
 }
 
+// --- the first-run onboarding commands -------------------------------------------------------------
+// Setup asks the engine things the accounts screen never does: read the config, read the model situation,
+// then write both. The JSON shapes mirror the real engine exactly (src/cli/config.rs::show_json,
+// src/cli/model.rs::detect_json and save_json, model_setup.rs::normalise_pull_line), with synthetic values
+// only: imap.example.com, /example/config.toml, qwen3:*. Nothing is stored anywhere; a write is echoed.
+//
+// Scenarios come from the ENVIRONMENT, because the desktop always passes the same argv:
+//   LTM_FAKE_CONFIG=missing|empty|account   (default account)
+//   LTM_FAKE_MODEL=shared|found|found-empty|not-found|pull-fail   (default found)
+// The password an add or password op carries arrives on stdin; it is read and thrown away, exactly as a
+// real engine would consume it, so nothing the desktop writes to the pipe is left dangling.
+
+const FAKE_ACCOUNT = {
+	name: 'Example Work',
+	host: 'imap.example.com',
+	port: 993,
+	username: 'work@example.com',
+	tls: 'tls',
+	inbox: 'INBOX',
+	flagging: true,
+	watch_junk: false,
+	dry_run: false,
+	mode: 'live',
+	password_source: 'keyring',
+};
+
+// `config show --json` in its three onboarding states. `missing` is the true first run (no file yet),
+// `empty` is a file with no accounts, `account` is the normal screen's config.
+const configShow = () => {
+	const scenario = process.env.LTM_FAKE_CONFIG ?? 'account';
+	if (scenario === 'missing') {
+		process.stdout.write(JSON.stringify({ ok: false, error: 'no config file at /example/config.toml', missing: true }));
+		process.exit(1);
+	}
+	process.stdout.write(
+		JSON.stringify({
+			ok: true,
+			path: '/example/config.toml',
+			dry_run: true,
+			llm: { base_url: 'http://localhost:11434', model: 'qwen3:8b' },
+			digest: { enabled: true, time: '07:00' },
+			accounts: scenario === 'account' ? [FAKE_ACCOUNT] : [],
+		}),
+	);
+	process.exit(0);
+};
+
+if (args[0] === 'config') {
+	if (args[1] === 'show') configShow();
+	// A stdin-reading op: the desktop pipes the password in, so wait for it to close before answering.
+	const takeStdin = () => new Promise((resolve) => {
+		process.stdin.resume();
+		process.stdin.on('data', () => {});
+		process.stdin.on('end', resolve);
+		process.stdin.on('close', resolve);
+	});
+	if (args[1] === 'account' || args[1] === 'set') {
+		void takeStdin().then(() => {
+			process.stdout.write(JSON.stringify({ ok: true, restart_needed: true }));
+			process.exit(0);
+		});
+	}
+}
+
+// `model detect --json`: what answers, per scenario. One entry per runtime, plus the shared file's block.
+const RUNTIME_PROBE = (reachable, usable, error) => ({
+	runtime: 'ollama',
+	url: 'http://localhost:11434',
+	reachable,
+	models: usable,
+	usable,
+	error,
+});
+
+if (args[0] === 'model') {
+	const scenario = process.env.LTM_FAKE_MODEL ?? 'found';
+	if (args[1] === 'detect') {
+		const shared = scenario === 'shared' ? { runtime: 'ollama', url: 'http://localhost:11434', model: 'qwen3:8b', set_by: 'rag docs', reachable: true } : null;
+		const runtimes =
+			scenario === 'not-found'
+				? [RUNTIME_PROBE(false, [], 'no server answered at http://localhost:11434')]
+				: scenario === 'found-empty'
+					? [RUNTIME_PROBE(true, [], null)]
+					: [RUNTIME_PROBE(true, ['qwen3:8b', 'llama3.2:3b'], null)];
+		process.stdout.write(JSON.stringify({ ok: true, runtimes, shared }));
+		process.exit(0);
+	}
+	if (args[1] === 'save') {
+		process.stdout.write(JSON.stringify({ ok: true, runtime: 'ollama', url: 'http://localhost:11434', model: 'qwen3:8b' }));
+		process.exit(0);
+	}
+	if (args[1] === 'pull') {
+		// NDJSON, one normalised line per stage (model_setup.rs::normalise_pull_line): the desktop's bar
+		// reads total/completed as bytes and turns them into GB. 5.2 GB is the design's size for qwen3:8b.
+		const total = 5_576_501_248;
+		const step = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+		step({ stage: 'pulling manifest' });
+		for (const pct of [18, 42, 71, 100]) step({ stage: 'downloading', total, completed: Math.round((total * pct) / 100) });
+		if (scenario === 'pull-fail') {
+			step({ stage: 'error', error: 'manifest not found for that model' });
+			process.exit(1);
+		}
+		step({ stage: 'success' });
+		// A real pull streams for minutes, so cancelling it is a SIGTERM the desktop sends and the engine
+		// answers with exit 0; the fixture streams in one go, so cancel is checked in engine.test.ts, where
+		// the child is a fixture that stays alive until signalled.
+		process.exit(0);
+	}
+}
+
 if (args[0] === 'run') {
 	if (args.includes('--exit-1')) {
 		process.stderr.write('engine: config missing\n');

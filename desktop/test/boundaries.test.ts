@@ -96,14 +96,14 @@ test('DESKTOP.md keeps its Implemented / Mockup only / Future sections', () => {
 
 // The preload is CommonJS (sandbox), so it cannot import CHANNEL from ipc.ts. This closes the seam
 // the type system cannot: every channel name ipc.ts declares must appear in the bridge it exposes.
-test('the preload bridge exposes exactly the nine channels ipc.ts declares', () => {
+test('the preload bridge exposes exactly the ten channels ipc.ts declares', () => {
 	const preload = readFileSync(join(SRC, 'preload.cjs'), 'utf8');
 	const channels = Object.values(CHANNEL);
-	assert.equal(channels.length, 9, 'ipc.ts declares nine channels');
+	assert.equal(channels.length, 10, 'ipc.ts declares ten channels');
 	for (const channel of channels) {
 		assert.ok(preload.includes(channel), `preload.cjs must use channel ${channel}`);
 	}
-	// Nine and only nine: nothing here reaches Node, the network or the filesystem. The one
+	// Ten and only ten: nothing here reaches Node, the network or the filesystem. The one
 	// `require` allowed is the electron module itself.
 	const requires = preload.match(/require\([^)]*\)/g) ?? [];
 	for (const call of requires) {
@@ -344,4 +344,89 @@ test('the counts strip is three keyboard buttons with a focus ring and names tha
 	assert.match(css, /\.cell:focus-visible\s*\{[^}]*outline:\s*3px solid/, 'a focused cell shows a 3px ring');
 	assert.ok(/<span class="dot" aria-hidden="true">/.test(html), 'the needs-reply dot is aria-hidden');
 	assert.match(html, /<svg class="icon"[^>]*aria-hidden="true"><use href="#i-arrow-up-right"/, 'the corner arrow is aria-hidden');
+});
+
+// First-run onboarding: "install Ollama" may open exactly one fixed page in the user's browser, and the
+// notification switches become Electron Notifications in main only — notifier.ts decides whether and
+// how many, never displays anything, and no page can reach either call.
+test('setup opens one fixed URL, and Notification is built in main only', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.equal((main.match(/shell\.openExternal\(/g) ?? []).length, 1, 'openExternal appears exactly once in main');
+	assert.match(main, /shell\.openExternal\(OLLAMA_INSTALL_URL\)/, 'the one call uses the fixed constant, not a page value');
+	const setup = readFileSync(join(SRC, 'setup.ts'), 'utf8');
+	assert.match(setup, /OLLAMA_INSTALL_URL = 'https:\/\/ollama\.com\/download'/, 'the one URL, spelled once, in the pure module');
+	for (const file of ['notifier.ts', 'setup.ts', 'setup-model.ts', 'engine.ts', 'ipc.ts', 'settings.ts']) {
+		const text = readFileSync(join(SRC, file), 'utf8');
+		assert.equal(/new Notification\(/.test(text), false, `${file} must not build a Notification`);
+	}
+	assert.ok(/new Notification\(/.test(main), 'main is where a Notification is built');
+	for (const page of ['renderer.js', 'popup.js']) {
+		const script = readFileSync(join(DESKTOP, 'renderer', page), 'utf8');
+		assert.equal(/openExternal|new Notification/.test(script), false, `${page} can reach neither`);
+		assert.equal(/\.innerHTML\s*=/.test(script), false, `${page} must render with textContent, never an innerHTML sink`);
+	}
+});
+
+// The setup channel drives engine writes and settings writes, so only the window page may use it:
+// the popup answers idle. The two notification switches are rows on the settings screen (the board's
+// answer), and a click writes them back through the allow-listed setSetting.
+test('ltm.setup is the window page only, and the settings screen carries the two switches', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	const start = main.indexOf('ipcMain.handle(CHANNEL.setup');
+	assert.ok(start > 0, 'the setup channel has a handler');
+	assert.match(main.slice(start, start + 260), /!fromWindow\(event\.senderFrame\)\) return \{ kind: 'idle' \}/, 'the popup never drives setup');
+	const index = readFileSync(join(DESKTOP, 'renderer', 'index.html'), 'utf8');
+	assert.ok(index.includes('id="notifyReply"') && index.includes('id="notifyOffline"'), 'the two switch rows exist');
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	assert.ok(renderer.includes("setSetting('notifyReply'") && renderer.includes("setSetting('notifyOffline'"), 'the rows write back');
+	assert.equal(/setSetting\('setupDone'/.test(renderer), false, 'setupDone is main-only: the page cannot mark onboarding done');
+});
+
+// The first-run orchestration is in the DOM/Electron layer, which has no browser unit test here, so its
+// wiring is pinned structurally: detection starts on the model step and re-checks/refreshes while visible;
+// mode/digest Continue submit the chosen values (not an immediate write on a click); the chosen model and
+// typed address feed the requests; a completed pull is saved; and the download bar never reads as full.
+test('the onboarding steps drive the engine and settings end-to-end', () => {
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+
+	// 1. Detection starts when the model step paints its "looking for a runtime" placeholder, once, and while
+	// visible the step re-probes a not-found (every 3 s) and refreshes a running download.
+	assert.ok(renderer.includes("view.pill === 'looking for a runtime'") && renderer.includes('&& !setupDetectStarted'), 'entering the model step starts a single detect');
+	assert.ok(renderer.includes("api.setup('detect', { url: setupAddress })"), 'the model step and not-found re-check send a detect with the typed address');
+	assert.ok(renderer.includes('}, 3_000);'), 'a three-second interval keeps the model step current while visible');
+
+	// 2. Mode Continue submits the selected choice; a segment click only records the choice locally.
+	assert.ok(renderer.includes("setupChosenMode = value"), 'a mode click is a local choice');
+	assert.ok(renderer.includes(".setup('mode', { choice })"), 'Continue submits the selected mode');
+	assert.equal(/renderSetupMode[\s\S]{0,400}api\.setup\('mode', \{ choice: value \}/.test(renderer), false, 'a click must not run the engine write by itself');
+
+	// 6. Digest Continue writes the digest and the notification switches before marking setup complete,
+	// and the chain stops on any write that did not answer with a view.
+	assert.ok(renderer.includes('void setupDigestChain('), 'digest Continue runs the chain of writes');
+	assert.ok(renderer.includes('{ enabled: setupDigestEnabled, time: setupDigestTime }'), 'the digest switch reaches main on Continue');
+	assert.ok(renderer.includes('{ notifyReply: setupNotifyReply, notifyOffline: setupNotifyOffline }'), 'the notification switches reach main on Continue');
+	assert.ok(renderer.includes("setup('start', {})"), 'only after both writes answered does setup finish');
+	assert.equal(/return null;\n\t\t\t\}\n\t\t\t\treturn api\.setup\('start'/.test(renderer), false, 'a failed write must not fall through to start');
+
+	// 8. The chosen model and the typed runtime address feed save/pull/detect, and the address is read live.
+	assert.ok(renderer.includes("api.setup('save', { model: setupChosenModel"), 'Continue saves the chosen model');
+	assert.ok(renderer.includes("url: setupAddress }"), 'requests carry the typed runtime address');
+	assert.ok(renderer.includes('setupAddress = input.value.trim()'), 'the address field is read live into setupAddress');
+
+	// 10. The bar keeps its maximum at 100 and the fill is the clamped percent (never a partial "full").
+	assert.ok(renderer.includes("bar.setAttribute('aria-valuemax', '100')"), 'the bar maximum stays 100');
+	assert.ok(renderer.includes("fill.style.setProperty('--fill'"), 'the fill takes the clamped percent');
+	assert.equal(/aria-valuemax', String\(pct\)/.test(renderer), false, 'the maximum is never the current percent');
+	const css = readFileSync(join(DESKTOP, 'renderer', 'onboarding.css'), 'utf8');
+	assert.match(css, /\.model-panel \.progress-fill \{[^}]*width: var\(--fill, 100%\)/, 'the fill width is the driven percentage');
+
+	// 9. A completed pull in main saves the exact runtime/URL/model it downloaded (a download records the model).
+	const doneIdx = main.indexOf("session.pullState = 'done'");
+	assert.ok(doneIdx > 0, 'a successful pull marks the step done');
+	assert.match(main.slice(doneIdx, doneIdx + 400), /buildModelSaveArgs\(saveRuntime, saveUrl, model\)/, 'the pulled model is saved');
+
+	// 3. The live notification switches hydrate from saved settings, and a silent skip persists both false.
+	assert.ok(main.includes('notifySwitches.notifyReply = settings.notifyReply'), 'boot hydrates the switches from settings');
+	assert.ok(main.includes('settings = skippedInstallSettings(settings)'), 'a silent-skip install turns both switches off');
 });

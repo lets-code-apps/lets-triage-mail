@@ -9,6 +9,7 @@
 		<link rel="stylesheet" href="tokens.css" />
 		<link rel="stylesheet" href="shared.css" />
 		<link rel="stylesheet" href="renderer.css" />
+		<link rel="stylesheet" href="onboarding.css" />
 	</head>
 	<body>
 		<svg class="sprite" width="0" height="0" aria-hidden="true">
@@ -68,6 +69,14 @@
 							<button id="checkbtn" class="btn secondary" type="button"><span class="busy-dot" hidden></span><span id="checkLabel">check setup</span></button>
 						</div>
 					</div>
+					<label class="srow">
+						<span class="slabel"><span class="lbl">mail that needs a reply</span><span class="meta">One notification per message, nothing for fyi or done.</span></span>
+						<input id="notifyReply" class="switch" type="checkbox" role="switch" />
+					</label>
+					<label class="srow">
+						<span class="slabel"><span class="lbl">connection problems</span><span class="meta">One per account that stays offline for 5 minutes.</span></span>
+						<input id="notifyOffline" class="switch" type="checkbox" role="switch" />
+					</label>
 					<div id="checks" class="checks"></div>
 					<div class="srow">
 						<div class="slabel"><span class="lbl">log</span><span class="meta">Engine output from this session, kept in memory (last 500 lines).</span></div>
@@ -77,6 +86,19 @@
 				</section>
 			</article>
 		</div>
+		<main class="setup" id="setup" hidden>
+			<ol class="step-list" id="stepList" aria-label="setup steps"></ol>
+			<div class="step-head">
+				<h1 class="step-title" id="stepTitle"></h1>
+				<p class="step-text" id="stepText"></p>
+			</div>
+			<div class="step-body" id="stepBody"></div>
+			<div class="step-foot">
+				<button class="btn ghost" id="setupBack" type="button" hidden><span>back</span></button>
+				<span class="foot-spacer" aria-hidden="true"></span>
+				<button class="btn primary" id="setupNext" type="button"><span>continue</span></button>
+			</div>
+		</main>
 		<script src="renderer.js"></script>
 	</body>
 </html>

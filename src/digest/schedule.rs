@@ -102,6 +102,13 @@ pub async fn digest_loop(
     stop: &CancellationToken,
     timing: &DigestTiming,
 ) {
+    // `[digest] enabled = false` means the automatic schedule does nothing at all. A digest asked
+    // for by hand (`lets-triage-mail digest`) does not go through this loop, so it still works
+    // when the automatic one is off.
+    if !config.digest.enabled {
+        return;
+    }
+
     // Always `Some` after config validation; a config that skipped it gets no digest.
     let Some(at) = config.digest.time_of_day() else {
         return;
@@ -228,5 +235,33 @@ mod tests {
     #[test]
     fn midnight_is_a_valid_time() {
         assert_eq!(next_step(at(0, 0), (0, 0), None), Step::SendNow);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_digest_loop_returns_at_once_and_writes_nothing() {
+        // `[digest] enabled = false`: the loop must not poll or deliver, even when the time has
+        // long passed. A hand-run `digest` does not use this loop, so it is unaffected.
+        let config = Config::parse(
+            "[digest]\nenabled = false\ntime = \"07:00\"\n\
+             [[accounts]]\nname = \"a\"\nhost = \"h\"\nusername = \"u\"\n",
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let stop = CancellationToken::new();
+        let timing = DigestTiming::default();
+        let finished = tokio::time::timeout(
+            Duration::from_millis(50),
+            digest_loop(&config.accounts[0], &config, &store, &stop, &timing),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "a disabled digest must return at once, not loop"
+        );
+        let name = config.accounts[0].name.clone();
+        let last = with_store(&store, move |s| s.last_digest_date(&name))
+            .await
+            .unwrap();
+        assert!(last.is_none(), "no digest written while disabled");
     }
 }

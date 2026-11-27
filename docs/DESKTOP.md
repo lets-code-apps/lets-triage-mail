@@ -143,7 +143,10 @@ while the tray already says `failed`.
   buttons, the setup check report). Accounts has the add form, per-account mode (dry run / classify only /
   classify and sort), test connection, update password and remove, all through the engine's `config`
   commands; no folders screen. It polls `getStatus` every 5 s while visible; main answers
-  `idle` while the window is hidden. A tray "Check setup" switches it to settings.
+   `idle` while the window is hidden. A tray "Check setup" switches it to settings. While a notification switch
+   is on, main also polls `status --json` itself, every 30 s — the same short-lived command the popup uses, so
+   this adds no channel and no port; with both switches off it does not poll at all.
+
   Settings is one article (the `TriageMailSettings` design): **general** (appearance system/dark/light,
   stored in `userData/settings.json` and applied through `nativeTheme.themeSource`; open at login, kept
   by macOS and read/written with `app.get/setLoginItemSettings`) and **triage** (engine pause/start,
@@ -151,21 +154,24 @@ while the tray already says `failed`.
   scrolls per pane (the app bar never moves). The pause/start button shows a play or pause glyph (the
   design set has no play glyph yet) and a pulsing dot while the engine is starting or stopping. A setup
   check shows "checking…" with an elapsed-seconds counter, then "Checked at HH:MM · N warnings, M
-  failed", a "check again" button and a hide/show toggle for the results (per session). The engine's
-  `check` runs the model probe and every account probe at the same time and still prints and
-  reports them in the fixed order (config, model, accounts), so the report is the same, only sooner. The **notifications**
-  group is left out until the engine reports events. Poppins (400/500/600, latin) is bundled in
+   failed", a "check again" button and a hide/show toggle for the results (per session). The engine's
+   `check` runs the model probe and every account probe at the same time and still prints and
+   reports them in the fixed order (config, model, accounts), so the report is the same, only sooner. The
+   **notifications** group is two switches on that screen (`mail that needs a reply`, `connection problems`),
+   both off until the user turns them on; the app raises them from its own status poll (see the lifecycle
+   contract below), never from mail text. Poppins (400/500/600, latin) is bundled in
+
   `desktop/renderer/fonts/` under the SIL OFL; the CSP therefore also allows `font-src 'self'`.
 - Security defaults, all required, on **both** pages: `contextIsolation: true`, `sandbox: true`,
   `nodeIntegration: false`, CSP `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'`, `will-navigate`
   and `setWindowOpenHandler` deny everything, IPC handlers check `event.senderFrame.url` is one of **our
   two files** (the window page and the popup page), and the preload (see `desktop/src/preload.cjs`)
-   exposes nine functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
+   exposes ten functions only (`getState`, `onState`, `onCheckResult`, `getStatus`,
    `command(start|stop|check|openWindow|openSettings|openMail|quit)`, `getSettings`, `setSetting`, `getConfig`,
-   `editAccount(op, fields)`). `setSetting` is checked in main: our page, a known name (`appearance`,
-   `openAtLogin`) and an allow-listed value. `openMail` takes no argument and runs a fixed `open -a Mail`
+   `editAccount(op, fields)`, `setup(op, args)`). `setSetting` is checked in main: our page, a known name (`appearance`,
+   `openAtLogin`, and the two notification switches) and an allow-listed value. `openMail` takes no argument and runs a fixed `open -a Mail`
    (Apple Mail itself, never a folder or a message); it is the popup's three count buttons and adds no
-   channel, so the allowlist stays at nine.
+   channel, so the allowlist stays at ten.
   `getConfig` and `editAccount` answer the **window page only** (the popup must not read or write the
   config). `editAccount` ops are `add | set | remove | password | test`; main checks every field against a
   per-op allow-list with types (`src/account-edit.ts`: name 1-64 engine-allowed characters starting with a
@@ -179,7 +185,23 @@ while the tray already says `failed`.
   `openSettings` sets a one-shot flag that `getSettings` hands to the window on its next focus. A `getStatus` call from a hidden popup is answered
   `idle`: an invisible page never spawns the engine. The renderer and the popup write engine text with
   `textContent`, never `innerHTML` (check messages carry server and folder names, and the popup shows
-  config account names), and a pill's colour class can only be one of four allow-listed names.
+   config account names), and a pill's colour class can only be one of four allow-listed names.
+- **First-run onboarding** replaces the two panes with one setup column in the same window (the app bar is
+   unchanged): four steps in a fixed order — accounts, mode, model, digest — a step list across the top, and
+   `back`/`continue` in the foot. The page owns no engine call: it asks `setup(op, args)` and main answers for
+   the window page only (the popup gets `idle`). Main decides on launch, from `config show` alone: no config
+   file (or no accounts) opens setup; accounts already configured and no `setupDone` record means it notes
+   `setupDone` silently and shows the normal screen; a broken file keeps the normal screen with its error.
+   A second launch never re-runs setup (`setupDone` in `settings.json`, written by main only, never readable
+   or writable from the page). `continue` after the accounts step waits until one account signed in;
+   "classify and sort" shows the same native go-live confirm the accounts screen uses, and declining falls
+   back to classify only. The model step's engine work is `model detect|pull|save` (below); a pull streams
+   one JSON line per stage, cancelling it sends **exactly one** SIGTERM (a second would make the engine exit
+   130 and skip its cleanup). The only `shell.openExternal` in the app is one fixed URL (`ollama.com/download`),
+   on the "install Ollama" click, with nothing built from page input; boundaries.test.ts pins that rule.
+   The two notification switches are the same two rows on the settings screen, so a user who skipped setup can
+   still turn them on.
+
 
 ## Developer guide
 
@@ -211,25 +233,32 @@ measurement ever fails the popup just keeps its last size (the next 5 s poll ret
 ### Screenshots and layout checks
 
 `npm run shots` (run by the `desktop-shots` CI job) renders the real window page eight times — accounts
-and settings, at 1100px and 360px, light and dark — and the real popup page six times — normal, calm and
-paused, light and dark — with **synthetic data only**, measures the design layout, captures a PNG, and diffs
-each against the committed baseline in `desktop/screenshots/` (fourteen in all). It loads
-the real `src/preload.cjs` and answers the IPC channels with `ipcMain.handle` in the main process (so
-the bridge is exercised, not stubbed), and reads `src/` and `renderer/` directly (no build step). The
-popup's three states differ only in what `getStatus` and `getState` answer (the calm fixture, and
-`engine.running:false` plus the app's paused marker for paused), so the same nine-channel bridge covers
-all fourteen. No engine, no config file, no `~/.config`, no network, and no setup-check clock ever enters a
-shot. Captures are normalised to CSS pixels (a Retina Mac is 2×, a runner may be 1×), then compared with
-two named constants at the top of `test/shots/compare.ts` (`PIXEL_DELTA = 16`, `MAX_CHANGED_RATIO = 0.001`,
-about 840 px at 1100×760). It prints one line per shot (`OK`/`CHANGED`/`MISSING`/`SIZE`) plus any layout
+and settings, at 1100px and 360px, light and dark — the real popup page six times — normal, calm and
+paused, light and dark — and the first-run setup column twenty times — eight steps (accounts empty, accounts
+added, mode, model shared, found, not-found, downloading, digest) at 720px plus accounts and model-shared at
+360px, light and dark — with **synthetic data only**, measures the design layout, captures a PNG, and diffs
+each against the committed baseline in `desktop/screenshots/` (thirty-four in all; the setup PNGs are named
+`setup-<step>-<width>-<theme>.png`). It loads the real `src/preload.cjs` and answers the IPC channels with
+`ipcMain.handle` in the main process (so the bridge is exercised, not stubbed), and reads `src/` and `renderer/`
+directly (no build step). The popup's three states differ only in what `getStatus` and `getState` answer (the
+calm fixture, and `engine.running:false` plus the app's paused marker for paused), and each setup state differs
+only in what `ltm.setup` answers, so the same ten-channel bridge covers all thirty-four. No engine, no config
+file, no `~/.config`, no network, and no setup-check clock ever enters a shot. `npm run shots` launches electron
+with `--force-device-scale-factor=1`: Chromium picks its raster scale from the display, and a 2× capture resized
+to CSS pixels is **not** the same image as a native 1× capture (every text edge moves, 6-10% of the pixels), so
+without the pin a Retina Mac would appear to change every baseline. Captures are normalised to CSS pixels, then
+compared with two named constants at the top of `test/shots/compare.ts` (`PIXEL_DELTA = 16`, `MAX_CHANGED_RATIO =
+0.001`, about 840 px at 1100×760). It prints one line per shot (`OK`/`CHANGED`/`MISSING`/`SIZE`) plus any layout
 violations, and writes `desktop/shots-out/` (the actual PNGs, a red diff per changed shot, and
 `report.json`), which the job uploads as an artifact.
 
 The layout assertions are the pure `checkLayout` in `test/shots/layout.ts`: the app-bar title centred
 on the whole bar with 132px of clear and on one line, the emblem at the bar's right end (the 24px
 token inset), the settings rows sharing one column, and every control meeting the design's 44px
-touch target. The popup's strip has its own pure `checkPopupLayout` and `MEASURE_POPUP` probe: three
-equal-width `BUTTON` cells at least 44px tall, each named with its count (the accessible name ends in
+touch target. The setup column is measured by the same function (its `continue`/`back` are plain `.btn`, so the
+44px rule bites there too), and the switch-row rule follows the switch actually on screen: `.srow` on the settings
+screen, `.switch-row` in the digest step. The popup's strip has its own pure `checkPopupLayout` and `MEASURE_POPUP`
+probe: three equal-width `BUTTON` cells at least 44px tall, each named with its count (the accessible name ends in
 "`N`, open Apple Mail"), and the decorative dot and corner arrow `aria-hidden`. Four controls are not
 yet 44px tall (nav 41, the mode/appearance segment 38, the switch 24 tall — its row is ≥44), so they
 carry `KNOWN_BELOW_44` floors: a **ratchet** that may grow but turns CI red the moment one shrinks.
@@ -268,7 +297,19 @@ Keeping these three apart is the point: it stops this document from reading like
   test, password update and remove. Not done: per-account pause/resume (the config has no per-account
   enabled key; the global pause exists), editing host or user in place (remove and add), and the folders
   sentence of the design (increment 7).
-- The window's **settings screen**: appearance, open at login, engine pause/start, setup check, log.
+- The window's **first-run onboarding** column (four steps: accounts, mode, model, digest), decided at launch
+  from `config show`, driven only by the `setup` channel: add account with the password to the Keychain through
+  the engine, the mode choice (classify only is the per-account `flagging = false`, classify and sort adds the
+  go-live confirm), the model step over `model detect|pull|save` with a streamed progress bar and a cancel that
+  sends one SIGTERM, then the digest and notification switches. `settings.json` records `setupDone`, and the same
+  two switches are rows on the settings screen, so an install that skipped setup can still turn them on.
+- The window's **settings screen**: appearance, open at login, engine pause/start, setup check, log, and the two
+  notification switches (`mail that needs a reply`, `connection problems`), both off until turned on.
+- **Notifications** from a main-process status poll (`engine.status()` every 30 s while a switch is on): a rise in
+  a count becomes one macOS notification per message (cap 5, then "and N more"), reset on the day rollover; an
+  account offline for 5 minutes becomes one notification per outage, re-armed when it connects. Counts only: no
+  sender, subject or mail text ever enters a notification or `settings.json`. Known limit: the counts are totals,
+  so one notification can be missed if a message is cleared as another arrives in the same poll.
 - Engine status for the UI: `status --json` (shape locked by a Rust test), fed by two SQLite tables the
   engine writes (`engine_status` heartbeat + `account_status` per account). No socket, no port.
 - A single window that hides on close and reopens by reuse (never destroyed); the dock hides when no
@@ -276,8 +317,10 @@ Keeping these three apart is the point: it stops this document from reading like
 - The app name in the window bar: "triage mail" centred on the whole app bar, one line, ellipsis, 132px
   clear on each side, with the emblem staying at the right end.
 - The CI screenshot baseline and design layout checks (`desktop-shots` job): the window rendered in
-  eight synthetic states and the popup in six (normal, calm and paused, light and dark), a committed PNG
-  baseline under `desktop/screenshots/`, and assertions that the app-bar title is centred with 132px clear,
+  eight synthetic states, the popup in six (normal, calm and paused, light and dark) and the setup column in
+  twenty (eight steps at 720px, accounts and model at 360px, light and dark) — thirty-four committed PNGs
+  under `desktop/screenshots/`, with the pixel scale pinned to 1 at launch so a Retina laptop regenerates
+  exactly what CI compares — and assertions that the app-bar title is centred with 132px clear,
   the emblem sits at the right end, the settings rows align, the controls meet the design's 44px touch target
   (with a ratchet on the four controls the app does not yet size to 44), and the popup's three count cells
   are equal-width buttons that meet 44px and name their count.
@@ -290,7 +333,7 @@ Keeping these three apart is the point: it stops this document from reading like
 
 - Per-account server folders with modes `off/report/classify/act` and actions (`TriageMailFolders`),
   matching `docs/SPEC.md` §5 and needing engine v1.1a/b first.
-- Settings: the **notifications** group (the rest is built).
+- Settings: the rest of the **notifications** group in the design (only the two switches are built — see Implemented above).
 - The desktop-controls decision (the Switch, gear/pause icons, `AppBar inset`, menu-bar emblem).
 
 The design files are named only; nothing here reproduces or links their contents.
@@ -309,7 +352,8 @@ Everything in the "Next increments" table and "Distribution and signing" section
 | 5 | **Done by this PR** (the tray part). Tray popover from `TriageMailTray` + design import | Board must approve publishing each design asset publicly; the popup is plain HTML/TS, so no UI framework was decided. |
 | 6 | **Done by this PR.** Accounts screen: add account, test sign-in (`config account test`), mode, password to Keychain, remove. **Not done:** per-account pause/resume (no per-account enabled key in the config; the global pause exists) | Needs 4. |
 | 7 | Folders screen | Needs engine v1.1a folder discovery and v1.1b modes first. |
-| 8 | **Mostly done** (general, triage). Settings notifications group | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
+| 8 | **Done by this PR** (the two switches + notifications). Settings notifications group | Needs 4. Notifications no longer need 3: `status --json` already carries what a balloon would say. |
+| 11 | **Done by this PR.** First-run onboarding: the setup column (accounts, mode, model, digest), `config set` + per-account `flagging`, `model detect/pull/save`, the digest gate | Needs 4 and 6. The engine does all the writing; the desktop only asks. |
 | 9 | Packaging: bundle the engine into the app, locally signed (ad-hoc) dev build, launch at login | Packager choice recorded in `docs/DECISIONS.md`. |
 | 10 | Release pipeline and updates: Developer ID signing, notarization, DMG/zip on GitHub Releases, optional update check, Homebrew cask | Board: Apple Developer Program, CI secrets, public release. Adds the privacy statement. |
 
@@ -319,12 +363,20 @@ All run as `lets-triage-mail --config PATH config ... --json`. Success is `{"ok"
 failure is `{"ok":false,"error":"<sentence>"}` on stdout with a non-zero exit (the error never contains a
 password). Locked by tests in `src/cli/config.rs`.
 
-- `config show`: `{ok, path, dry_run, llm:{base_url, model}, accounts:[{name, host, port, username, tls,
-  inbox, flagging, watch_junk, dry_run, mode, password_source}]}`. `mode` is the word `status --json`
+- `config show`: `{ok, path, dry_run, llm:{base_url, model}, digest:{enabled, time}, accounts:[{name, host, port,
+  username, tls, inbox, flagging, watch_junk, dry_run, mode, password_source}]}`. `mode` is the word `status --json`
   uses; `dry_run` and `port` are the effective values; `password_source` is `keychain` (the command this
   tool writes), `command` (any other) or `env`. The `password_command` text is never output. A missing
-  file gives `{ok:false, error, missing:true}`.
+  file gives `{ok:false, error, missing:true}`. `digest.enabled` is false only when the user turned the
+  daily digest off (`[digest] enabled = false`).
 - `config validate`: `{ok, path, accounts}`; no network, no password lookup.
+- `config set KEY VALUE` (global keys only: `policy.dry_run`, `digest.enabled`, `digest.time`) → `{ok, restart_needed:true}`.
+  One key per call, value validated the same way the file is (`true|false`, or `HH:MM`); unknown keys are refused,
+  comments and layout are kept, and the desktop's argv is built from a closed key list in `src/setup.ts` so a value
+  can never read as a flag. Per-account writes go through `config account set --json -- NAME KEY VALUE` with the
+  same closed set (`flagging`, `dry_run`) — that is how the mode step works: classify only sets `flagging false`,
+  classify and sort sets `flagging true`, and both keep `dry_run false` so the digest is appended as designed.
+  The engine reads the config only at start, so the app restarts it.
 - `config account add|set|remove`: `{ok, restart_needed:true}` (`remove` adds `password_forgotten`). The
   engine reads the config only at start, so the app restarts it.
 - `config account password NAME --password-stdin`: `{ok, restart_needed}` (true only when the config now
@@ -339,6 +391,41 @@ password). Locked by tests in `src/cli/config.rs`.
 - Every write is validated first, keeps `config.toml.bak` (0600) and replaces the file atomically. No lock
   against two writers at once (`shortcut:` in `config_edit.rs`).
 - Test hook: `LTM_KEYCHAIN_SERVICE` replaces the Keychain service name; the app never sets it.
+
+### Model commands: the contract for the app (first-run onboarding)
+
+`lets-triage-mail model ... --json`. The desktop never talks to a model runtime itself and never opens a port:
+it runs these three commands, same stdin/stdout rules as above (locked by tests in `src/cli/model.rs` and
+`src/model_setup.rs`).
+
+- `model detect [--url ADDR] --json` → `{ok, runtimes:[{runtime, url, reachable, models, usable, error}],
+  shared:{runtime, url, model, set_by, reachable}|null}`. It probes the local endpoints only (a non-local `--url`
+  is refused) under the engine's own 2 s timeouts, so a dead port costs 2 s, not 4. `shared` is the shared
+  `model.toml` the other app may have chosen; it carries `reachable`, so the desktop can say "using the model
+  from rag docs" only when that server actually answers.
+- `model pull --json [--url ADDR] -- MODEL` → **line-delimited** JSON on stdout, one normalised line per stage:
+  `{stage:"pulling manifest"}`, `{stage:"downloading", total:<bytes>, completed:<bytes>}`, `{stage:"success"}`,
+  and `{stage:"error", error:"<sentence>"}`. A line split across two network chunks is still one line (the engine
+  buffers on `\n`); an error line still exits non-zero once the stream ends. The desktop draws its bar from
+  `total`/`completed`; it never re-reads the runtime's own progress text.
+- `model save --json --runtime R --url U --model M` → `{ok, runtime, url, model}`. Writes the shared file with
+  `set_by = "triage mail"`, refuses a non-local url, an unknown runtime, or a url carrying credentials.
+- Cancelling a pull is **exactly one SIGTERM** to that child (a second SIGTERM would make the engine exit 130 and
+  skip its own cleanup); the stream then ends and the desktop shows "cancelled", not "failed".
+- `check --json` already sends a synthetic message through the real decider, so its **Model** area carries a
+  test-classification line. That line is what the model step quotes when it says the model "answered a test
+  question"; with no such line the step falls back to "installed and saved", claiming nothing about a test
+  (`src/check-report.ts`, marked `// shortcut:` for the upgrade: a `kind` field on `CheckItem`, or a `model test`
+  command later).
+
+### Privacy of the first-run flow
+
+The onboarding path adds no third party and makes no network call from the app: every step is an engine command
+on this Mac, and the only thing the desktop opens in a browser is one fixed URL (`ollama.com/download`), when the
+user clicks "install Ollama" — it is Ollama, not triage mail, that downloads a model, and that download is a local
+step on a runtime the user chose. Notifications carry counts only (no sender, subject or mail text), and
+`settings.json` holds appearance, open-at-login, `setupDone` and the two notification switches. There is no
+telemetry, and no policy page is needed for this feature.
 
 ## Distribution and signing requirements (future)
 

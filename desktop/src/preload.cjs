@@ -2,12 +2,14 @@
 // and no `electron`; it can only call what we expose. Sandboxed preload scripts must be CommonJS,
 // which is why this is a `.cjs` using `require('electron')` rather than an ESM module.
 //
-// We expose exactly nine functions: getState, onState, onCheckResult, getStatus, command, getSettings,
-// setSetting, getConfig and editAccount (main validates the setting name and value, and every field of
-// an account edit; a password travels only in editAccount's fields and is never sent back).
+// We expose exactly ten functions: getState, onState, onCheckResult, getStatus, command, getSettings,
+// setSetting, getConfig, editAccount and setup (main validates the setting name and value, every field
+// of an account edit, and every setup op; a password travels only in an account edit and is never
+// sent back).
 // `onCheckResult` is a push channel (no round-trip) so the tray's "Check setup" can deliver a check
 // to a renderer that did not ask for one; `getStatus` is the popup's own poll, answered `idle` by
-// main while the popup is hidden. The channel strings must match src/ipc.ts (CHANNEL) and main.ts's
+// main while the popup is hidden; `setup` is answered only for the window page (the popup never
+// drives first-run onboarding). The channel strings must match src/ipc.ts (CHANNEL) and main.ts's
 // ipcMain registrations; test/boundaries.test.ts keeps them in sync.
 
 const { contextBridge, ipcRenderer } = require('electron');
@@ -30,4 +32,5 @@ contextBridge.exposeInMainWorld('triageMail', {
 	setSetting: (name, value) => ipcRenderer.invoke('ltm.setSetting', name, value),
 	getConfig: () => ipcRenderer.invoke('ltm.getConfig'),
 	editAccount: (op, fields) => ipcRenderer.invoke('ltm.editAccount', op, fields),
+	setup: (op, args) => ipcRenderer.invoke('ltm.setup', op, args),
 });

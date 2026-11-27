@@ -387,7 +387,8 @@ board decisions.
 | 7.4 | Tray popover + design import (emblem, tokens, Switch, icons) | Board approves each published asset; first UI-framework decision |
 | 7.5 | Accounts screen | Needs 7.3 |
 | 7.6 | Folders screen | Needs engine v1.1a discovery + v1.1b modes first |
-| 7.7 | Settings screen | Needs 7.3; notifications need 7.2 |
+| 7.7 | Settings screen | Needs 7.3; notifications need 7.2 — the two switches and their notifications are **done** (main's `status` poll, counts only) |
+| 7.10 | First-run onboarding: the setup column (accounts, mode, model, digest) over `config set` + per-account `flagging` + `model detect/pull/save`, the digest gate, the two notification switches | Needs 7.3 and 7.5. Done by this PR; engine commands are locked by Rust tests, the flow by desktop tests and 20 new screenshots |
 | 7.8 | Packaging: bundle the engine, locally signed dev build, launch at login | Packager choice (electron-builder / Forge) recorded in DECISIONS |
 | 7.9 | Release pipeline, signing, notarization, updates, Homebrew cask | **Board**: Apple Developer Program, CI secrets, public release; adds the privacy statement |
 
