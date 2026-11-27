@@ -84,6 +84,20 @@ test('the ratchet: a .seg button may not fall below its floor (38)', () => {
 	assert.ok(violations.some((v) => v.includes('.seg button height 37 below floor 38')), JSON.stringify(violations));
 });
 
+// The setup column's digest step wraps its switches in `.switch-row`, so MEASURE reports that row's
+// height there instead of the settings screen's `.srow`. The switch itself stays 24px (the design's),
+// so the row is what has to clear 44px for a thumb to land on it.
+test('a switch row under 44px is a violation, at 44px it passes (the setup column)', () => {
+	const atFloor = good(720);
+	atFloor.switchRowHeight = 44;
+	assert.deepEqual(checkLayout('settings', atFloor), [], 'a 44px switch row is allowed');
+
+	const below = good(720);
+	below.switchRowHeight = 40;
+	const violations = checkLayout('settings', below);
+	assert.ok(violations.some((v) => v.includes('switch row height 40 below 44')), JSON.stringify(violations));
+});
+
 test('a title wider than its box (scrollWidth > clientWidth) is a violation', () => {
 	const m = good(1100);
 	m.title.scrollWidth = m.title.clientWidth + 1;

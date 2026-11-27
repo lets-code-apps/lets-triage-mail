@@ -660,6 +660,9 @@ window.addEventListener('focus', loadSettings);
 const setupEl = $('setup');
 const stepListEl = $('stepList');
 const stepTitleEl = $('stepTitle');
+// Focusable on purpose, but only programmatically: a step change focuses it (see paintSetup), it is never
+// reachable by Tab on its own.
+stepTitleEl.tabIndex = -1;
 const stepTextEl = $('stepText');
 const stepBodyEl = $('stepBody');
 const backBtn = $('setupBack');
@@ -742,6 +745,7 @@ function applySetupResult(result) {
 
 // Paint one step from the view main built: the step list, the heading, the body for this step, and the footer.
 function paintSetup(view) {
+	const previousStep = setupCurrent === null ? null : setupCurrent.step;
 	setupCurrent = view;
 	if (view.step !== 'model') setupModelSaved = false;
 	if (view.step === 'model' && view.pill === 'ready') setupModelSaved = true;
@@ -771,6 +775,10 @@ function paintSetup(view) {
 	if (view.muted) stepBodyEl.append(el('p', 'step-muted', view.muted));
 	if (view.actions && view.actions.length > 0) renderSetupActions(view.actions);
 	renderSetupFoot(view);
+	// A step change removes the controls the reader was on, so move the focus to the new heading: the
+	// focus rules in shared.css draw the ring there, and a keyboard or screen-reader pass starts the step
+	// at its own text. Not on the first paint, where nothing was lost and a ring would be noise.
+	if (previousStep !== null && previousStep !== view.step) stepTitleEl.focus();
 }
 
 // accounts: the one step with nothing pre-filled. The add form reuses the field/button components; the signed-

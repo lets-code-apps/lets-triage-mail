@@ -39,7 +39,7 @@ export type Measurements = {
 	bar: { right: number; centerY: number };
 	srows: Row[];
 	controls: Control[];
-	switchRowHeight: number; // the .srow wrapping the login switch, or -1 when no switch is shown
+	switchRowHeight: number; // the row wrapping the visible switch: `.srow` on the settings screen, `.switch-row` in the setup column (the digest step), -1 when no switch is shown
 };
 
 // One title-centring budget, spelled once: 132px of clear on each side (the design's 264px of slack
@@ -155,7 +155,7 @@ export const MEASURE = `
   title.clientWidth = titleEl.clientWidth;
   const switchEl = document.querySelector('.switch');
   const switchShown = !!switchEl && switchEl.getBoundingClientRect().height > 0;
-  const rowEl = switchShown ? switchEl.closest('.srow') : null;
+  const rowEl = switchShown ? switchEl.closest('.srow') ?? switchEl.closest('.switch-row') : null;
   return {
     width: window.innerWidth,
     title,
