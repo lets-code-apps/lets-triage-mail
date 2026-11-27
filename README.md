@@ -238,9 +238,15 @@ printf '%s\n' "$APP_PASSWORD" | lets-triage-mail config account add \
 lets-triage-mail config show                       # accounts, modes, where each password comes from
 lets-triage-mail config account set personal dry_run false
 lets-triage-mail config account remove personal --forget-password
+lets-triage-mail config set digest.enabled false   # global keys only: policy.dry_run, digest.enabled, digest.time
+lets-triage-mail model detect                    # which local runtime answers, and which chat models it can run
+lets-triage-mail model pull -- qwen3:8b          # one JSON line per stage (pulling manifest, downloading, success)
+lets-triage-mail model save --runtime ollama --url http://localhost:11434 --model qwen3:8b
 ```
 
-The running engine reads the config at start, so restart it after a change.
+The running engine reads the config at start, so restart it after a change. The macOS desktop app drives
+exactly these commands during its first-run onboarding (accounts, mode, model, digest) — it never talks to a
+model runtime or an IMAP server itself, see [docs/DESKTOP.md](docs/DESKTOP.md).
 
 ## Engine status
 

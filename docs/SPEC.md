@@ -39,7 +39,9 @@ gets moved.
 
 - Once a day at a configured local time (e.g. 07:30), per account, the service **APPENDs** one email
   to a configured folder (default `INBOX`, so it gets noticed; `LetsTriageMail/Digest` is an option).
-  There is no SMTP, so there are no deliverability issues.
+  There is no SMTP, so there are no deliverability issues. `[digest] enabled = false` (default `true`) stops
+  the **automatic** digest only; `lets-triage-mail digest` run by hand still sends one, and `check` reports the
+  switch so a settings screen shows the truth.
 - Catch-up: if the Mac was asleep at digest time, send it on the next wake. Store
   `last_digest_date` per account so a day is never duplicated.
 - Message: `From: Let's Triage Mail <lets-triage-mail@localhost>` (configurable), `To:` the account address,
@@ -79,7 +81,7 @@ gets moved.
 
 Sections: `[llm]` (base_url, model, timeout, max_body_chars, max_concurrent=1), `[policy]`
 (dry_run, min_confidence, known_senders_from_sent, authserv_id), `[flags.*]` (enabled, colour,
-name), `[digest]` (time, folder, from, language), `[[accounts]]` (name, host, port, tls, username,
+name), `[digest]` (enabled, time, folder, from, language), `[[accounts]]` (name, host, port, tls, username,
 password_command, inbox, sent_folder, junk_folder, watch_junk, flagging, dry_run, provider_headers).
 
 - Passwords: `password_command` (macOS: `security find-generic-password -s lets-triage-mail -a <acct> -w`)
@@ -99,6 +101,10 @@ lets-triage-mail stats [--days 7]
 lets-triage-mail status [--json]         # one snapshot: engine liveness (heartbeat), today's counts, per-account state; metadata only
 lets-triage-mail rules list|allow|block|remove PATTERN
 lets-triage-mail config show|validate [--json]        # the path and the settings a settings screen needs; never a password command
+lets-triage-mail config set KEY VALUE [--json]        # global keys only: policy.dry_run, digest.enabled, digest.time (one key per call)
+lets-triage-mail model detect [--url ADDR] [--json]   # probe the local runtimes + the shared model file; no model id, nothing written
+lets-triage-mail model pull [--url ADDR] -- MODEL     # stream one JSON line per stage (pulling manifest, downloading, success/error)
+lets-triage-mail model save --runtime R --url U --model M [--json]   # record the choice in the shared model.toml (local url required)
 lets-triage-mail config account add --name N --host H --username U [--port P] [--tls T] [--dry-run B] [--flagging B] [--password-stdin]
 lets-triage-mail config account set NAME KEY VALUE    # host, port, username, tls, inbox, flagging, watch_junk, dry_run (`default` removes it)
 lets-triage-mail config account remove NAME [--forget-password]
