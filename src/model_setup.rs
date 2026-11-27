@@ -391,13 +391,22 @@ pub struct PullStream {
     pub read_failed: bool,
 }
 
-/// Reads a pull response's NDJSON body to the end, chunk by chunk, into [`PullStream`].
+/// Reads a pull response's NDJSON body to the end, chunk by chunk, into [`PullStream`], and hands
+/// every normalised line to `emit` the moment it arrives.
 ///
 /// A chunk of the raw byte stream never lines up with a line, so `drain_lines` carries the
 /// unfinished tail into the next chunk (see `drain_lines`). A body-read error sets
 /// `read_failed` and stops the loop; the caller turns an incomplete or failed stream into a
 /// non-zero exit (see `pull` in `cli/model.rs`).
-pub async fn consume_pull_stream(mut response: reqwest::Response) -> PullStream {
+///
+/// The `emit` callback is what makes progress live (round-2 finding 2): the CLI's stdout writer
+/// runs per line, while the download runs, so a multi-minute model shows progress the instant the
+/// server writes it instead of after the body ends. The generic `Emit: FnMut(Value)` accepts
+/// any closure, including one that keeps state.
+pub async fn consume_pull_stream_to<Emit: FnMut(Value)>(
+    mut response: reqwest::Response,
+    mut emit: Emit,
+) -> PullStream {
     let mut lines: Vec<Value> = vec![];
     let mut saw_success = false;
     let mut saw_error = false;
@@ -426,7 +435,8 @@ pub async fn consume_pull_stream(mut response: reqwest::Response) -> PullStream 
                         "error" => saw_error = true,
                         _ => {}
                     }
-                    lines.push(shaped);
+                    lines.push(shaped.clone());
+                    emit(shaped);
                 }
             }
         }
@@ -444,7 +454,8 @@ pub async fn consume_pull_stream(mut response: reqwest::Response) -> PullStream 
             "error" => saw_error = true,
             _ => {}
         }
-        lines.push(shaped);
+        lines.push(shaped.clone());
+        emit(shaped);
     }
 
     PullStream {
@@ -453,6 +464,12 @@ pub async fn consume_pull_stream(mut response: reqwest::Response) -> PullStream 
         saw_error,
         read_failed,
     }
+}
+
+/// The flags-only form used by the library tests: read the whole stream and collect the lines,
+/// handing nothing over as it arrives (the emit callback does nothing).
+pub async fn consume_pull_stream(response: reqwest::Response) -> PullStream {
+    consume_pull_stream_to(response, |_line| {}).await
 }
 
 /// Whether a finished pull stream must be treated as a failure (the CLI uses this to exit 1).
@@ -849,6 +866,40 @@ mod tests {
         );
         assert!(!stream.read_failed, "the body did read to its end");
         assert_eq!(stream.lines.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn consume_pull_stream_hands_each_line_over_as_it_arrives() {
+        // Round-2 finding 2's library half: `consume_pull_stream_to` must call the emit callback
+        // once per normalised line, in stream order — the CLI's flush-per-line progress rides on
+        // this contract (the fresh-process test in tests/model_pull.rs covers the timing half).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"pulling manifest"}
+{"status":"downloading x: 1%","total":1000,"completed":10}
+{"status":"success"}
+"#,
+            ))
+            .mount(&server)
+            .await;
+        let response = start_pull(download_client(), server.uri(), "qwen3:4b".into())
+            .await
+            .expect("the fake server agrees to pull");
+        let mut emitted: Vec<Value> = vec![];
+        let stream = consume_pull_stream_to(response, |line: Value| emitted.push(line)).await;
+        assert_eq!(
+            emitted.len(),
+            3,
+            "every line is handed to the callback exactly once"
+        );
+        assert_eq!(
+            emitted, stream.lines,
+            "handed over in stream order, identical to the collected lines"
+        );
+        assert_eq!(emitted[0]["stage"], "pulling manifest");
+        assert_eq!(emitted[2]["stage"], "success");
     }
 
     #[test]

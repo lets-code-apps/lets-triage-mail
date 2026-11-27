@@ -247,16 +247,17 @@ async fn pull(url: Option<&str>, model: String) -> anyhow::Result<()> {
         Ok(body) => body,
     };
 
-    // Read the NDJSON body to the end, then decide success from what the stream actually said
+    // Read the NDJSON body as it arrives: every normalised line is written AND flushed the moment
+    // the stream delivers it (round-2 finding 2 — a multi-minute download must show live progress,
+    // not sit at zero until the server closes), while the three flags still decide the exit code
     // (a `success` stage, an `error` stage, or a body that failed to read / stopped before
-    // finishing), not from the loop merely ending (finding 5).
-    let stream = model_setup::consume_pull_stream(response).await;
-
-    let mut out = std::io::stdout().lock();
-    for line in &stream.lines {
+    // finishing), not the loop merely ending (finding 5).
+    let stream = model_setup::consume_pull_stream_to(response, |line: Value| {
+        let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", line);
         let _ = out.flush();
-    }
+    })
+    .await;
 
     // If the stream never reached `success` and never printed its own error line, add one so
     // the desktop sees why: a dropped connection (`read_failed`) or a body that stopped early.
@@ -266,8 +267,7 @@ async fn pull(url: Option<&str>, model: String) -> anyhow::Result<()> {
         } else {
             "the download ended before the model finished"
         };
-        let _ = writeln!(out, "{}", json!({"stage": "error", "error": reason}));
-        let _ = out.flush();
+        println!("{}", json!({"stage": "error", "error": reason}));
     }
 
     // Non-zero unless the server confirmed `success`. A read failure, an error line, or a stream
