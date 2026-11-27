@@ -87,3 +87,17 @@ export function parseCheckReport(stdout: string): ParseResult {
 		},
 	};
 }
+
+// The one Model-area line that proves the model actually answered: the engine's test classification
+// (`probe_classification`, src/check.rs:474, area `Model`, an `ok` line beginning "test classification
+// worked"). Onboarding's "ready" is decided from this line, and its own text becomes the step's note
+// verbatim — we select an item, we never re-word it. No such line means no proof, and the caller falls
+// back to installed-and-saved instead of claiming a test.
+// shortcut: the engine has no machine-readable marker for this line, so it is matched on its own
+// prefix; upgrade = a `kind` field on CheckItem in check.rs, or a `model test` command.
+export function modelAnswer(report: CheckReport): string | null {
+	const answered = report.items.find(
+		(item) => item.area === 'Model' && item.status === 'ok' && item.message.startsWith('test classification worked'),
+	);
+	return answered ? answered.message : null;
+}

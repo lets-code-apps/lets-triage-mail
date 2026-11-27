@@ -54,13 +54,29 @@ test('a download reports a progress bar and still allows Continue', () => {
 	assert.ok((view.actions ?? []).some((a) => a.label === 'cancel download'));
 });
 
-test('the model step never claims the model answered a test question (ready = installed and saved)', () => {
-	const view = modelView('ready', data({ sharedModel: false }));
-	for (const text of [view.body ?? '', view.note ?? '']) {
-		assert.equal(/test question|answered/i.test(text), false, `ready copy must not mention a test question: ${text}`);
-	}
-	assert.ok((view.note ?? '').includes('Installed'));
+const ANSWERED = 'test classification worked in 1.4 s (judged "junk" with confidence 0.91)';
+
+test('ready comes from the model part of check --json: the step says the model answered, and quotes the engine line', () => {
+	const view = modelView('ready', data({ checkAnswer: ANSWERED }));
+	assert.equal(view.pill, 'ready');
+	assert.equal(view.tone, 'positive');
+	assert.ok((view.body ?? '').includes('answered a test question'));
+	assert.equal(view.note, ANSWERED, 'the note is the engine line, passed through unchanged');
 	assert.equal(view.nextOff, false);
+});
+
+test('ready with no model result in check falls back to installed and saved, and claims no test question', () => {
+	const view = modelView('ready', data());
+	assert.ok((view.note ?? '').includes('Installed and saved'));
+	for (const text of [view.body ?? '', view.note ?? '']) {
+		assert.equal(/test question|answered/i.test(text), false, `ready copy must not claim a test without the engine line: ${text}`);
+	}
+});
+
+test('a shared model keeps the shared note, whether or not check confirmed it', () => {
+	const view = modelView('ready', data({ sharedModel: true, setBy: 'rag docs', checkAnswer: ANSWERED }));
+	assert.ok((view.body ?? '').includes('answered a test question'));
+	assert.ok((view.note ?? '').includes('another app'));
 });
 
 test('a failed model step shows the engine sentence and a try again', () => {

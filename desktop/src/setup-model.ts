@@ -1,9 +1,10 @@
 // The model step's state machine. Everything the user sees about the model comes from the engine's
-// own `model detect`/`model save` answer, turned into a ready-to-print `SetupView` here. No network
-// call, no reading of any file: the desktop never probes a runtime or revalidates a URL. "Ready"
-// means installed-and-saved, decided from `model detect` + a successful save — there is no `model
-// test` and the copy never claims the model "answered a test question" (health, if ever shown,
-// reuses the `check --json` items on the settings screen).
+// own `model detect`/`model save` answer, plus the model part of `check --json` for the ready state.
+// No network call, no reading of any file: the desktop never probes a runtime or revalidates a URL.
+// "Ready" is decided from the engine's own test classification (`check-report.ts` -> `modelAnswer`): when
+// that line is present the step says the model answered a test question and shows the engine's line;
+// when `check` reports no model result it falls back to installed-and-saved and claims nothing about a
+// test.
 
 import type { SetupView, Tone } from './ipc.ts';
 import { recommendedModel } from './setup.ts';
@@ -20,6 +21,7 @@ export interface ModelStepData {
 	setBy?: string; // that other app's name (for the shared note)
 	pull?: { model: string; done: number; gb: number; pct: number } | null;
 	error?: string; // the engine's one-sentence reason, for the failed state
+	checkAnswer?: string; // the engine's `check --json` test-classification line, when it worked (check-report.ts modelAnswer)
 }
 
 // The address field, present in every state except `shared` (a shared model was set up elsewhere).
@@ -115,17 +117,21 @@ export function modelView(state: ModelStepState, data: ModelStepData): SetupView
 				nextOff: false,
 			};
 		}
-		case 'ready':
+		case 'ready': {
+			const proof = data.checkAnswer ?? '';
 			return {
 				...base,
 				pill: 'ready',
 				tone: 'positive',
-				body: `${data.model} runs in ${data.runtimeName} on this Mac and is ready for triage mail.`,
-				note: data.sharedModel ? `The same model another app already uses on this Mac.` : 'Installed and saved on this Mac.',
+				body: proof
+					? `${data.model} runs in ${data.runtimeName} on this Mac and answered a test question.`
+					: `${data.model} runs in ${data.runtimeName} on this Mac and is ready for triage mail.`,
+				note: data.sharedModel ? 'The same model another app already uses on this Mac.' : proof || 'Installed and saved on this Mac.',
 				fields: [{ ...ADDRESS_FIELD }],
 				nextLabel: 'Continue',
 				nextOff: false,
 			};
+		}
 		case 'failed':
 			return {
 				...base,
