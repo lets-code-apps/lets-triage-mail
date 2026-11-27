@@ -280,6 +280,41 @@ test('stop during starting works; stop when already stopped is a no-op', async (
 	assert.equal(stopped.getState().state, 'stopped');
 });
 
+// Round-2 finding 3: writes made while the watcher runs (digest keys, a saved model) must reach
+// the running engine — `start()` alone no-ops while it runs, so the owned watcher is reloaded.
+test('reloadIfRunning stops the owned watcher with one SIGTERM and spawns a fresh run', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	e.start();
+	s.state.long[0].child.emit('spawn');
+	await e.reloadIfRunning();
+	assert.equal(s.state.long.length, 2, 'the watcher is re-spawned after the writes, not left on the old config');
+	assert.deepEqual(s.state.long[0].signals, ['SIGTERM']); // the old child gets exactly one SIGTERM
+	assert.equal(e.getState().state, 'starting'); // the fresh watcher is spawned, awaiting its spawn event
+});
+
+test('reloadIfRunning touches nothing when this app does not own a running engine', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	await e.reloadIfRunning(); // never started here: nothing to reload, and no spawn to hijack
+	assert.equal(s.state.long.length, 0);
+	assert.equal(e.getState().state, 'stopped');
+});
+
+test('a reload while a model pull runs leaves the download child alone', async () => {
+	// Continue during a pull: the watcher restarts to pick up the saved model, but the pull child
+	// belongs to the download, not the watcher, and must not be signalled.
+	const s = makeSpawn();
+	const e = controller(s);
+	e.start();
+	s.state.long[0].child.emit('spawn');
+	const pull = e.modelPull(['pull', '--json', '--', 'qwen3:8b'], () => undefined);
+	assert.ok(pull.done instanceof Promise);
+	await e.reloadIfRunning();
+	assert.equal(s.state.long.length, 2, 'the watcher was reloaded for the new model choice');
+	assert.deepEqual(s.state.pull?.signals, [], 'the download child is not killed by a watcher reload');
+});
+
 test('runCheck returns items for exit 0 AND exit 1 (exit code is ignored)', async () => {
 	const s = makeSpawn();
 	const e = controller(s);

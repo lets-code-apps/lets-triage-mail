@@ -366,6 +366,10 @@ async function startPull(session: SetupSession, fields: Record<string, unknown>)
 				const raw = await engine.runModel(saveArgs);
 				if (raw.ok === true) {
 					session.modelSaved = true;
+					// The saved model must reach a watcher that is already running (the autostart,
+					// or a Continue pressed during the download, started it with the old choice):
+					// reload the owned watcher, or triage keeps using the model from before (finding 3).
+					await engine.reloadIfRunning();
 					const check = await engine.runCheck();
 					session.checkAnswer = check.kind === 'report' ? modelAnswer(check.report) : null;
 				}
@@ -426,10 +430,13 @@ async function setNotifications(session: SetupSession, fields: Record<string, un
 }
 
 // "start triage": the settings are final (setupDone written with them), then the engine starts. A
-// first run may have it `failed` on "config missing"; start() spawns afresh from failed.
+// first run may have it `failed` on "config missing"; start() spawns afresh from failed. The digest
+// and notification writes just landed, and the engine reads its config only at start — so a watcher
+// this app owns is reloaded first; `performStart` alone would no-op while it runs (round-2 finding 3).
 async function finishSetup(session: SetupSession): Promise<SetupResult> {
 	settings = { ...settings, setupDone: true };
 	persistSettings();
+	await engine.reloadIfRunning();
 	await performStart();
 	return { kind: 'done' };
 }

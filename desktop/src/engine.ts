@@ -170,6 +170,17 @@ export class EngineController {
 		this.launch();
 	}
 
+	// Reload the watcher this app owns so writes made while it runs take effect: the engine reads
+	// its config (and builds its model client) once at start, so after a `config set` or a saved
+	// model a plain `start()` would no-op and the old values would keep running (round-2 finding 3).
+	// Only a watcher this controller spawned is ever stopped: an engine started by launchd or a
+	// terminal keeps its owner, and `current` is not running/starting for one, so this is a no-op.
+	async reloadIfRunning(): Promise<void> {
+		if (this.current !== 'running' && this.current !== 'starting') return;
+		await this.stop();
+		this.start();
+	}
+
 	// A failed run: schedule a restart unless the failure is final.
 	private afterFailure(): void {
 		if (this.clock.now() - this.startedAt >= STABLE_RUN_MS) this.restarts = 0;
