@@ -31,6 +31,50 @@ function makeLong(runKind: 'normal' | 'ignore'): LongChild {
 	return { child, stdout, stderr, signals };
 }
 
+// A `model detect`/`save` JSON answer, the shape src/cli/model.rs locks.
+const MODEL_DETECT =
+	'{"ok":true,"runtimes":[{"runtime":"ollama","url":"http://127.0.0.1:11434","reachable":true,' +
+	'"models":["qwen3:8b"],"usable":["qwen3:8b"],"error":null}],"shared":null}';
+
+// The streamed `model pull` child: NDJSON on stdout, then which ending it gives. The split-chunk
+// case is deliberate: a line arrives across two `data` events, as the Rust side warns.
+type PullChild = { child: EngineProcess; stdout: PassThrough; signals: string[] };
+
+function makePull(mode: 'ok' | 'error' | 'refused' | 'cancel'): PullChild {
+	const child = new EventEmitter() as unknown as EngineProcess;
+	const stdout = new PassThrough();
+	const stderr = new PassThrough();
+	child.stdout = stdout;
+	child.stderr = stderr;
+	const signals: string[] = [];
+	child.kill = (signal?: NodeJS.Signals | number) => {
+		signals.push(String(signal));
+		child.emit('exit', null, String(signal));
+		child.emit('close');
+	};
+	queueMicrotask(() => {
+		if (mode === 'ok') {
+			// One line split across two chunks, then the success line.
+			stdout.write('{"stage":"pulling manifest"}\n{"stage":"downloading","total":1000,"comp');
+			stdout.write('leted":430}\n{"stage":"success"}\n');
+			child.emit('exit', 0, null);
+			child.emit('close');
+		} else if (mode === 'error') {
+			stdout.write('{"stage":"pulling manifest"}\n{"stage":"error","error":"manifest not found"}\n');
+			child.emit('exit', 1, null);
+			child.emit('close');
+		} else if (mode === 'refused') {
+			// A server with no /api/pull answers the usual failure object and exits 1.
+			stdout.write('{"ok":false,"error":"LM Studio has no pull endpoint"}\n');
+			child.emit('exit', 1, null);
+			child.emit('close');
+		}
+		// 'cancel': one line, then it waits to be killed; nothing closes on its own.
+		else stdout.write('{"stage":"pulling manifest"}\n');
+	});
+	return { child, stdout, signals };
+}
+
 function makeSpawn() {
 	const state = {
 		long: [] as LongChild[],
@@ -41,6 +85,11 @@ function makeSpawn() {
 		statusMode: 'json' as 'json' | 'refused' | 'hang' | 'garbage',
 		statusSpawns: 0,
 		statusSignals: [] as string[],
+		// The streamed `model pull` child: which ending it gives, and the SIGTERM cancel records.
+		pullMode: 'ok' as 'ok' | 'error' | 'refused' | 'cancel',
+		pull: null as PullChild | null,
+		// `model detect`/`save`: the JSON answer, or silence with a stderr reason.
+		modelMode: 'json' as 'json' | 'silent',
 	};
 	const spawn = (file: string, args: readonly string[], options?: { stdio?: unknown }) => {
 		void file;
@@ -49,6 +98,27 @@ function makeSpawn() {
 			const long = makeLong(state.runKind);
 			state.long.push(long);
 			return long.child;
+		}
+		if (args.includes('pull')) {
+			const pull = makePull(state.pullMode);
+			state.pull = pull;
+			return pull.child;
+		}
+		if (args.includes('model')) {
+			// `model detect`/`model save`: one JSON answer, or a refusal on stderr.
+			const model = new EventEmitter() as unknown as EngineProcess;
+			const modelOut = new PassThrough();
+			const modelErr = new PassThrough();
+			model.stdout = modelOut;
+			model.stderr = modelErr;
+			model.kill = () => undefined;
+			queueMicrotask(() => {
+				if (state.modelMode === 'json') modelOut.write(MODEL_DETECT);
+				else modelErr.write('no model server answers\n');
+				model.emit('exit', state.modelMode === 'json' ? 0 : 1, null);
+				model.emit('close');
+			});
+			return model;
 		}
 		// A short-lived one-shot child (check / status / --version): it writes then closes.
 		const one = new EventEmitter() as unknown as EngineProcess;
@@ -463,4 +533,62 @@ test('runConfig turns silence or garbage into an error result', async () => {
 		assert.equal(result.ok, false);
 		assert.equal(typeof result.error, 'string');
 	}
+});
+
+test('runModel returns the engine JSON for a model call', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	const answer = await e.runModel(['detect', '--json']);
+	assert.equal(answer.ok, true);
+	const runtimes = answer.runtimes as Array<Record<string, unknown>>;
+	assert.equal(runtimes[0].runtime, 'ollama');
+	assert.deepEqual(runtimes[0].usable, ['qwen3:8b']);
+});
+
+test('runModel with no JSON on stdout becomes the engine stderr sentence', async () => {
+	const s = makeSpawn();
+	s.state.modelMode = 'silent';
+	const e = controller(s);
+	assert.deepEqual(await e.runModel(['save', '--json']), { ok: false, error: 'no model server answers' });
+});
+
+test('modelPull feeds every complete stdout line to the page, across a chunk split, and reports ok', async () => {
+	const s = makeSpawn();
+	const e = controller(s);
+	const lines: string[] = [];
+	const pull = e.modelPull(['pull', '--json', '--', 'qwen3:8b'], (line) => lines.push(line));
+	const result = await pull.done;
+	assert.deepEqual(lines, [
+		'{"stage":"pulling manifest"}',
+		'{"stage":"downloading","total":1000,"completed":430}',
+		'{"stage":"success"}',
+	], 'the split line arrives whole, and every line reaches the page');
+	assert.deepEqual(result, { ok: true, error: null, cancelled: false });
+});
+
+test('modelPull reports the stream error line, and the pre-stream refusal, as a failure', async () => {
+	const s = makeSpawn();
+	s.state.pullMode = 'error';
+	const e = controller(s);
+	const lines: string[] = [];
+	const result = await e.modelPull(['pull', '--json', '--', 'x'], (line) => lines.push(line)).done;
+	assert.deepEqual(result, { ok: false, error: 'manifest not found', cancelled: false });
+
+	const t = makeSpawn();
+	t.state.pullMode = 'refused';
+	const refused = await new EngineController(ENV, '/unused', t.spawn).modelPull(['pull', '--json', '--', 'x'], () => undefined).done;
+	assert.deepEqual(refused, { ok: false, error: 'LM Studio has no pull endpoint', cancelled: false });
+});
+
+test('cancelling a pull sends one SIGTERM and ends as cancelled, not failed', async () => {
+	const s = makeSpawn();
+	s.state.pullMode = 'cancel';
+	const e = controller(s);
+	const lines: string[] = [];
+	const pull = e.modelPull(['pull', '--json', '--', 'qwen3:8b'], (line) => lines.push(line));
+	pull.cancel();
+	const result = await pull.done;
+	assert.deepEqual(s.state.pull?.signals, ['SIGTERM'], 'exactly one SIGTERM, never a second');
+	assert.deepEqual(result, { ok: false, error: null, cancelled: true });
+	assert.deepEqual(lines, ['{"stage":"pulling manifest"}'], 'the lines already streamed are kept');
 });

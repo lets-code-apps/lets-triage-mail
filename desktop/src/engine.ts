@@ -36,6 +36,10 @@ export interface EngineProcess extends EventEmitter {
 	kill(signal?: NodeJS.Signals | number): void;
 }
 
+// How one streamed `model pull` ended: it finished, it stopped with the engine's sentence, or the
+// user cancelled it. The three are different outcomes, so the caller never guesses from silence.
+export type ModelPullResult = { ok: boolean; error: string | null; cancelled: boolean };
+
 // `config account test` signs in to a real server (up to a few steps of 15 s each); the other config
 // calls only touch the file and the Keychain.
 const CONFIG_TIMEOUT_MS = 10_000;
@@ -43,9 +47,13 @@ export const CONFIG_TEST_TIMEOUT_MS = 60_000;
 const MAX_LOG_LINES = 500;
 const MAX_STDERR_LINES = 8;
 const DEFAULT_STOP_TIMEOUT_MS = 30_000;
-// One-shot `status --json` reads a local SQLite file; anything slower than this is a wedged
-// engine, and a popup must not wait on one.
-const STATUS_TIMEOUT_MS = 10_000;
+	// One-shot `status --json` reads a local SQLite file; anything slower than this is a wedged
+	// engine, and a popup must not wait on one.
+	const STATUS_TIMEOUT_MS = 10_000;
+	// `model detect` probes two local servers under 2 s timeouts of its own; 15 s is generous room
+	// for the process itself, and `model save` only touches a file.
+	const MODEL_TIMEOUT_MS = 15_000;
+
 // `run` exits with this when another engine holds the database lock (src/cli/run.rs). Retrying
 // would only fail again, so it is the one failure that is never restarted.
 const ALREADY_RUNNING_EXIT_CODE = 75;
@@ -318,13 +326,7 @@ export class EngineController {
 	// fails, so the exit code is ignored. The child's stderr is not echoed: it is one sentence at best.
 	async runConfig(args: string[], stdin?: string, timeoutMs: number = CONFIG_TIMEOUT_MS): Promise<Record<string, unknown>> {
 		const collected = await this.collect(['config', ...args], timeoutMs, stdin);
-		try {
-			const parsed: unknown = JSON.parse(collected.stdout);
-			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
-		} catch {
-			// fall through
-		}
-		return { ok: false, error: collected.stderrTail[0] ?? 'the engine gave no answer' };
+		return jsonAnswer(collected.stdout, collected.stderrTail);
 	}
 
 	// `--version` prints `lets-triage-mail X.Y.Z`; the tray shows just the version token.
@@ -393,6 +395,98 @@ export class EngineController {
 		return { stdout, stderrTail, exitCode };
 	}
 
+	// One `model detect`/`model save` call: the engine's `model ...` subcommand, JSON like `config`
+	// (it prints JSON even when it refuses). `args` come from setup.ts, so they are a closed set of
+	// fixed flags and positionals, never renderer strings.
+	async runModel(args: string[], timeoutMs: number = MODEL_TIMEOUT_MS): Promise<Record<string, unknown>> {
+		const collected = await this.collect(['model', ...args], timeoutMs);
+		return jsonAnswer(collected.stdout, collected.stderrTail);
+	}
+
+	// --- model pull, streamed ---------------------------------------------------
+	//
+	// `model pull` answers as line-delimited JSON (`{"stage": ...}` in src/cli/model.rs), one line
+	// per download step, so progress can be painted while the download runs. `onLine` gets every
+	// complete stdout line; `cancel` sends one SIGTERM (a second would make the engine exit 130 and
+	// skip cleanup — the same rule as stop()); `done` resolves when the child closes. No timeout:
+	// a download of several GB is healthy, the user cancels it, nothing else does.
+	modelPull(
+		args: string[],
+		onLine: (line: string) => void,
+	): { cancel(): void; done: Promise<ModelPullResult> } {
+		const { file, baseArgs } = this.resolve();
+		const child = this.spawn(file, [...baseArgs, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+		let cancelled = false;
+		let streamError: string | null = null;
+		let stderrFirst = '';
+		let pending = '';
+		let exitCode: number | null = null;
+
+		const feed = (line: string): void => {
+			if (line === '') return;
+			onLine(line);
+			// An error is still just a line on the stream; the command exits non-zero after it. A
+			// refusal before the stream starts arrives as the usual `{ok:false,error}` object.
+			const answer = jsonAnswer(line, []);
+			if (answer.stage === 'error' || answer.ok === false) {
+				if (typeof answer.error === 'string') streamError = answer.error;
+			}
+		};
+
+		if (child.stdout) {
+			child.stdout.on('data', (chunk: unknown) => {
+				pending += String(chunk);
+				const parts = pending.split('\n');
+				pending = parts.pop() ?? '';
+				for (const line of parts) feed(line);
+			});
+		}
+		if (child.stderr) {
+			child.stderr.on('data', (chunk: unknown) => {
+				for (const line of String(chunk).split('\n')) {
+					if (line !== '' && stderrFirst === '') stderrFirst = line;
+				}
+			});
+		}
+		child.once('exit', (code: number | null) => {
+			exitCode = code;
+		});
+
+		const done = new Promise<ModelPullResult>((resolve) => {
+			child.once('close', () => {
+				// The engine flushes its own tail, but a child killed mid-line leaves one here.
+				if (pending !== '') {
+					feed(pending);
+					pending = '';
+				}
+				if (cancelled) {
+					resolve({ ok: false, error: null, cancelled: true });
+					return;
+				}
+				const failed = exitCode !== null && exitCode !== 0;
+				resolve({
+					ok: !failed,
+					error: failed ? (streamError ?? stderrFirst) || 'the download stopped' : null,
+					cancelled: false,
+				});
+			});
+			// A spawn failure (the binary vanished) ends the wait too; the empty stream says so.
+			child.once('error', () => {
+				if (cancelled) resolve({ ok: false, error: null, cancelled: true });
+				else resolve({ ok: false, error: stderrFirst || 'the download never started', cancelled: false });
+			});
+		});
+
+		return {
+			cancel: () => {
+				cancelled = true;
+				child.kill('SIGTERM');
+			},
+			done,
+		};
+	}
+
 	// --- status for the popup ---------------------------------------------------
 
 	// One in-flight status read. The popup polls every few seconds; sharing the promise means a
@@ -425,6 +519,20 @@ export class EngineController {
 }
 
 type EnginePathRef = { file: string; baseArgs: string[] };
+
+// The engine's answer to one short-lived call (`config ...`, `model detect`/`model save`):
+// the JSON object it prints (the engine prints JSON even when it refuses), or `{ok:false, error}`
+// built from its first stderr line, so a caller can never mistake silence for success.
+function jsonAnswer(stdout: string, stderrTail: string[]): Record<string, unknown> {
+	try {
+		const parsed: unknown = JSON.parse(stdout);
+		if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+	} catch {
+		// stdout was not the engine's JSON: fall through to the stderr sentence.
+	}
+	return { ok: false, error: stderrTail[0] ?? 'the engine gave no answer' };
+}
+
 type SpawnLike = (file: string, args: readonly string[], options?: { stdio?: unknown }) => EngineProcess;
 
 // The real spawner, used by the main process. `stdio: ['pipe','pipe','pipe']` keeps stdin an open pipe
