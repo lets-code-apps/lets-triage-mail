@@ -14,6 +14,7 @@ pub mod flagging;
 pub mod flags;
 pub mod imap;
 pub mod message;
+pub mod model_setup;
 pub mod precheck;
 pub mod senders;
 pub mod shared_model;

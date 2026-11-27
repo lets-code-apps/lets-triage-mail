@@ -35,6 +35,11 @@ pub const SETTABLE_KEYS: [&str; 8] = [
     "dry_run",
 ];
 
+/// Keys `config set` may change at the top level, named `section.key`. `config account set`
+/// only edits `[[accounts]]`; these are the policy and digest switches the desktop onboarding
+/// "mode" and "digest" steps write.
+pub const SETTABLE_GLOBAL_KEYS: [&str; 3] = ["policy.dry_run", "digest.enabled", "digest.time"];
+
 const HEADER: &str =
     "# Let's Triage Mail configuration. See config.example.toml for every option.\n";
 
@@ -213,6 +218,66 @@ fn set_account_value(text: &str, name: &str, key: &str, new: Option<Value>) -> R
         }
     }
     Ok(doc.to_string())
+}
+
+/// Sets one top-level key (`section.key`), creating the table when it is missing and
+/// keeping the comments around the value, exactly like [`set_account_key`] does for accounts.
+/// The caller validates the result with [`validate_text`].
+pub fn set_global_key(text: &str, key: &str, raw: &str) -> Result<String> {
+    let new = typed_global_value(key, raw)?;
+    let (section, field) = split_global_key(key)?;
+    let mut doc = parse_doc(text)?;
+    // A missing `[section]` table is created, so `config set policy.dry_run true` works on a
+    // config that never had a `[policy]` block.
+    if doc.get_mut(&section).is_none() {
+        doc.insert(&section, Item::Table(Table::new()));
+    }
+    let table = doc
+        .get_mut(&section)
+        .and_then(|item| item.as_table_mut())
+        .context(format!("`{section}` is not a table in the config"))?;
+    if let Some(old) = table.get(&field).and_then(Item::as_value) {
+        let mut with_comment = new;
+        *with_comment.decor_mut() = old.decor().clone();
+        table[&field] = Item::Value(with_comment);
+    } else {
+        table[&field] = Item::Value(new);
+    }
+    Ok(doc.to_string())
+}
+
+/// A typed TOML value for one of [`SETTABLE_GLOBAL_KEYS`]; unknown keys and bad values are
+/// refused with a message naming the key.
+fn typed_global_value(key: &str, raw: &str) -> Result<Value> {
+    let bool_value = |key: &str| -> Result<Value> {
+        match raw {
+            "true" => Ok(true.into()),
+            "false" => Ok(false.into()),
+            _ => bail!("`{key}` must be true or false, not `{raw}`"),
+        }
+    };
+    Ok(match key {
+        "policy.dry_run" => bool_value("policy.dry_run")?,
+        "digest.enabled" => bool_value("digest.enabled")?,
+        // `digest.time` stays a string here; `validate_text` checks the `HH:MM` shape.
+        "digest.time" => raw.into(),
+        _ => bail!(
+            "`{key}` cannot be set here; allowed keys: {}",
+            SETTABLE_GLOBAL_KEYS.join(", "),
+        ),
+    })
+}
+
+/// Splits `section.key`; exactly one dot, both sides non-empty, the key itself has no dot.
+fn split_global_key(key: &str) -> Result<(String, String)> {
+    match key.split_once('.') {
+        Some((section, field))
+            if !section.is_empty() && !field.is_empty() && !field.contains('.') =>
+        {
+            Ok((section.to_owned(), field.to_owned()))
+        }
+        _ => bail!("`{key}` is not a `section.key`"),
+    }
 }
 
 /// Points an account at its Keychain item, if it has no `password_command` yet.

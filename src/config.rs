@@ -262,6 +262,15 @@ impl FlagsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DigestConfig {
+    /// Whether the daily digest is written at all. On by default. `false` makes the `run`
+    /// digest loop do nothing; `lets-triage-mail digest` run by hand still works, so the
+    /// switch is about the automatic schedule, not about the feature existing.
+    ///
+    /// A plain `bool` under `#[serde(default)]` would default to `false`, so the field names
+    /// a function that returns `true`: `#[serde(default = "...")]` calls it when the key is
+    /// missing.
+    #[serde(default = "digest_enabled_default")]
+    pub enabled: bool,
     /// Local time of day, `HH:MM` (24 hours).
     pub time: String,
     /// The mailbox the digest is appended to.
@@ -276,12 +285,18 @@ pub struct DigestConfig {
 impl Default for DigestConfig {
     fn default() -> Self {
         DigestConfig {
+            enabled: true,
             time: String::from("07:00"),
             folder: String::from("INBOX"),
             from: None,
             language: String::from("en"),
         }
     }
+}
+
+/// `#[serde(default = "...")]` target: the digest is on unless the config turns it off.
+fn digest_enabled_default() -> bool {
+    true
 }
 
 impl DigestConfig {
@@ -422,13 +437,17 @@ fn default_inbox() -> String {
 /// Whether a host name or address is on this machine or a private network, so that mail
 /// content sent there stays inside the user's own network.
 ///
+/// Public because `model_setup` reuses it: a model runtime address must be local or private
+/// for the same privacy reason a model `base_url` must be (`model save` refuses a remote
+/// url, and `model detect --url` refuses one).
+///
 /// Accepts loopback, RFC 1918 private IPv4, link-local, IPv6 unique-local (`fc00::/7`),
 /// `localhost`, and the names that are reserved for local networks: `.local` (mDNS), `.lan`
 /// and `.home.arpa` (RFC 8375). It never looks anything up in DNS: a name that merely
 /// *looks* local could still resolve to a public address, and the answer could change, so
 /// the check is on the text only. A user who really means a remote server says so with
 /// `llm.allow_remote`.
-fn is_local_or_private_host(host: &str) -> bool {
+pub fn is_local_or_private_host(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return match ip {
