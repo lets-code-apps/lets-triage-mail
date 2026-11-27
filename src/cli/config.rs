@@ -302,6 +302,7 @@ async fn test(
             // A dry-run digest check, so no digest folder is looked for.
             let digest = DigestCheck {
                 time: String::new(),
+                enabled: true,
                 folder: String::new(),
                 dry_run: true,
                 previews_dir: PathBuf::new(),
@@ -537,6 +538,7 @@ mod tests {
     fn dry_digest() -> DigestCheck {
         DigestCheck {
             time: String::new(),
+            enabled: true,
             folder: String::new(),
             dry_run: true,
             previews_dir: PathBuf::new(),

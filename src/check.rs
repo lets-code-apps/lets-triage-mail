@@ -527,6 +527,8 @@ pub fn account_area(name: &str) -> String {
 pub struct DigestCheck {
     /// The configured time of day, `HH:MM`.
     pub time: String,
+    /// Whether the daily digest runs at all (`[digest] enabled`).
+    pub enabled: bool,
     /// The folder the digest is appended to.
     pub folder: String,
     /// The account is in dry-run: its digest is saved as a file, never appended.
@@ -540,6 +542,7 @@ impl DigestCheck {
     pub fn for_account(config: &Config, account: &AccountConfig) -> DigestCheck {
         DigestCheck {
             time: config.digest.time.clone(),
+            enabled: config.digest.enabled,
             folder: config.digest.folder.clone(),
             dry_run: account.dry_run(&config.policy),
             previews_dir: crate::digest::deliver::previews_dir(config),
@@ -684,9 +687,10 @@ pub async fn probe_imap(
         }
     }
 
-    // The digest folder is only needed when the digest is really appended. SELECT changes
-    // nothing; the folder is never created here or by the service.
-    let opened = if digest.dry_run {
+    // The digest folder is only needed when the digest is really appended. When the digest is off
+    // or the account is in dry-run nothing is appended, so the folder is not opened. SELECT
+    // changes nothing; the folder is never created here or by the service.
+    let opened = if digest.dry_run || !digest.enabled {
         Ok(())
     } else {
         let what = format!("selecting the digest folder {}", digest.folder);
@@ -822,6 +826,12 @@ pub fn digest_item(
     uidplus: bool,
     opened: Result<(), String>,
 ) -> CheckItem {
+    if !digest.enabled {
+        return CheckItem::ok(
+            area,
+            "daily digest is off: set `enabled = true` in [digest] to start sending it",
+        );
+    }
     if digest.dry_run {
         return CheckItem::ok(
             area,
@@ -923,6 +933,7 @@ mod tests {
     fn digest_check(dry_run: bool) -> DigestCheck {
         DigestCheck {
             time: "07:30".into(),
+            enabled: true,
             folder: "INBOX".into(),
             dry_run,
             previews_dir: PathBuf::from("/data/digests"),
@@ -960,6 +971,21 @@ mod tests {
         let item = digest_item("a", &digest_check(true), true, Err("ignored".into()));
         assert_eq!(item.status, Status::Ok);
         assert!(item.message.contains("/data/digests"));
+    }
+
+    #[test]
+    fn a_disabled_digest_reports_off_without_touching_a_folder() {
+        // `[digest] enabled = false`: check says so plainly and does not look at any folder.
+        let off = DigestCheck {
+            time: "07:30".into(),
+            enabled: false,
+            folder: "INBOX".into(),
+            dry_run: false,
+            previews_dir: PathBuf::from("/data/digests"),
+        };
+        let item = digest_item("a", &off, true, Err("never reached".into()));
+        assert_eq!(item.status, Status::Ok);
+        assert!(item.message.contains("digest is off"), "{item:?}");
     }
 
     fn llm_config(server: &MockServer) -> LlmConfig {

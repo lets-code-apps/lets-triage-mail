@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 fn digest_check() -> lets_triage_mail::check::DigestCheck {
     lets_triage_mail::check::DigestCheck {
         time: "07:00".into(),
+        enabled: true,
         folder: "INBOX".into(),
         dry_run: false,
         previews_dir: std::path::PathBuf::from("digests"),
