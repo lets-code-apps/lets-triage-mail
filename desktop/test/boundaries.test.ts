@@ -401,10 +401,13 @@ test('the onboarding steps drive the engine and settings end-to-end', () => {
 	assert.ok(renderer.includes(".setup('mode', { choice })"), 'Continue submits the selected mode');
 	assert.equal(/renderSetupMode[\s\S]{0,400}api\.setup\('mode', \{ choice: value \}/.test(renderer), false, 'a click must not run the engine write by itself');
 
-	// 6. Digest Continue writes the digest and the notification switches before marking setup complete.
-	assert.ok(renderer.includes("api.setup('digest', { enabled: setupDigestEnabled"), 'the digest switch reaches main on Continue');
-	assert.ok(renderer.includes("api.setup('settings', { notifyReply: setupNotifyReply"), 'the notification switches reach main on Continue');
-	assert.ok(renderer.includes("api.setup('start', {})"), 'and only then setup finishes');
+	// 6. Digest Continue writes the digest and the notification switches before marking setup complete,
+	// and the chain stops on any write that did not answer with a view.
+	assert.ok(renderer.includes('void setupDigestChain('), 'digest Continue runs the chain of writes');
+	assert.ok(renderer.includes('{ enabled: setupDigestEnabled, time: setupDigestTime }'), 'the digest switch reaches main on Continue');
+	assert.ok(renderer.includes('{ notifyReply: setupNotifyReply, notifyOffline: setupNotifyOffline }'), 'the notification switches reach main on Continue');
+	assert.ok(renderer.includes("setup('start', {})"), 'only after both writes answered does setup finish');
+	assert.equal(/return null;\n\t\t\t\}\n\t\t\t\treturn api\.setup\('start'/.test(renderer), false, 'a failed write must not fall through to start');
 
 	// 8. The chosen model and the typed runtime address feed save/pull/detect, and the address is read live.
 	assert.ok(renderer.includes("api.setup('save', { model: setupChosenModel"), 'Continue saves the chosen model');

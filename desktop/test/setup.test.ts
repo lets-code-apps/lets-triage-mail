@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import vm from 'node:vm';
 
 import type { ConfigAccount } from '../src/account-edit.ts';
 import { buildEditRequests } from '../src/account-edit.ts';
@@ -157,3 +160,60 @@ test('parseConfigGlobal reads the engine defaults when a field is absent or nons
 	assert.deepEqual(parseConfigGlobal({ dry_run: false, digest: { enabled: false, time: '08:30' } }), { dryRun: false, digestEnabled: false, digestTime: '08:30' });
 	assert.deepEqual(parseConfigGlobal({ digest: { time: 'nonsense' } }), { dryRun: true, digestEnabled: true, digestTime: '07:00' });
 });
+
+// Round-2 finding 1 (a rejected digest write still finished setup): the chain is extracted from the
+// real page and EXECUTED here against a fake setup(), so the assertions run the real code path —
+// the point is which ops the chain actually calls, not which strings appear in the source.
+const rendererSource = readFileSync(join(import.meta.dirname, '..', 'renderer', 'renderer.js'), 'utf8');
+const chainMatch = /async function setupDigestChain\(setup, digestFields, settingsFields\) \{[\s\S]*?\n\}/.exec(rendererSource);
+if (!chainMatch) {
+	throw new Error('renderer.js no longer defines setupDigestChain in the form the test extracts and runs');
+}
+const setupDigestChain = vm.runInNewContext(`(${chainMatch[0]})`) as (
+	setup: (op: string, fields: Record<string, unknown>) => Promise<Record<string, unknown> | null>,
+	digestFields: Record<string, unknown>,
+	settingsFields: Record<string, unknown>,
+) => Promise<Record<string, unknown> | null>;
+
+test('a refused digest write stops the chain: neither the settings write nor start is called', async () => {
+	const calls: string[] = [];
+	const setup = (op: string): Promise<Record<string, unknown>> => {
+		calls.push(op);
+		if (op === 'digest') return Promise.resolve({ kind: 'error', message: 'The digest time must be a time like 08:00.' });
+		return Promise.resolve({ kind: 'view' });
+	};
+	const result = await setupDigestChain(setup, { enabled: true, time: '25:00' }, { notifyReply: true, notifyOffline: false });
+	assert.deepEqual(calls, ['digest'], 'after a rejected digest write settings and start must never run');
+	assert.deepEqual(result, { kind: 'error', message: 'The digest time must be a time like 08:00.' }, 'main\'s reason reaches the page');
+});
+
+test('a refused or idle settings write stops the chain before start; so does no answer at all', async () => {
+	const calls: string[] = [];
+	const setup = (op: string): Promise<Record<string, unknown>> => {
+		calls.push(op);
+		return Promise.resolve(op === 'settings' ? { kind: 'idle' } : { kind: 'view' });
+	};
+	const result = await setupDigestChain(setup, { enabled: false, time: '08:30' }, { notifyReply: false, notifyOffline: true });
+	assert.deepEqual(calls, ['digest', 'settings'], 'start is not reached when the settings write does not answer with a view');
+	assert.deepEqual(result, { kind: 'idle' });
+
+	const silence: string[] = [];
+	const silent = await setupDigestChain((op: string) => {
+		silence.push(op);
+		return Promise.resolve(null);
+	}, { enabled: true, time: '08:00' }, {});
+	assert.deepEqual(silence, ['digest'], 'no answer stops the chain at once');
+	assert.equal(silent, null);
+});
+
+test('three honest answers: digest, settings and start run in that order and the chain ends done', async () => {
+	const calls: string[] = [];
+	const setup = (op: string): Promise<Record<string, unknown>> => {
+		calls.push(op);
+		return Promise.resolve(op === 'start' ? { kind: 'done' } : { kind: 'view' });
+	};
+	const result = await setupDigestChain(setup, { enabled: true, time: '08:30' }, { notifyReply: true, notifyOffline: true });
+	assert.deepEqual(calls, ['digest', 'settings', 'start']);
+	assert.deepEqual(result, { kind: 'done' });
+});
+

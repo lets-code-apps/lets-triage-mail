@@ -722,6 +722,19 @@ function renderSetupFoot(view) {
 	nextBtn.disabled = view.nextOff === true;
 }
 
+// The digest step's final writes, chained honestly: a write that does not answer with a fresh
+// view (an error, a session that has gone, no answer at all) stops the chain right there —
+// settings and "start triage" never run, so setup cannot finish with preferences the engine
+// rejected (round-2 finding 1: a null that fell through used to call start anyway). A named
+// function of its inputs so the node test can run the real chain against a fake setup().
+async function setupDigestChain(setup, digestFields, settingsFields) {
+	const digest = await setup('digest', digestFields);
+	if (!digest || digest.kind !== 'view') return digest;
+	const settings = await setup('settings', settingsFields);
+	if (!settings || settings.kind !== 'view') return settings;
+	return await setup('start', {});
+}
+
 // Continue per step, decided from the view main just painted: digest's "start triage" ends setup; model saves
 // the chosen model once then advances; any other step advances to the next, which main answers.
 function setupContinue() {
@@ -729,25 +742,13 @@ function setupContinue() {
 	const step = setupCurrent.step;
 	if (step === 'digest') {
 		// The digest step's edits must reach main before setup is called done: write the digest and the
-		// notification switches the page still shows, each from its retained value, then start triage. A
-		// failing write stops the chain instead of finishing setup with the wrong preferences.
-		void Promise.resolve()
-			.then(() => api.setup('digest', { enabled: setupDigestEnabled, time: setupDigestTime }))
-			.then((r) => {
-				if (r && r.kind === 'error') {
-					applySetupResult(r);
-					return null;
-				}
-				return api.setup('settings', { notifyReply: setupNotifyReply, notifyOffline: setupNotifyOffline });
-			})
-			.then((r) => {
-				if (r && r.kind === 'error') {
-					applySetupResult(r);
-					return null;
-				}
-				return api.setup('start', {});
-			})
-			.then((r) => applySetupResult(r));
+		// notification switches the page still shows, each from its retained value, then start triage.
+		// setupDigestChain stops the chain on any write that did not answer with a view.
+		void setupDigestChain(
+			(op, fields) => api.setup(op, fields),
+			{ enabled: setupDigestEnabled, time: setupDigestTime },
+			{ notifyReply: setupNotifyReply, notifyOffline: setupNotifyOffline },
+		).then(applySetupResult);
 		return;
 	}
 	if (step === 'mode') {
