@@ -18,6 +18,7 @@ import {
 	parseModelDetect,
 	parsePullLine,
 	pullProgress,
+	progressBar,
 	recommendedModel,
 } from '../src/setup.ts';
 
@@ -65,14 +66,25 @@ test('recommendedModel sizes the model to the Mac', () => {
 });
 
 test('buildConfigSetArgs allows only the three global keys, and never a value that could read as a flag', () => {
-	assert.deepEqual(buildConfigSetArgs('policy.dry_run', 'true'), ['config', 'set', 'policy.dry_run', 'true', '--json']);
-	assert.deepEqual(buildConfigSetArgs('digest.enabled', 'false'), ['config', 'set', 'digest.enabled', 'false', '--json']);
-	assert.deepEqual(buildConfigSetArgs('digest.time', '08:00'), ['config', 'set', 'digest.time', '08:00', '--json']);
+	assert.deepEqual(buildConfigSetArgs('policy.dry_run', 'true'), ['set', 'policy.dry_run', 'true', '--json']);
+	assert.deepEqual(buildConfigSetArgs('digest.enabled', 'false'), ['set', 'digest.enabled', 'false', '--json']);
+	assert.deepEqual(buildConfigSetArgs('digest.time', '08:00'), ['set', 'digest.time', '08:00', '--json']);
 	assert.equal(buildConfigSetArgs('policy.bogus', 'true'), null, 'unknown key');
 	assert.equal(buildConfigSetArgs('policy.dry_run', 'maybe'), null, 'bad value');
 	assert.equal(buildConfigSetArgs('digest.time', '8am'), null, 'bad time');
 	assert.equal(buildConfigSetArgs('--evil', 'x'), null, 'a flag is not a key');
 	assert.equal(buildConfigSetArgs('digest.time', '--nope'), null, 'a value can never start with a dash');
+});
+
+test('a download bar keeps its maximum at 100 and the fill is the clamped percent, never a partial "full"', () => {
+	// The bar is percent-based: at 42% the maximum stays 100 and the fill is 42%, so a screen reader and
+	// the painted bar both read "42 of 100", not "42 of 42" complete.
+	assert.deepEqual(progressBar(42), { valuemin: 0, valuemax: 100, valuenow: 42, fill: '42%' });
+	assert.equal(progressBar(100).fill, '100%', 'a finished download fills the bar');
+	assert.equal(progressBar(0).valuenow, 0, 'a download that has not started is empty');
+	assert.equal(progressBar(140).valuenow, 100, 'a value over 100 is clamped');
+	assert.equal(progressBar(-5).valuenow, 0, 'a negative value is clamped');
+	assert.equal(progressBar(41.7).valuenow, 42, 'a fractional percent is rounded');
 });
 
 test('mode is the per-account flagging the engine writes, per the board decision', () => {

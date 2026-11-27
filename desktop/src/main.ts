@@ -44,7 +44,7 @@ import { openMail } from './open-mail.ts';
 import { POPUP_FALLBACK_HEIGHT, POPUP_WIDTH, type PopupAnchor, type PopupHandle } from './popup.ts';
 import { PopupController } from './popup.ts';
 import { buildTrayMenu } from './menu.ts';
-import { DEFAULT_SETTINGS, isAllowedSetting, parseSettings, type Settings } from './settings.ts';
+import { DEFAULT_SETTINGS, isAllowedSetting, parseSettings, skippedInstallSettings, type Settings } from './settings.ts';
 import {
 	CHANNEL,
 	IDLE_PAYLOAD,
@@ -332,6 +332,10 @@ async function startPull(session: SetupSession, fields: Record<string, unknown>)
 	const model = typeof fields.model === 'string' && fields.model !== '' ? fields.model : recommendedModel(MEM_GB * 1024 ** 3).model;
 	const answering = session.detect?.runtimes.find((probe) => probe.reachable);
 	const url = typeof fields.url === 'string' && fields.url !== '' ? fields.url : (answering?.url ?? undefined);
+	// The runtime/URL/model this pull is for, remembered so a completed download can record exactly what
+	// it downloaded (see the save-on-done below); a typed address wins over the answering runtime.
+	const saveUrl = url ?? answering?.url ?? '';
+	const saveRuntime = answering?.runtime;
 	const args = buildModelPullArgs(model, url);
 	if (args === null) return { kind: 'error', message: 'The model or address is not valid.' };
 	session.pullModel = model;
@@ -345,13 +349,28 @@ async function startPull(session: SetupSession, fields: Record<string, unknown>)
 		else if (parsed.stage === 'error') session.pullError = parsed.text;
 	});
 	session.handle = handle;
-	void handle.done.then((result) => {
+	// A successful pull must also save the model it downloaded, or the finished download is never made
+	// available to triage (the downloading view has no chooser, so the page's save-on-continue branch
+	// cannot run). Save the runtime/URL/model captured above, then read the model part of `check --json`
+	// for the ready proof — the same recording `saveModel` does.
+	void handle.done.then(async (result) => {
 		session.pull = null;
 		if (result.cancelled) session.pullState = 'cancelled';
 		else if (!result.ok) {
 			session.pullState = 'failed';
 			session.pullError = result.error ?? session.pullError;
-		} else session.pullState = 'done';
+		} else {
+			session.pullState = 'done';
+			const saveArgs = buildModelSaveArgs(saveRuntime, saveUrl, model);
+			if (saveArgs !== null) {
+				const raw = await engine.runModel(saveArgs);
+				if (raw.ok === true) {
+					session.modelSaved = true;
+					const check = await engine.runCheck();
+					session.checkAnswer = check.kind === 'report' ? modelAnswer(check.report) : null;
+				}
+			}
+		}
 	});
 	return { kind: 'view', view: modelStepView(session) };
 }
@@ -771,6 +790,10 @@ function boot(): void {
 	} catch {
 		// no file yet: defaults
 	}
+	// The live notification switches start from the saved settings, not from a fixed true: an opt-out
+	// (or a silent skip, both saved false) must survive a relaunch instead of snapping back on.
+	notifySwitches.notifyReply = settings.notifyReply;
+	notifySwitches.notifyOffline = settings.notifyOffline;
 	nativeTheme.themeSource = settings.appearance;
 	tray = makeTray();
 	// Left-click toggles the popup; right-click shows the native menu. No persistent context
@@ -938,7 +961,12 @@ function boot(): void {
 			};
 			ctl.open();
 		} else if (decision === 'silent') {
-			settings = { ...settings, setupDone: true };
+			// An install that already has accounts skips onboarding: setup is done and both first-run
+			// switches are persisted false (the board's decision), and the live switches drop with them
+			// so this session stays silent too.
+			settings = skippedInstallSettings(settings);
+			notifySwitches.notifyReply = false;
+			notifySwitches.notifyOffline = false;
 			persistSettings();
 		}
 	});

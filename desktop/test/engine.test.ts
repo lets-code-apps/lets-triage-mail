@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { EngineController, backoffMs, type Clock, type EngineProcess } from '../src/engine.ts';
+import { buildConfigSetArgs } from '../src/setup.ts';
 
 // The engine is driven with a fake child so no real process, signal or timer is involved: `spawn`
 // and the stop timeout are injected. This mirrors how the Rust supervisor tests inject a closure.
@@ -518,6 +519,15 @@ test('runConfig writes the password to stdin only and parses the JSON answer', a
 	assert.deepEqual(c.seen.args.slice(0, 2), ['config', 'account']);
 	assert.deepEqual(c.seen.stdio, ['pipe', 'pipe', 'pipe']);
 	assert.equal(e.logCount(), 0, 'one-shot output never enters the log buffer');
+});
+
+test('a digest write spawns exactly one `config set` (the builder omits `config`; runConfig prepends it)', async () => {
+	const c = configSpawn('{"ok":true,"restart_needed":true}\n');
+	const e = new EngineController(ENV, '/unused', c.spawn);
+	const result = await e.runConfig(buildConfigSetArgs('digest.enabled', 'false') as string[], '');
+	assert.deepEqual(result, { ok: true, restart_needed: true });
+	// The whole point of the fix: not `config config set`, which clap rejects, but one leading `config`.
+	assert.deepEqual(c.seen.args, ['config', 'set', 'digest.enabled', 'false', '--json']);
 });
 
 test('runConfig ignores the exit code when the engine printed its JSON failure', async () => {

@@ -34,6 +34,14 @@ export function parseSettings(text: string): Settings {
 
 // What `setSetting` may do: a known name with a value of the right type, nothing else. `setupDone`
 // is deliberately absent: the page cannot mark onboarding done, only main can.
+// An install that already has accounts skips onboarding. Its setup is marked done and both first-run
+// switches go off (the board's decision: a silent skip is not an opt-in to notifications). Pure so the
+// skip default and its survival across a relaunch (parseSettings keeps known keys) can be tested without
+// Electron.
+export function skippedInstallSettings(settings: Settings): Settings {
+	return { ...settings, setupDone: true, notifyReply: false, notifyOffline: false };
+}
+
 export const isAllowedSetting = (name: unknown, value: unknown): boolean =>
 	name === 'appearance'
 		? isAppearance(value)

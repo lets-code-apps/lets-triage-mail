@@ -107,7 +107,9 @@ export function buildConfigSetArgs(key: unknown, value: unknown): string[] | nul
 			? value === 'true' || value === 'false'
 			: /^\d{2}:\d{2}$/.test(value);
 	if (!ok) return null;
-	return ['config', 'set', key, value, '--json'];
+	// runConfig already prepends `config`; return only the sub-command so the engine sees one
+	// `config set`, not `config config set`.
+	return ['set', key, value, '--json'];
 }
 
 // The mode choice, as the engine writes it. Board decision 2026-11-27: classify only is the per-account
@@ -171,6 +173,15 @@ export function buildModelPullArgs(model: unknown, url?: unknown): string[] | nu
 export function buildModelSaveArgs(runtime: unknown, url: unknown, model: unknown): string[] | null {
 	if (!runtimeWord(runtime) || !urlText(url) || !modelId(model)) return null;
 	return ['save', '--json', `--runtime=${runtime}`, `--url=${url}`, `--model=${model}`];
+}
+
+// The download bar's accessible values and fill width for one progress percent, clamped to 0..100. The
+// maximum is always 100 and the fill is that same percent, so a partial download (e.g. 42%) never reads
+// as complete to a screen reader or in the painted bar. The renderer uses these exact numbers; this is
+// the spec test pins.
+export function progressBar(pct: number): { valuemin: 0; valuemax: 100; valuenow: number; fill: string } {
+	const now = Math.min(100, Math.max(0, Math.round(pct) || 0));
+	return { valuemin: 0, valuemax: 100, valuenow: now, fill: `${now}%` };
 }
 
 // What `model detect --json` answered (src/cli/model.rs `detect_json`, shape-locked by a Rust test):
