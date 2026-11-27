@@ -525,6 +525,12 @@ function applySettings(s) {
 		button.setAttribute('aria-checked', String(button.dataset.value === s.appearance));
 	}
 	$('login').checked = Boolean(s.openAtLogin);
+	// The two first-run notification switches: rows on the settings screen (board decision 2026-11-27,
+	// so an install that skipped setup can still turn them on). main reports them, the page paints them.
+	const notifyReply = $('notifyReply');
+	const notifyOffline = $('notifyOffline');
+	if (notifyReply) notifyReply.checked = s.notifyReply !== false;
+	if (notifyOffline) notifyOffline.checked = s.notifyOffline !== false;
 	logEl.textContent = Array.isArray(s.log) ? s.log.join('\n') : '';
 	if (s.section === 'settings') show('settings');
 }
@@ -582,6 +588,20 @@ for (const button of document.querySelectorAll('#appearance button')) {
 $('login').addEventListener('change', (event) => {
 	void api.setSetting('openAtLogin', event.target.checked).then(applySettings);
 });
+// The two notification switches write back through the same validated setSetting (main's allow-list
+// accepts these two booleans; `setupDone` is deliberately absent from it).
+const notifyReplyInput = $('notifyReply');
+if (notifyReplyInput) {
+	notifyReplyInput.addEventListener('change', (event) => {
+		void api.setSetting('notifyReply', event.target.checked).then(applySettings);
+	});
+}
+const notifyOfflineInput = $('notifyOffline');
+if (notifyOfflineInput) {
+	notifyOfflineInput.addEventListener('change', (event) => {
+		void api.setSetting('notifyOffline', event.target.checked).then(applySettings);
+	});
+}
 $('addbtn').addEventListener('click', () => {
 	adding = true;
 	passwordOpen = false;

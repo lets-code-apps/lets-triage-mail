@@ -345,3 +345,38 @@ test('the counts strip is three keyboard buttons with a focus ring and names tha
 	assert.ok(/<span class="dot" aria-hidden="true">/.test(html), 'the needs-reply dot is aria-hidden');
 	assert.match(html, /<svg class="icon"[^>]*aria-hidden="true"><use href="#i-arrow-up-right"/, 'the corner arrow is aria-hidden');
 });
+
+// First-run onboarding: "install Ollama" may open exactly one fixed page in the user's browser, and the
+// notification switches become Electron Notifications in main only — notifier.ts decides whether and
+// how many, never displays anything, and no page can reach either call.
+test('setup opens one fixed URL, and Notification is built in main only', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	assert.equal((main.match(/shell\.openExternal\(/g) ?? []).length, 1, 'openExternal appears exactly once in main');
+	assert.match(main, /shell\.openExternal\(OLLAMA_INSTALL_URL\)/, 'the one call uses the fixed constant, not a page value');
+	const setup = readFileSync(join(SRC, 'setup.ts'), 'utf8');
+	assert.match(setup, /OLLAMA_INSTALL_URL = 'https:\/\/ollama\.com\/download'/, 'the one URL, spelled once, in the pure module');
+	for (const file of ['notifier.ts', 'setup.ts', 'setup-model.ts', 'engine.ts', 'ipc.ts', 'settings.ts']) {
+		const text = readFileSync(join(SRC, file), 'utf8');
+		assert.equal(/new Notification\(/.test(text), false, `${file} must not build a Notification`);
+	}
+	assert.ok(/new Notification\(/.test(main), 'main is where a Notification is built');
+	for (const page of ['renderer.js', 'popup.js']) {
+		const script = readFileSync(join(DESKTOP, 'renderer', page), 'utf8');
+		assert.equal(/openExternal|new Notification/.test(script), false, `${page} can reach neither`);
+	}
+});
+
+// The setup channel drives engine writes and settings writes, so only the window page may use it:
+// the popup answers idle. The two notification switches are rows on the settings screen (the board's
+// answer), and a click writes them back through the allow-listed setSetting.
+test('ltm.setup is the window page only, and the settings screen carries the two switches', () => {
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+	const start = main.indexOf('ipcMain.handle(CHANNEL.setup');
+	assert.ok(start > 0, 'the setup channel has a handler');
+	assert.match(main.slice(start, start + 260), /!fromWindow\(event\.senderFrame\)\) return \{ kind: 'idle' \}/, 'the popup never drives setup');
+	const index = readFileSync(join(DESKTOP, 'renderer', 'index.html'), 'utf8');
+	assert.ok(index.includes('id="notifyReply"') && index.includes('id="notifyOffline"'), 'the two switch rows exist');
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	assert.ok(renderer.includes("setSetting('notifyReply'") && renderer.includes("setSetting('notifyOffline'"), 'the rows write back');
+	assert.equal(/setSetting\('setupDone'/.test(renderer), false, 'setupDone is main-only: the page cannot mark onboarding done');
+});

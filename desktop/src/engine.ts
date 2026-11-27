@@ -415,7 +415,8 @@ export class EngineController {
 		onLine: (line: string) => void,
 	): { cancel(): void; done: Promise<ModelPullResult> } {
 		const { file, baseArgs } = this.resolve();
-		const child = this.spawn(file, [...baseArgs, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+		// `args` are the pull arguments from setup.ts; `model` is prefixed here, as runModel does.
+		const child = this.spawn(file, [...baseArgs, 'model', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
 
 		let cancelled = false;
 		let streamError: string | null = null;

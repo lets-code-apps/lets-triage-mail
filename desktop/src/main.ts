@@ -1,19 +1,43 @@
-// Wiring only: single-instance lock, dock, tray, the controllers and the quit choreography. No
-// triage logic lives here — every engine fact comes from EngineController, which shells out to
-// `lets-triage-mail`. The renderer talks back through the nine preload functions only, the popup
-// page through `getStatus` and `command`.
+// Wiring only: single-instance lock, dock, tray, the controllers, the quit choreography and the
+// first-run onboarding handler. No triage logic lives here — every engine fact comes from EngineController,
+// which shells out to `lets-triage-mail`. The renderer talks back through the ten preload functions only
+// (the tenth is `ltm.setup`), the popup page through `getStatus` and `command`.
 //
 // The whole app ends only through an explicit quit (tray "Quit", Cmd+Q, or SIGTERM to the app);
 // closing the window just hides it (docs/DESKTOP.md). The popup is a second, read-only surface:
 // left-click on the tray icon opens it, a blur closes it, and it never touches the dock.
 
-import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeTheme, screen, systemPreferences } from 'electron';
+import { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeTheme, screen, shell, systemPreferences } from 'electron';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { totalmem } from 'node:os';
 
-import { EngineController, CONFIG_TEST_TIMEOUT_MS, defaultSpawn } from './engine.ts';
-import { buildEditRequests, parseConfigShow, toEditResult, type AccountOp, type EditResult } from './account-edit.ts';
+import { EngineController, CONFIG_TEST_TIMEOUT_MS, defaultSpawn, type ModelPullResult } from './engine.ts';
+import { buildEditRequests, parseConfigShow, toEditResult, type AccountOp, type ConfigView, type EditResult } from './account-edit.ts';
+import {
+	accountNameFor,
+	decideSetup,
+	guessServer,
+	modeChanges,
+	OLLAMA_INSTALL_URL,
+	buildAccountSetArgs,
+	buildConfigSetArgs,
+	buildModelDetectArgs,
+	buildModelPullArgs,
+	buildModelSaveArgs,
+	parseConfigGlobal,
+	parseModelDetect,
+	parsePullLine,
+	pullProgress,
+	recommendedModel,
+	type GlobalView,
+	type ModeChoice,
+	type ModelDetect,
+} from './setup.ts';
+import { STEP_ORDER, modelView, stepFromDetect, stepView, type DigestStepData } from './setup-model.ts';
+import { createNotifier } from './notifier.ts';
+import { modelAnswer } from './check-report.ts';
 import { WindowController } from './window.ts';
 import { buildPopupView, type PopupView } from './popup-model.ts';
 import { openMail } from './open-mail.ts';
@@ -26,11 +50,15 @@ import {
 	IDLE_PAYLOAD,
 	checkPayload,
 	statusPayload,
+	type CheckView,
 	type CommandResult,
 	type EngineCommand,
-	type StatusResult,
 	type SettingsPayload,
 	type StatusPayload,
+	type StatusResult,
+	type SetupResult,
+	type SetupStep,
+	type SetupView,
 } from './ipc.ts';
 
 // ESM has no __dirname; derive the directory this module lives in once.
@@ -76,6 +104,11 @@ function settingsPayload(): SettingsPayload {
 		openAtLogin: app.getLoginItemSettings().openAtLogin,
 		log: engine.getLog(),
 		section,
+		// The settings screen's notification rows and the onboarding flag (board decision 2026-11-27:
+		// the two switches get rows so an install that skipped setup can still turn them on).
+		setupDone: settings.setupDone,
+		notifyReply: notifySwitches.notifyReply,
+		notifyOffline: notifySwitches.notifyOffline,
 	};
 }
 
@@ -86,6 +119,364 @@ const fromUs = (senderFrame?: { url?: string } | null): boolean =>
 const firstLine = (failed: unknown): string => (failed instanceof Error ? failed.message : String(failed)).split('\n')[0];
 // The config calls are for the window page alone.
 const fromWindow = (senderFrame?: { url?: string } | null): boolean => senderFrame?.url === RENDERER_URL;
+
+// --- first-run onboarding ---------------------------------------------------------
+//
+// One channel (`ltm.setup`) carries every step the window page drives, and only the window page may
+// use it: the popup never drives setup. The page owns the step number; main owns what the engine
+// said — the last `model detect` answer, one `model pull` at a time, and the settings it persists.
+// Ready-to-print views come from setup-model.ts (pure), engine argv from setup.ts (closed sets), so
+// no string a page typed can become a flag, a URL or a colour.
+
+// The Mac's memory, read once: the engine sizes the recommended model against it, and the step quotes
+// the same number, so a pull never tries to load more than the machine has.
+const MEM_GB = Math.round(totalmem() / 1024 ** 3);
+
+// Everything onboarding keeps in memory. Nothing here is written to disk except the settings file,
+// and no mail or model content is ever stored: these are step facts the page re-asks for.
+type SetupSession = {
+	step: SetupStep;
+	modeChoice: ModeChoice;
+	globals: GlobalView;
+	detect: ModelDetect | null; // the last `model detect --json` answer, or null before the first
+	modelSaved: boolean; // `model save` wrote the shared file: the step is ready
+	checkAnswer: string | null; // the model line of `check --json`, when it answered ("answered a test question")
+	pullState: 'idle' | 'pulling' | 'done' | 'failed' | 'cancelled';
+	pullModel: string;
+	pull: { model: string; done: number; gb: number; pct: number } | null;
+	pullError: string | null;
+	handle: { cancel(): void; done: Promise<ModelPullResult> } | null;
+};
+let setupSession: SetupSession | null = null;
+
+// The two notification switches the settings screen can flip (the board's rows). The same live object
+// is handed to notifier.ts, which reads the switches at every poll, so a flip takes effect without
+// rebuilding anything. Both default true; an install that skipped setup got false.
+const notifySwitches = { notifyReply: true, notifyOffline: true };
+const notifier = createNotifier({
+	// Electron's Notification is built here and nowhere else (boundaries.test.ts keeps it that way):
+	// notifier.ts only decides *whether* and *how many*, never the text beyond its fixed sentences.
+	notify: (title, body) => {
+		try {
+			new Notification({ title, body }).show();
+		} catch {
+			// macOS refused (permission not granted yet): the switch stays as the user set it.
+		}
+	},
+	now: () => Date.now(),
+	get notifyReply() {
+		return notifySwitches.notifyReply;
+	},
+	get notifyOffline() {
+		return notifySwitches.notifyOffline;
+	},
+});
+
+// The settings file, written whole: the spread keeps the keys another handler added (the board's
+// switches and `setupDone`), so a write never drops them.
+function persistSettings(): void {
+	try {
+		writeFileSync(settingsFile, JSON.stringify(settings));
+	} catch {
+		// not persisted this time; the choice still applies until quit
+	}
+}
+
+// The config facts every step prefills from, in one read: the accounts (account-edit trims the engine's
+// answer to its own typed view) and the global keys that view ignores.
+async function readGlobalConfig(): Promise<{ config: ConfigView; globals: GlobalView }> {
+	const raw = await engine.runConfig(['show', '--json']);
+	return { config: parseConfigShow(raw), globals: parseConfigGlobal(raw) };
+}
+
+const accountNames = (config: ConfigView): string[] => (config.ok ? config.accounts.map((account) => account.name) : []);
+
+// The model step's state, from main's own last answers: nothing is re-probed to paint a step, so the
+// page cannot make the desktop hit a runtime by asking for a view.
+function modelStepView(session: SetupSession): SetupView {
+	const base = stepFromDetect(session.detect ?? { ok: true, runtimes: [], shared: null, error: null }, MEM_GB);
+	if (session.pullState === 'pulling') {
+		return modelView('downloading', { ...base.data, model: session.pullModel, pull: session.pull });
+	}
+	if (session.pullState === 'failed') {
+		return modelView('failed', { ...base.data, model: session.pullModel, error: session.pullError ?? undefined });
+	}
+	if (session.modelSaved) {
+		// Ready: the check line when `check --json` answered one ("answered a test question", the
+		// board's answer), installed-and-saved otherwise. No new engine command exists for a test.
+		return modelView('ready', { ...base.data, sharedModel: base.state === 'shared', checkAnswer: session.checkAnswer ?? undefined });
+	}
+	if (session.detect === null) {
+		return modelView('detecting', { runtimeName: 'Ollama', url: 'http://localhost:11434', model: recommendedModel(MEM_GB * 1024 ** 3).model, memGb: MEM_GB });
+	}
+	// found / not-found / shared straight from the detect answer; a cancelled pull lands back here, so
+	// the step offers the sized download again.
+	return modelView(base.state, base.data);
+}
+
+function setupViewFor(step: SetupStep, config: ConfigView, globals: GlobalView, session: SetupSession): SetupView {
+	switch (step) {
+		case 'model':
+			return modelStepView(session);
+		case 'mode':
+			return stepView({ step: 'mode', data: { choice: session.modeChoice } });
+		case 'digest':
+			return stepView({
+				step: 'digest',
+				data: {
+					enabled: globals.digestEnabled,
+					time: globals.digestTime,
+					accounts: accountNames(config),
+					notifyReply: notifySwitches.notifyReply,
+					notifyOffline: notifySwitches.notifyOffline,
+				} satisfies DigestStepData,
+			});
+		default: {
+			return stepView({ step: 'accounts', data: { accounts: accountNames(config), missing: !config.ok && config.missing, error: config.ok ? null : config.error } });
+		}
+	}
+}
+
+// The setup's go-live confirm: the same native dialog as the accounts screen's, policy-wide wording
+// (every configured account), cancel still the default button.
+async function confirmGoLive(): Promise<boolean> {
+	const options = {
+		type: 'warning' as const,
+		buttons: ['classify and sort', 'cancel'],
+		defaultId: 1,
+		cancelId: 1,
+		message: 'Let triage flag your mail on the server?',
+		detail: 'Classify and sort sets flag colours on every configured account. It never moves or deletes mail.',
+	};
+	const { response } = currentWindow ? await dialog.showMessageBox(currentWindow, options) : await dialog.showMessageBox(options);
+	return response === 0;
+}
+
+// The accounts step's "add account": the engine's own `test` of the typed values first (nothing
+// stored), and only a pass runs `add`. Both go through account-edit, so the password reaches the
+// child's stdin and never argv. A fail paints the check items on the step and stores nothing.
+async function addAccount(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	const address = typeof fields.address === 'string' ? fields.address : '';
+	const guessed = guessServer(address);
+	const host = typeof fields.host === 'string' && fields.host !== '' ? fields.host : guessed.host;
+	const port = typeof fields.port === 'number' ? fields.port : guessed.port;
+	// The design has no name field: derive it from the address, disambiguated against the config.
+	const current = await readGlobalConfig();
+	const editFields = {
+		name: accountNameFor(address, accountNames(current.config)),
+		host,
+		port,
+		tls: 'tls',
+		username: address,
+		password: typeof fields.password === 'string' ? fields.password : '',
+	};
+	const test = await editAccount('test', editFields);
+	if (!test.ok) {
+		return {
+			kind: 'view',
+			view: { ...setupViewFor('accounts', current.config, current.globals, session), check: test.report ? { ok: test.report.ok, items: test.report.items } : null },
+		};
+	}
+	const added = await editAccount('add', editFields);
+	if (!added.ok) return { kind: 'error', message: added.error ?? 'the engine refused the add' };
+	const after = await readGlobalConfig();
+	session.globals = after.globals;
+	return { kind: 'view', view: setupViewFor('accounts', after.config, after.globals, session) };
+}
+
+// The mode step's writes: the per-account keys the board decision settled (classify only = flagging
+// off; both modes live so the digest appends). The go-live confirm belongs to "classify and sort"
+// alone, and declining it applies classify only instead of doing nothing.
+async function applyModeChoice(session: SetupSession, choice: ModeChoice): Promise<SetupResult> {
+	session.modeChoice = choice;
+	const current = await readGlobalConfig();
+	if (!current.config.ok) return { kind: 'error', message: current.config.error };
+	for (const account of current.config.accounts) {
+		for (const change of modeChanges(choice)) {
+			const args = buildAccountSetArgs(account.name, change.key, change.value);
+			if (args === null) return { kind: 'error', message: 'That account name cannot be changed here.' };
+			const raw = await engine.runConfig(args);
+			if (raw.ok !== true) return { kind: 'error', message: typeof raw.error === 'string' ? raw.error : 'the engine gave no answer' };
+		}
+	}
+	// The engine reads its config only at start; restart the run this app owns, once.
+	if (appOwnsEngine()) {
+		await engine.stop();
+		engine.start();
+	}
+	const after = await readGlobalConfig();
+	session.globals = after.globals;
+	return { kind: 'view', view: setupViewFor('mode', after.config, after.globals, session) };
+}
+
+async function applyMode(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	if (fields.choice !== 'classify-only' && fields.choice !== 'classify-and-sort') return { kind: 'error', message: 'Not a known mode.' };
+	if (fields.choice === 'classify-and-sort' && !(await confirmGoLive())) {
+		return await applyModeChoice(session, 'classify-only');
+	}
+	return await applyModeChoice(session, fields.choice as ModeChoice);
+}
+
+// `model detect` again (the step's "check again"), or the first probe. `--url` only when the user
+// typed an address into the step's field; anything else is the engine's two defaults.
+async function runDetect(session: SetupSession, url: unknown): Promise<SetupResult> {
+	const args = buildModelDetectArgs(url === '' ? undefined : url);
+	if (args === null) return { kind: 'error', message: 'The runtime address is not valid.' };
+	session.detect = parseModelDetect(await engine.runModel(args));
+	return { kind: 'view', view: modelStepView(session) };
+}
+
+// Start a pull through the runtime that answers. The stream's lines update the session, and the
+// download keeps running while the user continues or closes the window (cancel is its own op).
+async function startPull(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	const model = typeof fields.model === 'string' && fields.model !== '' ? fields.model : recommendedModel(MEM_GB * 1024 ** 3).model;
+	const answering = session.detect?.runtimes.find((probe) => probe.reachable);
+	const url = typeof fields.url === 'string' && fields.url !== '' ? fields.url : (answering?.url ?? undefined);
+	const args = buildModelPullArgs(model, url);
+	if (args === null) return { kind: 'error', message: 'The model or address is not valid.' };
+	session.pullModel = model;
+	session.pullState = 'pulling';
+	session.pull = { model, done: 0, gb: 0, pct: 0 };
+	session.pullError = null;
+	const handle = engine.modelPull(args, (line) => {
+		const parsed = parsePullLine(line);
+		if (parsed === null) return;
+		if (parsed.stage === 'downloading') session.pull = pullProgress(model, parsed) ?? session.pull;
+		else if (parsed.stage === 'error') session.pullError = parsed.text;
+	});
+	session.handle = handle;
+	void handle.done.then((result) => {
+		session.pull = null;
+		if (result.cancelled) session.pullState = 'cancelled';
+		else if (!result.ok) {
+			session.pullState = 'failed';
+			session.pullError = result.error ?? session.pullError;
+		} else session.pullState = 'done';
+	});
+	return { kind: 'view', view: modelStepView(session) };
+}
+
+// `model save` records the choice (shared_model.rs, whose first caller this is), then the model part
+// of the engine's own `check --json` becomes the ready state's proof when it answers one.
+async function saveModel(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	const answering = session.detect?.runtimes.find((probe) => probe.reachable);
+	const shared = session.detect?.shared;
+	const model = typeof fields.model === 'string' && fields.model !== '' ? fields.model : session.pullModel;
+	const url = typeof fields.url === 'string' && fields.url !== '' ? fields.url : (answering?.url ?? shared?.url ?? '');
+	const runtime = answering?.runtime ?? shared?.runtime;
+	const args = buildModelSaveArgs(runtime, url, model);
+	if (args === null) return { kind: 'error', message: 'The model choice is not valid.' };
+	const raw = await engine.runModel(args);
+	if (raw.ok !== true) return { kind: 'error', message: typeof raw.error === 'string' ? raw.error : 'the engine refused' };
+	session.modelSaved = true;
+	const check = await engine.runCheck();
+	session.checkAnswer = check.kind === 'report' ? modelAnswer(check.report) : null;
+	return { kind: 'view', view: modelStepView(session) };
+}
+
+// The digest step's writes: the two engine keys through the closed `config set` allow-list (the
+// engine validates the value again), then a re-read paints the step.
+async function setDigest(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	const write = async (key: string, value: string): Promise<string | null> => {
+		const args = buildConfigSetArgs(key, value);
+		if (args === null) return `${key} must be a ${key === 'digest.time' ? 'time like 08:00' : 'true or false'}`;
+		const raw = await engine.runConfig(args);
+		return raw.ok === true ? null : typeof raw.error === 'string' ? raw.error : 'the engine gave no answer';
+	};
+	if (typeof fields.enabled === 'boolean') {
+		const failure = await write('digest.enabled', fields.enabled ? 'true' : 'false');
+		if (failure !== null) return { kind: 'error', message: failure };
+	}
+	if (typeof fields.time === 'string') {
+		const failure = await write('digest.time', fields.time);
+		if (failure !== null) return { kind: 'error', message: failure };
+	}
+	const after = await readGlobalConfig();
+	session.globals = after.globals;
+	return { kind: 'view', view: setupViewFor('digest', after.config, after.globals, session) };
+}
+
+// The two notification switches: settings.json, not the engine (they are this app's own preference).
+async function setNotifications(session: SetupSession, fields: Record<string, unknown>): Promise<SetupResult> {
+	if (typeof fields.notifyReply === 'boolean') notifySwitches.notifyReply = fields.notifyReply;
+	if (typeof fields.notifyOffline === 'boolean') notifySwitches.notifyOffline = fields.notifyOffline;
+	settings = { ...settings, notifyReply: notifySwitches.notifyReply, notifyOffline: notifySwitches.notifyOffline };
+	persistSettings();
+	const after = await readGlobalConfig();
+	return { kind: 'view', view: setupViewFor('digest', after.config, after.globals, session) };
+}
+
+// "start triage": the settings are final (setupDone written with them), then the engine starts. A
+// first run may have it `failed` on "config missing"; start() spawns afresh from failed.
+async function finishSetup(session: SetupSession): Promise<SetupResult> {
+	settings = { ...settings, setupDone: true };
+	persistSettings();
+	await performStart();
+	return { kind: 'done' };
+}
+
+// One op from the page. Unknown names answer an error, a foreign sender answers idle; every case
+// re-answers with the step's view so the page needs no second round-trip.
+async function setupOp(op: unknown, args: unknown): Promise<SetupResult> {
+	const session = setupSession;
+	if (session === null) return { kind: 'error', message: 'Setup is not running.' };
+	const fields = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {};
+	try {
+		switch (op) {
+			case 'view':
+			case 'back': {
+				if (op === 'back') session.step = STEP_ORDER[Math.max(0, STEP_ORDER.indexOf(session.step) - 1)];
+				const { config, globals } = await readGlobalConfig();
+				session.globals = globals;
+				return { kind: 'view', view: setupViewFor(session.step, config, globals, session) };
+			}
+			case 'accounts':
+			case 'addAccount':
+				return await addAccount(session, fields);
+			case 'mode':
+				return await applyMode(session, fields);
+			case 'decline':
+				return await applyModeChoice(session, 'classify-only');
+			case 'detect':
+			case 'modelRetry':
+				return await runDetect(session, fields.url);
+			case 'pull':
+				return await startPull(session, fields);
+			case 'save':
+				return await saveModel(session, fields);
+			case 'open':
+				// "install Ollama": one fixed constant from setup.ts, never an address the page typed
+				// (that field feeds `model detect --url`, and only that).
+				void shell.openExternal(OLLAMA_INSTALL_URL);
+				return { kind: 'view', view: modelStepView(session) };
+			case 'cancelDownload':
+				session.handle?.cancel();
+				return { kind: 'view', view: modelStepView(session) };
+			case 'digest':
+				return await setDigest(session, fields);
+			case 'settings':
+				return await setNotifications(session, fields);
+			case 'start':
+				return await finishSetup(session);
+		}
+	} catch (failed) {
+		return { kind: 'error', message: firstLine(failed) };
+	}
+	return { kind: 'error', message: 'Not a known setup action.' };
+}
+
+// The notification poll, in the main process so a hidden window or popup still gets notifications
+// (their own polls stop with the surface). Every 30 s while a switch is on and setup finished;
+// notifier.ts decides whether a change is worth a sentence, and the first read is only a baseline.
+const NOTIFY_POLL_MS = 30_000;
+function notifyTick(): void {
+	if (settings.setupDone && (notifySwitches.notifyReply || notifySwitches.notifyOffline)) {
+		void engine.status().then((result) => {
+			if (result.kind === 'status') notifier.poll(result.report);
+		});
+	}
+	setTimeout(notifyTick, NOTIFY_POLL_MS).unref();
+}
 
 // The clock the popup's strings are built with: the user's locale and zone, pinned once per
 // read rather than guessed by the page (see popup-model.ts).
@@ -417,14 +808,22 @@ function boot(): void {
 	ipcMain.handle(CHANNEL.setSetting, (event, name: unknown, value: unknown) => {
 		if (!fromUs(event.senderFrame) || !isAllowedSetting(name, value)) return null;
 		if (name === 'openAtLogin') app.setLoginItemSettings({ openAtLogin: value as boolean });
-		else {
+		else if (name === 'notifyReply' || name === 'notifyOffline') {
+			// The two notification switches, now rows on the settings screen. The page may set them
+			// (unlike `setupDone`, which stays main-only); the live poll picks the change up on its
+			// next read of the same switch object.
+			if (name === 'notifyReply') {
+				settings = { ...settings, notifyReply: value as boolean };
+				notifySwitches.notifyReply = value as boolean;
+			} else {
+				settings = { ...settings, notifyOffline: value as boolean };
+				notifySwitches.notifyOffline = value as boolean;
+			}
+			persistSettings();
+		} else {
 			settings = { ...settings, appearance: value as Settings['appearance'] };
 			nativeTheme.themeSource = settings.appearance;
-			try {
-				writeFileSync(settingsFile, JSON.stringify(settings));
-			} catch {
-				// not persisted this time; the choice still applies until quit
-			}
+			persistSettings();
 		}
 		return settingsPayload();
 	});
@@ -504,6 +903,44 @@ function boot(): void {
 		}
 		return { command, view: engine.getState() } satisfies CommandResult;
 	});
+
+	// First-run onboarding, the window page only: the popup answers idle and can never drive setup.
+	// One channel, closed op names (ipc.ts SetupOp); every case answers with the step's view, so the
+	// page never needs a second round-trip to repaint.
+	ipcMain.handle(CHANNEL.setup, async (event, op: unknown, args: unknown): Promise<SetupResult> => {
+		if (!fromWindow(event.senderFrame)) return { kind: 'idle' };
+		return await setupOp(op, args);
+	});
+
+	// The first-run decision, in one config read (setup.ts decideSetup): a first run opens the window
+	// itself with setup showing (the app normally starts hidden); an install that already has accounts
+	// records setupDone silently and opens nothing; a broken or absent config file keeps the normal
+	// screen, which is where an engine error belongs.
+	void readGlobalConfig().then(({ config, globals }) => {
+		const decision = decideSetup(settings.setupDone, config);
+		if (decision === 'setup') {
+			setupSession = {
+				step: 'accounts',
+				modeChoice: 'classify-and-sort',
+				globals,
+				detect: null,
+				modelSaved: false,
+				checkAnswer: null,
+				pullState: 'idle',
+				pullModel: '',
+				pull: null,
+				pullError: null,
+				handle: null,
+			};
+			ctl.open();
+		} else if (decision === 'silent') {
+			settings = { ...settings, setupDone: true };
+			persistSettings();
+		}
+	});
+	// The notification poll starts here, not with a surface: a closed window still gets its
+	// notifications (docs/DESKTOP.md: the popup and window polls stop with their surface).
+	notifyTick();
 
 	if (process.env.LTM_SMOKE === '1') void runSmoke();
 }

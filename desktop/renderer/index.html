@@ -68,6 +68,14 @@
 							<button id="checkbtn" class="btn secondary" type="button"><span class="busy-dot" hidden></span><span id="checkLabel">check setup</span></button>
 						</div>
 					</div>
+					<label class="srow">
+						<span class="slabel"><span class="lbl">mail that needs a reply</span><span class="meta">One notification per message, nothing for fyi or done.</span></span>
+						<input id="notifyReply" class="switch" type="checkbox" role="switch" />
+					</label>
+					<label class="srow">
+						<span class="slabel"><span class="lbl">connection problems</span><span class="meta">One per account that stays offline for 5 minutes.</span></span>
+						<input id="notifyOffline" class="switch" type="checkbox" role="switch" />
+					</label>
 					<div id="checks" class="checks"></div>
 					<div class="srow">
 						<div class="slabel"><span class="lbl">log</span><span class="meta">Engine output from this session, kept in memory (last 500 lines).</span></div>

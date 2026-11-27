@@ -117,6 +117,9 @@ export type SetupView = {
 	selected?: string;
 	actions?: { label: string; glyph?: string; variant?: 'primary' | 'secondary' }[];
 	progress?: { label: string; value: number; max: number; pct: number } | null;
+	// A failed account test during the accounts step: the same typed check items the accounts screen
+	// paints, so the step can show why nothing was stored (engine data, never HTML).
+	check?: { ok: boolean; items: CheckReport['items'] } | null;
 	nextLabel?: string;
 	nextVariant?: 'primary' | 'secondary';
 	nextOff?: boolean;
