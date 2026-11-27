@@ -92,7 +92,8 @@ pub struct Detection {
 /// reads the shared file the caller passed in — never `$HOME` (the LET-135 rule:
 /// paths come from the caller, so tests decide the path).
 pub async fn detect(endpoints: Vec<Endpoint>, shared: shared_model::SharedModel) -> Detection {
-    install_tls_provider();
+    // The client constructor installs the TLS provider (see `probe_client`); no call needed
+    // here. `pull` shares the same rule through `download_client`.
     let client = probe_client();
 
     let runtimes: Vec<Found> = match endpoints.len() {
@@ -139,11 +140,31 @@ pub async fn detect(endpoints: Vec<Endpoint>, shared: shared_model::SharedModel)
 }
 
 /// The HTTP client for the probes: no redirects (a redirect would follow the server's
-/// `Location:` to a host outside the local-network rule, see `decider/llm.rs`) and a
-/// short timeout.
+/// `Location:` to a host outside the local-network rule, see `decider/llm.rs`) and a short
+/// total timeout — one dead port costs the desktop 2 s, not 4 s.
+///
+/// Every `reqwest::Client` builder in this crate calls `install_tls_provider()` first: the crate
+/// is built with `rustls-no-provider`, so reqwest panics when it builds a client and no crypto
+/// provider is installed. Doing it inside the constructor (rather than only at each caller) is
+/// what keeps a standalone `model pull` from panicking before it reaches the server.
 pub fn probe_client() -> reqwest::Client {
+    install_tls_provider();
     reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a basic HTTP client always builds")
+}
+
+/// The HTTP client for `model pull`: same no-redirect rule, but **no total timeout**.
+///
+/// A model download is a single response whose body streams for minutes (a multi-GB blob). The
+/// probe's 2 s total timeout would cut that stream after two seconds, so a download must use
+/// a client without it. A short `connect_timeout` is kept so a dead port still fails fast.
+pub fn download_client() -> reqwest::Client {
+    install_tls_provider();
+    reqwest::Client::builder()
+        .connect_timeout(PROBE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("a basic HTTP client always builds")
@@ -349,6 +370,98 @@ pub fn normalise_pull_line(raw: String) -> Value {
         line["completed"] = (*value).clone();
     }
     line
+}
+
+// ------------------------------------------------------------------- save
+
+/// The outcome of reading a whole pull stream: the normalised lines the desktop shows, plus
+/// three flags the CLI needs to decide whether the download actually finished.
+///
+/// A stream can end without ever reaching the `success` stage (the server closed the body
+/// early, or a timeout cut it), and reading the body can itself fail mid-download. Treating
+/// either as success would leave the desktop believing a partial download is a finished model,
+/// so the caller checks these flags rather than trusting "the loop ended".
+pub struct PullStream {
+    pub lines: Vec<Value>,
+    /// A `{"stage": "success"}` line arrived: the download is complete.
+    pub saw_success: bool,
+    /// A `{"stage": "error", ...}` line arrived: the server reported why it stopped.
+    pub saw_error: bool,
+    /// Reading the body failed (a dropped connection or a client timeout cut it mid-stream).
+    pub read_failed: bool,
+}
+
+/// Reads a pull response's NDJSON body to the end, chunk by chunk, into [`PullStream`].
+///
+/// A chunk of the raw byte stream never lines up with a line, so `drain_lines` carries the
+/// unfinished tail into the next chunk (see `drain_lines`). A body-read error sets
+/// `read_failed` and stops the loop; the caller turns an incomplete or failed stream into a
+/// non-zero exit (see `pull` in `cli/model.rs`).
+pub async fn consume_pull_stream(mut response: reqwest::Response) -> PullStream {
+    let mut lines: Vec<Value> = vec![];
+    let mut saw_success = false;
+    let mut saw_error = false;
+    let mut read_failed = false;
+    let mut buffer: Vec<u8> = vec![];
+
+    loop {
+        match response.chunk().await {
+            Err(_) => {
+                read_failed = true;
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => {
+                buffer.extend(chunk);
+                let (complete, tail) = drain_lines(buffer);
+                buffer = tail;
+                for line in complete {
+                    let shaped = normalise_pull_line(line);
+                    match shaped
+                        .get("stage")
+                        .and_then(|stage| stage.as_str())
+                        .unwrap_or_default()
+                    {
+                        "success" => saw_success = true,
+                        "error" => saw_error = true,
+                        _ => {}
+                    }
+                    lines.push(shaped);
+                }
+            }
+        }
+    }
+
+    // Anything after the last newline is a final, unterminated line.
+    if !buffer.is_empty() {
+        let shaped = normalise_pull_line(String::from_utf8_lossy(&buffer).to_string());
+        match shaped
+            .get("stage")
+            .and_then(|stage| stage.as_str())
+            .unwrap_or_default()
+        {
+            "success" => saw_success = true,
+            "error" => saw_error = true,
+            _ => {}
+        }
+        lines.push(shaped);
+    }
+
+    PullStream {
+        lines,
+        saw_success,
+        saw_error,
+        read_failed,
+    }
+}
+
+/// Whether a finished pull stream must be treated as a failure (the CLI uses this to exit 1).
+///
+/// Three independent ways a pull has NOT finished: the body read failed (`read_failed`, e.g. a
+/// connection dropped mid-download), the server reported an error stage, or the stream ended
+/// without ever reaching the `success` stage. A loop merely ending is not proof of success.
+pub fn pull_stream_failed(stream: PullStream) -> bool {
+    stream.read_failed || stream.saw_error || !stream.saw_success
 }
 
 // ------------------------------------------------------------------- save
@@ -684,5 +797,126 @@ mod tests {
         let sentence = start_pull(probe_client(), server.uri(), "qwen3:4b".into()).await;
         let reason = sentence.expect_err("a 404 server gives a refusal");
         assert!(reason.contains("404"), "reason was: {reason}");
+    }
+
+    #[tokio::test]
+    async fn consume_pull_stream_sees_a_success_stage() {
+        // A complete pull: the stream reaches `success`, so the caller treats it as done.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"pulling manifest"}
+{"status":"downloading x: 50%","total":10,"completed":5}
+{"status":"success"}
+"#,
+            ))
+            .mount(&server)
+            .await;
+        let response = start_pull(download_client(), server.uri(), "qwen3:4b".into())
+            .await
+            .expect("the fake server agrees to pull");
+        let stream = consume_pull_stream(response).await;
+        assert!(stream.saw_success, "the success stage is recorded");
+        assert!(!stream.saw_error, "no error line in a successful pull");
+        assert!(!stream.read_failed, "the body read to the end");
+        assert_eq!(stream.lines.len(), 3);
+        assert_eq!(stream.lines[2]["stage"], "success");
+    }
+
+    #[tokio::test]
+    async fn consume_pull_stream_marks_an_incomplete_body_as_not_done() {
+        // A server that streams stages then stops cleanly but never sends `success`: not a
+        // finished download. The caller must turn this into a non-zero exit (see the CLI test).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"pulling manifest"}
+{"status":"writing manifest"}
+"#,
+            ))
+            .mount(&server)
+            .await;
+        let response = start_pull(download_client(), server.uri(), "qwen3:4b".into())
+            .await
+            .expect("the fake server agrees to pull");
+        let stream = consume_pull_stream(response).await;
+        assert!(!stream.saw_success, "no success stage arrived");
+        assert!(
+            !stream.saw_error,
+            "the server never reported an error either"
+        );
+        assert!(!stream.read_failed, "the body did read to its end");
+        assert_eq!(stream.lines.len(), 2);
+    }
+
+    #[test]
+    fn pull_stream_failed_covers_every_failure_mode() {
+        // The CLI exits 1 exactly when this is true. A clean success is the only `false`.
+        let ok = PullStream {
+            lines: vec![],
+            saw_success: true,
+            saw_error: false,
+            read_failed: false,
+        };
+        assert!(!pull_stream_failed(ok), "a clean success is not a failure");
+        let errored = PullStream {
+            lines: vec![],
+            saw_success: false,
+            saw_error: true,
+            read_failed: false,
+        };
+        assert!(pull_stream_failed(errored), "an error stage is a failure");
+        let dropped = PullStream {
+            lines: vec![],
+            saw_success: false,
+            saw_error: false,
+            read_failed: true,
+        };
+        assert!(
+            pull_stream_failed(dropped),
+            "a body dropped mid-download is a failure"
+        );
+        let partial = PullStream {
+            lines: vec![],
+            saw_success: false,
+            saw_error: false,
+            read_failed: false,
+        };
+        assert!(
+            pull_stream_failed(partial),
+            "a stream that never reached success is a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_download_is_not_cut_at_two_seconds() {
+        // Finding 5: a real model pull streams longer than the probe's 2 s. The download client has
+        // no total timeout, so a 3 s body still arrives whole; the 2 s probe client would abort it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(3000))
+                    .set_body_string(
+                        r#"{"status":"downloading x: 50%","total":10,"completed":5}
+{"status":"success"}
+"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let response = start_pull(download_client(), server.uri(), "qwen3:4b".into())
+            .await
+            .expect("a slow pull still connects");
+        let stream = consume_pull_stream(response).await;
+        assert!(stream.saw_success, "a slow download still reaches success");
+        assert!(!stream.read_failed, "the body was not cut short");
+        assert!(
+            !pull_stream_failed(stream),
+            "a completed slow download is not a failure"
+        );
     }
 }

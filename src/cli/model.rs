@@ -236,8 +236,10 @@ async fn pull(url: Option<&str>, model: String) -> anyhow::Result<()> {
             Ok(value) => value,
         },
     };
-    let client = model_setup::probe_client();
-    let mut response = match model_setup::start_pull(client, base, model).await {
+    // A download uses `download_client` (no total timeout), not the 2 s probe client: a real
+    // model pull streams its body for far longer than two seconds (finding 5).
+    let client = model_setup::download_client();
+    let response = match model_setup::start_pull(client, base, model).await {
         Err(reason) => {
             println!("{}", json!({"ok": false, "error": reason}));
             std::process::exit(1);
@@ -245,48 +247,32 @@ async fn pull(url: Option<&str>, model: String) -> anyhow::Result<()> {
         Ok(body) => body,
     };
 
+    // Read the NDJSON body to the end, then decide success from what the stream actually said
+    // (a `success` stage, an `error` stage, or a body that failed to read / stopped before
+    // finishing), not from the loop merely ending (finding 5).
+    let stream = model_setup::consume_pull_stream(response).await;
+
     let mut out = std::io::stdout().lock();
-    let mut buffer: Vec<u8> = vec![];
-    let mut saw_error = false;
-    loop {
-        match response.chunk().await {
-            Err(_) => break,
-            Ok(None) => break,
-            Ok(Some(chunk)) => {
-                buffer.extend(chunk);
-                let (complete, tail) = model_setup::drain_lines(buffer);
-                buffer = tail;
-                for line in complete {
-                    let shaped = model_setup::normalise_pull_line(line);
-                    if shaped
-                        .get("stage")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        == "error"
-                    {
-                        saw_error = true;
-                    }
-                    let _ = writeln!(out, "{}", shaped);
-                    let _ = out.flush();
-                }
-            }
-        }
-    }
-    if !buffer.is_empty() {
-        let tail = String::from_utf8_lossy(&buffer).to_string();
-        let shaped = model_setup::normalise_pull_line(tail);
-        if shaped
-            .get("stage")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            == "error"
-        {
-            saw_error = true;
-        }
-        let _ = writeln!(out, "{}", shaped);
+    for line in &stream.lines {
+        let _ = writeln!(out, "{}", line);
         let _ = out.flush();
     }
-    if saw_error {
+
+    // If the stream never reached `success` and never printed its own error line, add one so
+    // the desktop sees why: a dropped connection (`read_failed`) or a body that stopped early.
+    if !stream.saw_success && !stream.saw_error {
+        let reason = if stream.read_failed {
+            "the model server closed the download before it finished"
+        } else {
+            "the download ended before the model finished"
+        };
+        let _ = writeln!(out, "{}", json!({"stage": "error", "error": reason}));
+        let _ = out.flush();
+    }
+
+    // Non-zero unless the server confirmed `success`. A read failure, an error line, or a stream
+    // that stopped before the `success` stage are all failures (see `pull_stream_failed`).
+    if model_setup::pull_stream_failed(stream) {
         std::process::exit(1);
     }
     Ok(())
