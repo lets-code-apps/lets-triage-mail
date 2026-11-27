@@ -804,7 +804,6 @@ function renderSetupAccounts(view) {
 		void api.setup('accounts', readSetupForm(form)).then(applySetupResult);
 	});
 	form.append(add);
-	form.append(el('p', 'form-note', 'The password stays in this Mac\u2019s keychain. Continue works once one account signs in.'));
 	stepBodyEl.append(form);
 	if (view.note) stepBodyEl.append(el('p', 'setup-note', view.note));
 }
