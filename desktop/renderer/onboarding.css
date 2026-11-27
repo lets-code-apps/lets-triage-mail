@@ -140,7 +140,9 @@
 
 .model-panel .progress-fill {
   height: 100%;
+  width: var(--fill, 100%);
   background: var(--fg);
+  transition: width 0.3s ease;
 }
 
 .model-panel .bar-meta {

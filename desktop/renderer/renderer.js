@@ -673,6 +673,16 @@ const SETUP_SPRITE = ['mail', 'settings', 'play', 'pause', 'arrow-up-right', 'pl
 let setupActive = false;
 let setupCurrent = null; // the last view main painted
 let setupModelSaved = false; // an op has saved the chosen model, so continue advances instead of saving again
+let setupDetectStarted = false; // a detect has run this session; the model step's placeholder triggers at most one probe
+// The values the user chose on each step, kept in the page so Continue submits them and a repaint does not
+// lose them: the mode choice and the model choice, the runtime address, and the digest/notification settings.
+let setupChosenMode = ''; // mode step: the segment the user clicked (empty = the preselected choice)
+let setupChosenModel = ''; // model step: the installed model the user picked
+let setupAddress = ''; // the runtime address typed into any model-step field; feeds detect/pull/save
+let setupDigestEnabled = true;
+let setupDigestTime = '';
+let setupNotifyReply = true;
+let setupNotifyOffline = true;
 
 // A label + input pair for the runtime address / send-at / account fields (reuses the .field component).
 function setupField(field) {
@@ -718,12 +728,46 @@ function setupContinue() {
 	if (!setupCurrent || nextBtn.disabled) return;
 	const step = setupCurrent.step;
 	if (step === 'digest') {
-		void api.setup('start', {}).then(applySetupResult);
+		// The digest step's edits must reach main before setup is called done: write the digest and the
+		// notification switches the page still shows, each from its retained value, then start triage. A
+		// failing write stops the chain instead of finishing setup with the wrong preferences.
+		void Promise.resolve()
+			.then(() => api.setup('digest', { enabled: setupDigestEnabled, time: setupDigestTime }))
+			.then((r) => {
+				if (r && r.kind === 'error') {
+					applySetupResult(r);
+					return null;
+				}
+				return api.setup('settings', { notifyReply: setupNotifyReply, notifyOffline: setupNotifyOffline });
+			})
+			.then((r) => {
+				if (r && r.kind === 'error') {
+					applySetupResult(r);
+					return null;
+				}
+				return api.setup('start', {});
+			})
+			.then((r) => applySetupResult(r));
+		return;
+	}
+	if (step === 'mode') {
+		// Continue submits the selected mode (the preselected choice if no segment was clicked); main applies
+		// the writes behind the go-live confirm and falls back to classify only on decline. Only advance to the
+		// model step once that write answers.
+		const choice = setupChosenMode || setupCurrent.selected || 'classify-and-sort';
+		void api
+			.setup('mode', { choice })
+			.then((r) => {
+				if (r && r.kind === 'view') return api.setup('view', { step: 'model' });
+				applySetupResult(r);
+				return null;
+			})
+			.then((r) => applySetupResult(r));
 		return;
 	}
 	if (step === 'model' && !setupModelSaved && setupCurrent.options && setupCurrent.options.length > 0) {
 		setupModelSaved = true;
-		void api.setup('save', { model: setupCurrent.selected || '' }).then(applySetupResult);
+		void api.setup('save', { model: setupChosenModel || setupCurrent.selected || '', url: setupAddress }).then(applySetupResult);
 		return;
 	}
 	const next = SETUP_STEPS[SETUP_STEPS.indexOf(step) + 1];
@@ -749,6 +793,9 @@ function paintSetup(view) {
 	setupCurrent = view;
 	if (view.step !== 'model') setupModelSaved = false;
 	if (view.step === 'model' && view.pill === 'ready') setupModelSaved = true;
+	// Releasing a step clears that step's retained selection, so re-entering it starts from main's view.
+	if (view.step !== 'mode') setupChosenMode = '';
+	if (view.step !== 'model') setupChosenModel = '';
 
 	clear(stepListEl);
 	const index = SETUP_STEPS.indexOf(view.step);
@@ -779,6 +826,13 @@ function paintSetup(view) {
 	// focus rules in shared.css draw the ring there, and a keyboard or screen-reader pass starts the step
 	// at its own text. Not on the first paint, where nothing was lost and a ring would be noise.
 	if (previousStep !== null && previousStep !== view.step) stepTitleEl.focus();
+	// Entering the model step must start detection: a fresh session answers the "looking for a runtime"
+	// placeholder, and the step is otherwise stuck there (no probe ever ran). Trigger one detect when that
+	// placeholder paints, and only once per session (setupDetectStarted), so navigation does not re-probe.
+	if (view.step === 'model' && view.pill === 'looking for a runtime' && !setupDetectStarted) {
+		setupDetectStarted = true;
+		void api.setup('detect', { url: setupAddress }).then(applySetupResult);
+	}
 }
 
 // accounts: the one step with nothing pre-filled. The add form reuses the field/button components; the signed-
@@ -834,17 +888,25 @@ function readSetupForm(form) {
 	return { address: val('email'), password: passNode ? passNode.value : '', host: val('host'), port: val('port') === '' ? undefined : Number(val('port')) };
 }
 
-// mode: one segmented control (main's options/selected), the sentence and the recommended note.
+// mode: one segmented control (main's options/selected), the sentence and the recommended note. Clicking a
+// segment keeps the choice local; Continue submits it (finding 2: the preselected choice must still be
+// applied on Continue, and a clicked choice is what gets written).
 function renderSetupMode(view) {
 	stepBodyEl.append(el('p', 'panel-text', view.body || ''));
-	stepBodyEl.append(setupSegment('mode', view, (value) => void api.setup('mode', { choice: value }).then(applySetupResult)));
+	stepBodyEl.append(setupSegment('mode', view, (value) => {
+		setupChosenMode = value;
+	}));
 }
 
-// A segmented radio control from the view's options/selected, used by the mode and model steps.
+// A segmented radio control from the view's options/selected, used by the mode and model steps. A click
+// updates the selection locally (the checked state follows the clicked option and, via onChoose, the page's
+// retained value); it does NOT run an engine op by itself. The write is submitted on Continue, so a click is
+// a choice and Continue is the commit.
 function setupSegment(ariaLabel, view, onChoose) {
 	const seg = el('div', 'seg');
 	seg.setAttribute('role', 'radiogroup');
 	seg.setAttribute('aria-label', ariaLabel);
+	const radios = [];
 	for (const option of view.options || []) {
 		const b = el('button');
 		b.type = 'button';
@@ -853,7 +915,9 @@ function setupSegment(ariaLabel, view, onChoose) {
 		b.append(el('span', '', option.label));
 		b.addEventListener('click', () => {
 			if (onChoose) onChoose(option.value);
+			for (const r of radios) r.setAttribute('aria-checked', String(r === b));
 		});
+		radios.push(b);
 		seg.append(b);
 	}
 	return seg;
@@ -868,34 +932,70 @@ function renderSetupModel(view) {
 	if (view.pill) panel.append(pill(view.tone, view.pill));
 	panel.append(el('p', 'panel-text', view.body || ''));
 	if (view.progress) {
-		const pct = Math.round(view.progress.pct) || 0;
+		// The bar is percent-based: the maximum stays 100 and the fill takes the same clamped percent, so a
+		// partial download reads as partial (finding 10), never as complete.
+		const now = Math.min(100, Math.max(0, Math.round(view.progress.pct) || 0));
 		const bar = el('div', 'progress');
 		bar.setAttribute('role', 'progressbar');
 		bar.setAttribute('aria-label', view.progress.label || 'downloading');
 		bar.setAttribute('aria-valuemin', '0');
-		bar.setAttribute('aria-valuemax', String(pct));
-		bar.setAttribute('aria-valuenow', String(pct));
-		bar.append(el('div', 'progress-fill'));
+		bar.setAttribute('aria-valuemax', '100');
+		bar.setAttribute('aria-valuenow', String(now));
+		const fill = el('div', 'progress-fill');
+		fill.style.setProperty('--fill', `${now}%`);
+		bar.append(fill);
 		panel.append(bar);
-		panel.append(el('span', 'bar-meta', `${view.progress.value} of ${view.progress.max} GB · ${pct}%`));
+		panel.append(el('span', 'bar-meta', `${view.progress.value} of ${view.progress.max} GB · ${now}%`));
 	}
 	if (view.note) panel.append(el('p', 'panel-note', view.note));
 	stepBodyEl.append(panel);
 	if (view.options && view.options.length > 0) {
 		const choice = el('div', 'model-choice');
 		choice.append(el('span', 'chooser-label', 'model'));
-		choice.append(setupSegment('model', view, null));
+		choice.append(
+			setupSegment('model', view, (value) => {
+				setupChosenModel = value;
+			}),
+		);
 		stepBodyEl.append(choice);
 	}
-	for (const field of view.fields || []) stepBodyEl.append(setupField(field));
+	for (const field of view.fields || []) {
+		const node = setupField(field);
+		// The runtime address the user types feeds detect/pull/save: read it live into setupAddress and
+		// re-prefill it, so a repaint during a download or a recheck does not lose what was entered.
+		if (field.kind !== 'switch') {
+			const input = node.querySelector ? node.querySelector('input') : null;
+			if (input) {
+				if (setupAddress !== '') input.value = setupAddress;
+				input.addEventListener('input', () => {
+					setupAddress = input.value.trim();
+				});
+			}
+		}
+		stepBodyEl.append(node);
+	}
 }
 
 // digest and notifications: switch rows split by 1px lines, a send-at field, then the two notification switches
 // the board added so a skip-setup install can turn them on from settings later.
 function renderSetupDigest(view) {
+	// Seed the retained values from the view first, so controls the user leaves alone still send the values
+	// main showed; then bind each control so a change updates the retained value Continue will submit.
+	const byLabel = (label) => (view.fields || []).find((f) => f.label === label);
+	setupDigestEnabled = byLabel('daily digest')?.checked ?? true;
+	setupDigestTime = byLabel('send at')?.value ?? '';
+	setupNotifyReply = byLabel('mail that needs a reply')?.checked ?? true;
+	setupNotifyOffline = byLabel('connection problems')?.checked ?? true;
 	for (const field of view.fields || []) {
-		if (field.kind === 'switch') stepBodyEl.append(setupField(field));
-		else stepBodyEl.append(setupField(field));
+		const node = setupField(field);
+		const input = node.querySelector ? node.querySelector('input') : null;
+		if (input) {
+			if (field.label === 'daily digest') input.addEventListener('change', () => (setupDigestEnabled = input.checked));
+			else if (field.label === 'send at') input.addEventListener('input', () => (setupDigestTime = input.value.trim()));
+			else if (field.label === 'mail that needs a reply') input.addEventListener('change', () => (setupNotifyReply = input.checked));
+			else if (field.label === 'connection problems') input.addEventListener('change', () => (setupNotifyOffline = input.checked));
+		}
+		stepBodyEl.append(node);
 	}
 }
 
@@ -915,10 +1015,12 @@ function renderSetupActions(actions) {
 }
 
 function setupAction(label) {
-	if (/^download /.test(label)) return void api.setup('pull', { model: label.slice('download '.length).trim() }).then(applySetupResult);
+	if (/^download /.test(label)) return void api.setup('pull', { model: label.slice('download '.length).trim(), url: setupAddress }).then(applySetupResult);
 	if (label === 'install Ollama' || label === 'check again' || label === 'use another model' || label === 'try again') {
 		const op = label === 'install Ollama' ? 'open' : label === 'check again' ? 'detect' : label === 'use another model' ? 'detect' : 'modelRetry';
-		return void api.setup(op, {}).then(applySetupResult);
+		// A probe carries the runtime address the user typed (when there is one), so a nondefault port or
+		// runtime is used instead of the engine's defaults.
+		return void api.setup(op, { url: setupAddress }).then(applySetupResult);
 	}
 	if (label === 'cancel download') return void api.setup('cancelDownload', {}).then(applySetupResult);
 	if (label === 'add another account') return void renderSetupAccounts(setupCurrent);
@@ -960,3 +1062,13 @@ setupBoot();
 setInterval(() => {
 	if (document.visibilityState === 'visible') refresh();
 }, REFRESH_MS);
+
+// While the model step is visible, keep its state current: a "no runtime found" step re-probes every three
+// seconds (the design's re-check), and a running download refreshes from main's pull progress until it
+// completes. Only while on the model step and the window is visible, so a hidden page never drives the engine.
+setInterval(() => {
+	if (!setupActive || !setupCurrent || setupCurrent.step !== 'model') return;
+	if (document.visibilityState !== 'visible') return;
+	if (setupCurrent.pill === 'no runtime found') void api.setup('detect', { url: setupAddress }).then(applySetupResult);
+	else if (setupCurrent.pill === 'downloading model') void api.setup('view', { step: 'model' }).then(applySetupResult);
+}, 3_000);

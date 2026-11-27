@@ -381,3 +381,49 @@ test('ltm.setup is the window page only, and the settings screen carries the two
 	assert.ok(renderer.includes("setSetting('notifyReply'") && renderer.includes("setSetting('notifyOffline'"), 'the rows write back');
 	assert.equal(/setSetting\('setupDone'/.test(renderer), false, 'setupDone is main-only: the page cannot mark onboarding done');
 });
+
+// The first-run orchestration is in the DOM/Electron layer, which has no browser unit test here, so its
+// wiring is pinned structurally: detection starts on the model step and re-checks/refreshes while visible;
+// mode/digest Continue submit the chosen values (not an immediate write on a click); the chosen model and
+// typed address feed the requests; a completed pull is saved; and the download bar never reads as full.
+test('the onboarding steps drive the engine and settings end-to-end', () => {
+	const renderer = readFileSync(join(DESKTOP, 'renderer', 'renderer.js'), 'utf8');
+	const main = readFileSync(join(SRC, 'main.ts'), 'utf8');
+
+	// 1. Detection starts when the model step paints its "looking for a runtime" placeholder, once, and while
+	// visible the step re-probes a not-found (every 3 s) and refreshes a running download.
+	assert.ok(renderer.includes("view.pill === 'looking for a runtime'") && renderer.includes('&& !setupDetectStarted'), 'entering the model step starts a single detect');
+	assert.ok(renderer.includes("api.setup('detect', { url: setupAddress })"), 'the model step and not-found re-check send a detect with the typed address');
+	assert.ok(renderer.includes('}, 3_000);'), 'a three-second interval keeps the model step current while visible');
+
+	// 2. Mode Continue submits the selected choice; a segment click only records the choice locally.
+	assert.ok(renderer.includes("setupChosenMode = value"), 'a mode click is a local choice');
+	assert.ok(renderer.includes(".setup('mode', { choice })"), 'Continue submits the selected mode');
+	assert.equal(/renderSetupMode[\s\S]{0,400}api\.setup\('mode', \{ choice: value \}/.test(renderer), false, 'a click must not run the engine write by itself');
+
+	// 6. Digest Continue writes the digest and the notification switches before marking setup complete.
+	assert.ok(renderer.includes("api.setup('digest', { enabled: setupDigestEnabled"), 'the digest switch reaches main on Continue');
+	assert.ok(renderer.includes("api.setup('settings', { notifyReply: setupNotifyReply"), 'the notification switches reach main on Continue');
+	assert.ok(renderer.includes("api.setup('start', {})"), 'and only then setup finishes');
+
+	// 8. The chosen model and the typed runtime address feed save/pull/detect, and the address is read live.
+	assert.ok(renderer.includes("api.setup('save', { model: setupChosenModel"), 'Continue saves the chosen model');
+	assert.ok(renderer.includes("url: setupAddress }"), 'requests carry the typed runtime address');
+	assert.ok(renderer.includes('setupAddress = input.value.trim()'), 'the address field is read live into setupAddress');
+
+	// 10. The bar keeps its maximum at 100 and the fill is the clamped percent (never a partial "full").
+	assert.ok(renderer.includes("bar.setAttribute('aria-valuemax', '100')"), 'the bar maximum stays 100');
+	assert.ok(renderer.includes("fill.style.setProperty('--fill'"), 'the fill takes the clamped percent');
+	assert.equal(/aria-valuemax', String\(pct\)/.test(renderer), false, 'the maximum is never the current percent');
+	const css = readFileSync(join(DESKTOP, 'renderer', 'onboarding.css'), 'utf8');
+	assert.match(css, /\.model-panel \.progress-fill \{[^}]*width: var\(--fill, 100%\)/, 'the fill width is the driven percentage');
+
+	// 9. A completed pull in main saves the exact runtime/URL/model it downloaded (a download records the model).
+	const doneIdx = main.indexOf("session.pullState = 'done'");
+	assert.ok(doneIdx > 0, 'a successful pull marks the step done');
+	assert.match(main.slice(doneIdx, doneIdx + 400), /buildModelSaveArgs\(saveRuntime, saveUrl, model\)/, 'the pulled model is saved');
+
+	// 3. The live notification switches hydrate from saved settings, and a silent skip persists both false.
+	assert.ok(main.includes('notifySwitches.notifyReply = settings.notifyReply'), 'boot hydrates the switches from settings');
+	assert.ok(main.includes('settings = skippedInstallSettings(settings)'), 'a silent-skip install turns both switches off');
+});
