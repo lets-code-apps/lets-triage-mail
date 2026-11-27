@@ -425,7 +425,11 @@ async function setupOp(op: unknown, args: unknown): Promise<SetupResult> {
 		switch (op) {
 			case 'view':
 			case 'back': {
+				// The page owns the step number: 'back' steps one back, 'view' with a step names it directly
+				// (Continue calls setup('view', {step: next})). A step name outside the fixed order is ignored,
+				// so the page cannot jump to a step that does not exist.
 				if (op === 'back') session.step = STEP_ORDER[Math.max(0, STEP_ORDER.indexOf(session.step) - 1)];
+				else if (typeof fields.step === 'string' && STEP_ORDER.includes(fields.step as SetupStep)) session.step = fields.step as SetupStep;
 				const { config, globals } = await readGlobalConfig();
 				session.globals = globals;
 				return { kind: 'view', view: setupViewFor(session.step, config, globals, session) };

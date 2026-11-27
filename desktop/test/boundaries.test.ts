@@ -363,6 +363,7 @@ test('setup opens one fixed URL, and Notification is built in main only', () => 
 	for (const page of ['renderer.js', 'popup.js']) {
 		const script = readFileSync(join(DESKTOP, 'renderer', page), 'utf8');
 		assert.equal(/openExternal|new Notification/.test(script), false, `${page} can reach neither`);
+		assert.equal(/\.innerHTML\s*=/.test(script), false, `${page} must render with textContent, never an innerHTML sink`);
 	}
 });
 

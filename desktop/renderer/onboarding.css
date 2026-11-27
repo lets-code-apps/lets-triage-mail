@@ -1,0 +1,288 @@
+/* First-run onboarding: one setup column that replaces the account/settings panes in the same
+   window (the app bar is unchanged). Buttons, fields, switches, segments and pills are shared.css
+   components, so the 44px touch targets and the design's pill/segment/switch sizing come for free.
+   The column is drawn at 720px and checked at 360px (design: TriageMailOnboarding). */
+
+.setup {
+  box-sizing: border-box;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--s-6);
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-6) 20px var(--s-6);
+}
+
+/* The step list across the top: done steps a check on a raised bubble, the current step the fg
+   fill, later steps an outline. Numbers are decorative; the accessible state is aria-current. */
+.step-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+}
+
+.step-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--label);
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.step-list li.current {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.step-list .bubble {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-strong);
+  color: var(--muted);
+  font-size: var(--label);
+  font-weight: 500;
+}
+
+.step-list li.done .bubble {
+  background: var(--raised);
+  border-color: var(--line-strong);
+  color: var(--fg);
+}
+
+.step-list li.current .bubble {
+  background: var(--fg);
+  border-color: var(--fg);
+  color: var(--bg);
+}
+
+.step-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  max-width: 560px;
+}
+
+.step-head .step-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.step-head .step-text {
+  margin: 0;
+  max-width: 62ch;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.step-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  max-width: 560px;
+  min-width: 0;
+}
+
+/* The model step's own panel: a live region so a state change is announced, the pill and the
+   engine's sentence, a download progress bar when pulling, then the note and any actions. */
+.model-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-3);
+  min-width: 0;
+  padding: var(--s-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.model-panel .panel-text {
+  margin: 0;
+  max-width: 62ch;
+  font-size: 16px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.model-panel .panel-note {
+  margin: 0;
+  max-width: 62ch;
+  font-size: var(--meta);
+  line-height: 1.55;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.model-panel .progress {
+  align-self: stretch;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--raised);
+  border: 1px solid var(--line-strong);
+  overflow: hidden;
+}
+
+.model-panel .progress-fill {
+  height: 100%;
+  background: var(--fg);
+}
+
+.model-panel .bar-meta {
+  margin: 0;
+  font-size: var(--meta);
+  color: var(--muted);
+}
+
+.model-panel .btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* A labelled model chooser and the runtime address field reuse .seg and .field from shared/renderer. */
+.model-choice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.model-choice .chooser-label {
+  font-size: var(--meta);
+  font-weight: 500;
+}
+
+.model-choice .chooser-note {
+  margin: 0;
+  max-width: 62ch;
+  font-size: var(--meta);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* The digest and notifications step: switch rows split by 1px lines, a send-at field, then the
+   two notification switches. A row is at least 44px tall so a switch is reachable by touch. */
+.switch-rows {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+
+.switch-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  padding: var(--s-1) 0 14px;
+  border-bottom: 1px solid var(--line);
+  min-height: 44px;
+}
+
+.switch-row .switch-note {
+  margin: 0;
+  font-size: var(--meta);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.field-time {
+  padding: var(--s-4) 0;
+  border-bottom: 1px solid var(--line);
+  max-width: 220px;
+}
+
+.step-muted {
+  margin: 0;
+  max-width: 62ch;
+  font-size: var(--meta);
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+/* The accounts step's add form reuses the field/button components; the "signed in" rows reuse .row. */
+.accounts-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  max-width: 560px;
+}
+
+.accounts-form .field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-4);
+}
+
+.accounts-form .field-row .field.grow {
+  flex: 3 1 220px;
+  min-width: 0;
+}
+
+.accounts-form .field-row .field:not(.grow) {
+  flex: 1 1 96px;
+  min-width: 0;
+}
+
+.accounts-form .form-note {
+  margin: 0;
+  max-width: 62ch;
+  font-size: var(--meta);
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.setup-note {
+  margin: 0;
+  max-width: 62ch;
+  font-size: var(--meta);
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+/* A signed-in account line (the accounts step names the inboxes; engine data only). */
+.setup-rows {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+
+.step-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding-top: var(--s-4);
+  border-top: 1px solid var(--line);
+}
+
+.step-foot .foot-spacer {
+  flex: 1 1 0;
+  min-width: 8px;
+}
+
+/* The back action is a quiet ghost button (no border/fill), distinct from the primary continue. */
+.btn.ghost {
+  padding: 0 14px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+}
+
+.btn.ghost:hover {
+  background: var(--raised);
+}

@@ -648,9 +648,308 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('focus', loadSettings);
 
+// --- first-run onboarding ---------------------------------------------------------------
+//
+// The setup column (`#setup` in index.html) replaces the account/settings panes in the same window; the app
+// bar is unchanged. This page owns the step number; main answers a ready-to-print view for the step it is on
+// (channel `ltm.setup` = the tenth bridge function). Every string is written with textContent, the pill tone
+// comes only from the four-name allow-list, and every control sends a closed op name — this page never formats
+// engine text, never becomes a flag, and reaches no network or browser page. main paints the strings; the page
+// sends ops and repaints from the view each op returns.
+
+const setupEl = $('setup');
+const stepListEl = $('stepList');
+const stepTitleEl = $('stepTitle');
+const stepTextEl = $('stepText');
+const stepBodyEl = $('stepBody');
+const backBtn = $('setupBack');
+const nextBtn = $('setupNext');
+const panesEl = document.querySelector('.panes');
+const SETUP_STEPS = ['accounts', 'mode', 'model', 'digest'];
+const SETUP_SPRITE = ['mail', 'settings', 'play', 'pause', 'arrow-up-right', 'plus', 'chevron-right'];
+let setupActive = false;
+let setupCurrent = null; // the last view main painted
+let setupModelSaved = false; // an op has saved the chosen model, so continue advances instead of saving again
+
+// A label + input pair for the runtime address / send-at / account fields (reuses the .field component).
+function setupField(field) {
+	if (field.kind === 'switch') {
+		const row = el('div', 'switch-row');
+		row.append(el('div', 'lbl', field.label));
+		const input = el('input', 'switch');
+		input.type = 'checkbox';
+		input.setAttribute('role', 'switch');
+		input.checked = field.checked === true;
+		row.append(input);
+		if (field.note) row.append(el('span', 'switch-note', field.note));
+		return row;
+	}
+	const wrap = field.glyph === 'clock' ? el('div', 'field-time') : el('div', 'field');
+	const field2 = wrap.classList.contains('field') ? wrap : el('div', 'field');
+	field2.append(el('label', '', field.label));
+	const input = el('input');
+	input.type = field.kind === 'password' ? 'password' : 'text';
+	input.setAttribute('autocomplete', 'off');
+	if (field.placeholder) input.placeholder = field.placeholder;
+	if (field.value !== undefined) input.value = field.value;
+	field2.append(input);
+	if (field.helper) field2.append(el('p', 'helper', field.helper));
+	if (wrap !== field2) wrap.append(field2);
+	return wrap;
+}
+
+// The footer: back (only after the first step), a spacer, and Continue labelled by main's nextLabel and
+// disabled by nextOff. The footer buttons persist across steps, so their click handlers are attached once.
+function renderSetupFoot(view) {
+	const index = SETUP_STEPS.indexOf(view.step);
+	backBtn.hidden = !(index > 0);
+	nextBtn.classList.remove('primary', 'secondary');
+	nextBtn.classList.add(view.nextVariant === 'secondary' ? 'secondary' : 'primary');
+	nextBtn.textContent = view.nextLabel || 'continue';
+	nextBtn.disabled = view.nextOff === true;
+}
+
+// Continue per step, decided from the view main just painted: digest's "start triage" ends setup; model saves
+// the chosen model once then advances; any other step advances to the next, which main answers.
+function setupContinue() {
+	if (!setupCurrent || nextBtn.disabled) return;
+	const step = setupCurrent.step;
+	if (step === 'digest') {
+		void api.setup('start', {}).then(applySetupResult);
+		return;
+	}
+	if (step === 'model' && !setupModelSaved && setupCurrent.options && setupCurrent.options.length > 0) {
+		setupModelSaved = true;
+		void api.setup('save', { model: setupCurrent.selected || '' }).then(applySetupResult);
+		return;
+	}
+	const next = SETUP_STEPS[SETUP_STEPS.indexOf(step) + 1];
+	void api.setup('view', { step: next }).then(applySetupResult);
+}
+
+function applySetupResult(result) {
+	if (!result) return;
+	if (result.kind === 'done') endSetup();
+	else if (result.kind === 'view') paintSetup(result.view);
+	else if (result.kind === 'error') {
+		const note = el('p', 'setup-error');
+		note.textContent = String(result.message);
+		note.classList.add('form-error');
+		stepBodyEl.append(note);
+	}
+	// idle: main has no session for this page; the normal panes stay.
+}
+
+// Paint one step from the view main built: the step list, the heading, the body for this step, and the footer.
+function paintSetup(view) {
+	setupCurrent = view;
+	if (view.step !== 'model') setupModelSaved = false;
+	if (view.step === 'model' && view.pill === 'ready') setupModelSaved = true;
+
+	clear(stepListEl);
+	const index = SETUP_STEPS.indexOf(view.step);
+	for (let i = 0; i < SETUP_STEPS.length; i += 1) {
+		const li = el('li', i < index ? 'done' : i === index ? 'current' : 'todo');
+		const bubble = el('span', 'bubble');
+		bubble.setAttribute('aria-hidden', 'true');
+		bubble.textContent = i < index ? '\u2713' : String(i + 1);
+		const label = el('span', '', SETUP_STEPS[i]);
+		if (i === index) li.setAttribute('aria-current', 'step');
+		const sr = el('span', 'visually-hidden', i < index ? ', done' : '');
+		li.append(bubble, label, sr);
+		stepListEl.append(li);
+	}
+
+	stepTitleEl.textContent = view.title;
+	stepTextEl.textContent = view.text;
+
+	clear(stepBodyEl);
+	if (view.step === 'mode') renderSetupMode(view);
+	else if (view.step === 'model') renderSetupModel(view);
+	else if (view.step === 'digest') renderSetupDigest(view);
+	else renderSetupAccounts(view);
+	if (view.muted) stepBodyEl.append(el('p', 'step-muted', view.muted));
+	if (view.actions && view.actions.length > 0) renderSetupActions(view.actions);
+	renderSetupFoot(view);
+}
+
+// accounts: the one step with nothing pre-filled. The add form reuses the field/button components; the signed-
+// in note main returns (never a name list) says what already passed; Continue waits until one account signed in.
+function renderSetupAccounts(view) {
+	const form = el('form', 'accounts-form');
+	form.noValidate = true;
+	form.addEventListener('submit', (event) => event.preventDefault());
+	const email = setupFormInput('email', 'email', { type: 'email', autocomplete: 'off', placeholder: 'you@example.com' });
+	const pass = setupFormInput('password', 'password', { type: 'password', autocomplete: 'current-password' }, 'If your provider uses app passwords, paste one here.');
+	form.append(email.wrap, pass.wrap);
+	const row = el('div', 'field-row');
+	const host = setupFormInput('host', 'IMAP server', { type: 'text', autocomplete: 'off' }, 'Found from your address.');
+	const port = setupFormInput('port', 'port', { type: 'text', autocomplete: 'off', value: '993', inputmode: 'numeric' });
+	host.wrap.classList.add('grow');
+	row.append(host.wrap, port.wrap);
+	form.append(row);
+	const add = el('button', 'btn primary');
+	add.type = 'button';
+	add.append(icon('plus', 18));
+	add.append(el('span', '', 'add account'));
+	add.addEventListener('click', () => {
+		void api.setup('accounts', readSetupForm(form)).then(applySetupResult);
+	});
+	form.append(add);
+	form.append(el('p', 'form-note', 'The password stays in this Mac\u2019s keychain. Continue works once one account signs in.'));
+	stepBodyEl.append(form);
+	if (view.note) stepBodyEl.append(el('p', 'setup-note', view.note));
+}
+
+function setupFormInput(id, label, attrs, helper) {
+	const wrap = el('div', 'field');
+	const labelEl = el('label', '', label);
+	labelEl.htmlFor = id;
+	const input = el('input');
+	input.id = id;
+	for (const [k, v] of Object.entries(attrs)) input.setAttribute(k, String(v));
+	wrap.append(labelEl, input);
+	if (helper) {
+		const note = el('p', 'helper', helper);
+		note.id = id + '-help';
+		input.setAttribute('aria-describedby', note.id);
+		wrap.append(note);
+	}
+	return { wrap, input };
+}
+
+function readSetupForm(form) {
+	const val = (id) => {
+		const node = form.querySelector('#' + id);
+		return node ? node.value.trim() : '';
+	};
+	const passNode = form.querySelector('#password');
+	return { address: val('email'), password: passNode ? passNode.value : '', host: val('host'), port: val('port') === '' ? undefined : Number(val('port')) };
+}
+
+// mode: one segmented control (main's options/selected), the sentence and the recommended note.
+function renderSetupMode(view) {
+	stepBodyEl.append(el('p', 'panel-text', view.body || ''));
+	stepBodyEl.append(setupSegment('mode', view, (value) => void api.setup('mode', { choice: value }).then(applySetupResult)));
+}
+
+// A segmented radio control from the view's options/selected, used by the mode and model steps.
+function setupSegment(ariaLabel, view, onChoose) {
+	const seg = el('div', 'seg');
+	seg.setAttribute('role', 'radiogroup');
+	seg.setAttribute('aria-label', ariaLabel);
+	for (const option of view.options || []) {
+		const b = el('button');
+		b.type = 'button';
+		b.setAttribute('role', 'radio');
+		b.setAttribute('aria-checked', String(option.value === view.selected));
+		b.append(el('span', '', option.label));
+		b.addEventListener('click', () => {
+			if (onChoose) onChoose(option.value);
+		});
+		seg.append(b);
+	}
+	return seg;
+}
+
+// model: the shared step. A live status panel holds the pill, the engine's sentence, a download bar, the note
+// and any actions; then, when installed models exist, a chooser, then the runtime address field.
+function renderSetupModel(view) {
+	const panel = el('div', 'model-panel');
+	panel.setAttribute('role', 'status');
+	panel.setAttribute('aria-live', 'polite');
+	if (view.pill) panel.append(pill(view.tone, view.pill));
+	panel.append(el('p', 'panel-text', view.body || ''));
+	if (view.progress) {
+		const pct = Math.round(view.progress.pct) || 0;
+		const bar = el('div', 'progress');
+		bar.setAttribute('role', 'progressbar');
+		bar.setAttribute('aria-label', view.progress.label || 'downloading');
+		bar.setAttribute('aria-valuemin', '0');
+		bar.setAttribute('aria-valuemax', String(pct));
+		bar.setAttribute('aria-valuenow', String(pct));
+		bar.append(el('div', 'progress-fill'));
+		panel.append(bar);
+		panel.append(el('span', 'bar-meta', `${view.progress.value} of ${view.progress.max} GB · ${pct}%`));
+	}
+	if (view.note) panel.append(el('p', 'panel-note', view.note));
+	stepBodyEl.append(panel);
+	if (view.options && view.options.length > 0) {
+		const choice = el('div', 'model-choice');
+		choice.append(el('span', 'chooser-label', 'model'));
+		choice.append(setupSegment('model', view, null));
+		stepBodyEl.append(choice);
+	}
+	for (const field of view.fields || []) stepBodyEl.append(setupField(field));
+}
+
+// digest and notifications: switch rows split by 1px lines, a send-at field, then the two notification switches
+// the board added so a skip-setup install can turn them on from settings later.
+function renderSetupDigest(view) {
+	for (const field of view.fields || []) {
+		if (field.kind === 'switch') stepBodyEl.append(setupField(field));
+		else stepBodyEl.append(setupField(field));
+	}
+}
+
+// Action buttons (install Ollama, check again, cancel download, try again, download …). Each label maps to a
+// fixed op; nothing the page typed becomes a flag (main builds the argv).
+function renderSetupActions(actions) {
+	const row = el('div', 'btns');
+	for (const action of actions) {
+		const b = el('button', 'btn ' + (action.variant === 'primary' ? 'primary' : action.variant === 'secondary' ? 'secondary' : 'ghost'));
+		b.type = 'button';
+		if (action.glyph && SETUP_SPRITE.includes(action.glyph)) b.append(icon(action.glyph, 18));
+		b.append(el('span', '', action.label));
+		b.addEventListener('click', () => setupAction(action.label));
+		row.append(b);
+	}
+	stepBodyEl.append(row);
+}
+
+function setupAction(label) {
+	if (/^download /.test(label)) return void api.setup('pull', { model: label.slice('download '.length).trim() }).then(applySetupResult);
+	if (label === 'install Ollama' || label === 'check again' || label === 'use another model' || label === 'try again') {
+		const op = label === 'install Ollama' ? 'open' : label === 'check again' ? 'detect' : label === 'use another model' ? 'detect' : 'modelRetry';
+		return void api.setup(op, {}).then(applySetupResult);
+	}
+	if (label === 'cancel download') return void api.setup('cancelDownload', {}).then(applySetupResult);
+	if (label === 'add another account') return void renderSetupAccounts(setupCurrent);
+}
+
+function enterSetup() {
+	setupActive = true;
+	if (panesEl) panesEl.hidden = true;
+	setupEl.hidden = false;
+}
+
+function endSetup() {
+	setupActive = false;
+	setupModelSaved = false;
+	setupEl.hidden = true;
+	if (panesEl) panesEl.hidden = false;
+}
+
+// The footer buttons persist across steps, so their click handlers are attached once; they read the current view.
+backBtn.addEventListener('click', () => void api.setup('back', {}).then(applySetupResult));
+nextBtn.addEventListener('click', () => setupContinue());
+
+// Ask main for the step it is on. A first run answers a view (enter setup); an install that already has accounts
+// or a broken config answers idle, and the normal panes this renderer already painted stay. The panes' 5 s poll
+// repaints the now-visible window after "start triage" ends setup.
+function setupBoot() {
+	void Promise.resolve(api.setup('view')).then((res) => {
+		if (res && res.kind === 'view') {
+			enterSetup();
+			paintSetup(res.view);
+		}
+	});
+}
+
 render();
 refresh();
 loadSettings();
+setupBoot();
 setInterval(() => {
 	if (document.visibilityState === 'visible') refresh();
 }, REFRESH_MS);
